@@ -1,0 +1,24 @@
+[package]
+name = "videocaptionerr-desktop"
+version = "0.1.0"
+description = "VideoCaptionerR desktop application"
+authors = ["VideoCaptionerR contributors"]
+edition = "2021"
+license = "GPL-3.0-only"
+rust-version = "1.85"
+publish = false
+
+[workspace]
+
+[lib]
+name = "videocaptionerr_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3" }
+
+[dependencies]
+tauri = { version = "2.11.5" }
+serde = { version = "1", features = ["derive"] }
+videocaptionerr-bootstrap = { path = "../../../crates/bootstrap" }
+videocaptionerr-contracts = { path = "../../../crates/contracts" }

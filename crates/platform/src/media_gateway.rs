@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use videocaptionerr_contracts::error::{ErrorCode, VcError};
 use videocaptionerr_core::ports::{
-    ArtifactInput, AudioExtraction, ExtractAudioRequest, MediaGateway, ProbeMediaRequest,
-    ProbedMedia,
+    ArtifactInput, AudioAnalysis, AudioAnalysisRequest, AudioExtraction, AudioRangeExtraction,
+    ExtractAudioRangeRequest, ExtractAudioRequest, MediaGateway, ProbeMediaRequest, ProbedMedia,
 };
 use videocaptionerr_domain::StageKind;
 
@@ -79,6 +79,39 @@ impl MediaGateway for FfmpegMediaGateway {
                     schema_version: videocaptionerr_domain::SCHEMA_VERSION,
                     producer_fingerprint: "ffmpeg-pcm-s16le".into(),
                 },
+            })
+        })
+        .await
+    }
+
+    async fn analyze_audio(
+        &self,
+        request: AudioAnalysisRequest,
+    ) -> videocaptionerr_core::AppResult<AudioAnalysis> {
+        blocking(move || {
+            let (silences, energy) =
+                crate::media::analyze_pcm_wav(&request.audio_path, request.duration_ms)?;
+            Ok(AudioAnalysis { silences, energy })
+        })
+        .await
+    }
+
+    async fn extract_audio_range(
+        &self,
+        request: ExtractAudioRangeRequest,
+    ) -> videocaptionerr_core::AppResult<AudioRangeExtraction> {
+        let ffmpeg_path = self.ffmpeg_path.clone();
+        blocking(move || {
+            let extracted = crate::media::extract_audio_range_wav(
+                &request.input_wav,
+                &request.output_path,
+                request.read_start_ms,
+                request.read_end_ms,
+                ffmpeg_path.as_deref(),
+            )?;
+            Ok(AudioRangeExtraction {
+                wav_path: extracted.wav_path,
+                pcm_hash: extracted.pcm_hash,
             })
         })
         .await

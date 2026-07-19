@@ -60,6 +60,7 @@ impl LlmGateway for ProviderLlmGateway {
             structured_output: map_structured_output(capabilities.effective_structured_mode()),
             returns_usage: capabilities.returns_usage,
             supports_seed: capabilities.seed,
+            supports_model_list: capabilities.supports_model_list,
             max_context_tokens: capabilities.max_context_tokens,
             max_output_tokens: capabilities.max_output_tokens,
         })

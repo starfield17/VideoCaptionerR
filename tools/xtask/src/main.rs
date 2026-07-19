@@ -244,6 +244,7 @@ fn verify_architecture() -> Result<()> {
             "videocaptionerr-bootstrap",
         ],
     )?;
+    verify_desktop_boundary()?;
 
     let mut source_files = Vec::new();
     collect_files(Path::new("crates"), &mut source_files)?;
@@ -290,6 +291,58 @@ fn assert_no_dependencies(
     for name in forbidden {
         if dependencies.iter().any(|dependency| dependency == name) {
             bail!("{package} must not depend on {name}");
+        }
+    }
+    Ok(())
+}
+
+fn verify_desktop_boundary() -> Result<()> {
+    let manifest_path = Path::new("apps/desktop/src-tauri/Cargo.toml");
+    if !manifest_path.is_file() {
+        bail!("desktop manifest missing: {}", manifest_path.display());
+    }
+    let manifest = fs::read_to_string(manifest_path)
+        .with_context(|| format!("read desktop manifest {}", manifest_path.display()))?;
+    for required in ["videocaptionerr-bootstrap", "videocaptionerr-contracts"] {
+        if !manifest.contains(required) {
+            bail!("desktop must depend on {required}");
+        }
+    }
+    for forbidden in [
+        "videocaptionerr-core",
+        "videocaptionerr-domain",
+        "videocaptionerr-asr",
+        "videocaptionerr-llm",
+        "videocaptionerr-platform",
+        "videocaptionerr-store",
+    ] {
+        if manifest
+            .lines()
+            .any(|line| line.trim_start().starts_with(&format!("{forbidden} =")))
+        {
+            bail!("desktop must not depend directly on {forbidden}");
+        }
+    }
+
+    let mut source_files = Vec::new();
+    collect_files(Path::new("apps/desktop/src-tauri/src"), &mut source_files)?;
+    for path in source_files {
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("read desktop source {}", path.display()))?;
+        for forbidden in [
+            "videocaptionerr_core",
+            "videocaptionerr_domain",
+            "videocaptionerr_asr",
+            "videocaptionerr_llm",
+            "videocaptionerr_platform",
+            "videocaptionerr_store",
+        ] {
+            if text.contains(forbidden) {
+                bail!(
+                    "desktop source imports concrete adapter {forbidden}: {}",
+                    path.display()
+                );
+            }
         }
     }
     Ok(())

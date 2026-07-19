@@ -5,6 +5,6 @@
 //! migration.
 
 pub use videocaptionerr_domain::subtitle::transcript::{
-    Cue, CueFlags, EngineFingerprint, FieldOrigin, RangeUsize, TimelineSource, Transcript, Word,
-    PROB_UNAVAILABLE,
+    Cue, CueFlags, CueTextUpdate, EngineFingerprint, FieldOrigin, LlmResultBinding, LlmTextField,
+    RangeUsize, TimelineSource, Transcript, Word, PROB_UNAVAILABLE,
 };

@@ -11,9 +11,12 @@ pub struct AsrDescriptor {
     pub engine_id: String,
     pub adapter_version: String,
     pub runtime_version: String,
+    /// Complete cache-safe identity for this loaded model/runtime session.
+    pub fingerprint: String,
     pub supports_word_timestamps: bool,
     pub supports_confidence: bool,
     pub cooperative_cancel: bool,
+    pub max_audio_secs: Option<u32>,
 }
 
 pub struct AsrTranscribeRequest {

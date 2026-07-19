@@ -9,7 +9,9 @@ use std::process::ExitCode as StdExitCode;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 use ulid::Ulid;
-use videocaptionerr_bootstrap::{ApplicationRuntime, RuntimeConfig, TranscribeOptions};
+use videocaptionerr_bootstrap::{
+    ApplicationRuntime, ProcessOptions, RuntimeConfig, TranscribeOptions,
+};
 use videocaptionerr_contracts::error::{ErrorCode, VcError};
 use videocaptionerr_contracts::event::{CliEvent, EventEnvelope, ExitCode};
 
@@ -56,7 +58,7 @@ enum Commands {
         #[arg(long, default_value = "srt")]
         format: String,
     },
-    /// Full process: ASR + split + correct + translate. Implemented in a later milestone.
+    /// Full process: ASR + split + correct + translate.
     Process {
         #[arg(required = true)]
         files: Vec<PathBuf>,
@@ -64,6 +66,16 @@ enum Commands {
         profile: Option<String>,
         #[arg(long)]
         target_lang: Option<String>,
+        #[arg(long, default_value = "fake")]
+        engine: String,
+        #[arg(long)]
+        model: Option<PathBuf>,
+        #[arg(long, env = "VIDEOCAPTIONERR_HELPER")]
+        helper: Option<PathBuf>,
+        #[arg(long)]
+        language: Option<String>,
+        #[arg(long, default_value = "srt")]
+        format: String,
     },
     /// Job management.
     Jobs {
@@ -75,13 +87,27 @@ enum Commands {
         #[command(subcommand)]
         action: CacheCmd,
     },
+    /// LLM provider management.
+    Providers {
+        #[command(subcommand)]
+        action: ProvidersCmd,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum JobsCmd {
     List,
-    Retry { id: String },
-    Rm { id: String },
+    Retry {
+        id: String,
+        /// Retry this stage and all later stages. Defaults to the first failed stage.
+        #[arg(long)]
+        from_stage: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    Rm {
+        id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -89,6 +115,17 @@ enum CacheCmd {
     Gc {
         #[arg(long, default_value = "20G")]
         max_size: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ProvidersCmd {
+    /// Probe the configured provider; use --force to ignore its cached result.
+    Probe {
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -126,6 +163,7 @@ fn run(cli: Cli) -> Result<ExitCode, VcError> {
                 engine: "fake".into(),
                 model_path: None,
                 helper_path: None,
+                prompt_dir: None,
             })?;
             let report = runtime.doctor();
             println!("videocaptionerr {}", report.version);
@@ -170,6 +208,7 @@ fn run(cli: Cli) -> Result<ExitCode, VcError> {
                 engine,
                 model_path: model,
                 helper_path: helper,
+                prompt_dir: None,
             })?;
             let _lock = runtime.acquire_cli_processing_lock()?;
             let options = TranscribeOptions {
@@ -177,6 +216,8 @@ fn run(cli: Cli) -> Result<ExitCode, VcError> {
                 language,
                 format,
                 profile,
+                target_language: None,
+                layout: videocaptionerr_core::ports::SubtitleLayout::SourceOnly,
             };
             let async_runtime = tokio::runtime::Runtime::new().map_err(|error| {
                 VcError::new(
@@ -185,62 +226,43 @@ fn run(cli: Cli) -> Result<ExitCode, VcError> {
                 )
             })?;
             let result = async_runtime.block_on(runtime.transcribe(options))?;
-            for job in &result.jobs {
-                emit_or_print(
-                    cli.json,
-                    CliEvent::JobFinished,
-                    Some(job.job.id().to_string()),
-                    serde_json::json!({
-                        "status": format!("{:?}", job.job.status()).to_ascii_lowercase(),
-                        "cues": job.transcript.cues.len(),
-                        "path": job.export_path,
-                    }),
-                    format!(
-                        "job {} done: {} cues -> {}",
-                        job.job.id(),
-                        job.transcript.cues.len(),
-                        job.export_path.display()
-                    ),
-                )?;
-            }
-            for failure in &result.failures {
-                if cli.json {
-                    emit_event(
-                        CliEvent::Error,
-                        Some(failure.job_id.clone()),
-                        serde_json::json!({
-                            "code": failure.error.code.as_str(),
-                            "message": failure.error.message,
-                        }),
-                    )?;
-                } else {
-                    eprintln!("job {} failed: {}", failure.job_id, failure.error);
-                }
-            }
-            if result.failures.is_empty() {
-                Ok(ExitCode::Success)
-            } else if result.jobs.is_empty() {
-                Err(result.failures[0].error.clone())
-            } else {
-                Ok(ExitCode::PartialBatchSuccess)
-            }
+            emit_batch_result(cli.json, result)
         }
         Commands::Process {
-            files: _,
-            profile: _,
-            target_lang: _,
+            files,
+            profile,
+            target_lang,
+            engine,
+            model,
+            helper,
+            language,
+            format,
         } => {
             let runtime = ApplicationRuntime::open(RuntimeConfig {
                 home: cli.home,
-                engine: "fake".into(),
-                model_path: None,
-                helper_path: None,
+                engine,
+                model_path: model,
+                helper_path: helper,
+                prompt_dir: None,
             })?;
             let _lock = runtime.acquire_cli_processing_lock()?;
-            Err(VcError::new(
-                ErrorCode::InvalidArgument,
-                "process pipeline is not enabled in the current milestone",
-            ))
+            let target_language = target_lang.ok_or_else(|| {
+                VcError::new(ErrorCode::InvalidArgument, "process requires --target-lang")
+            })?;
+            let async_runtime = tokio::runtime::Runtime::new().map_err(|error| {
+                VcError::new(
+                    ErrorCode::Internal,
+                    format!("create Tokio runtime: {error}"),
+                )
+            })?;
+            let result = async_runtime.block_on(runtime.process(ProcessOptions {
+                files,
+                language,
+                target_language,
+                format,
+                profile,
+            }))?;
+            emit_batch_result(cli.json, result)
         }
         Commands::Jobs { action } => {
             let runtime = ApplicationRuntime::open(RuntimeConfig {
@@ -248,6 +270,7 @@ fn run(cli: Cli) -> Result<ExitCode, VcError> {
                 engine: "fake".into(),
                 model_path: None,
                 helper_path: None,
+                prompt_dir: None,
             })?;
             match action {
                 JobsCmd::List => {
@@ -273,12 +296,49 @@ fn run(cli: Cli) -> Result<ExitCode, VcError> {
                     }
                     Ok(ExitCode::Success)
                 }
-                JobsCmd::Retry { id } => {
+                JobsCmd::Retry {
+                    id,
+                    from_stage,
+                    dry_run,
+                } => {
                     let _lock = runtime.acquire_cli_processing_lock()?;
-                    Err(VcError::new(
-                        ErrorCode::InvalidArgument,
-                        format!("jobs retry {id} is not enabled in the current milestone"),
-                    ))
+                    let async_runtime = tokio::runtime::Runtime::new().map_err(|error| {
+                        VcError::new(
+                            ErrorCode::Internal,
+                            format!("create Tokio runtime: {error}"),
+                        )
+                    })?;
+                    let result = async_runtime.block_on(runtime.retry_job(
+                        &id,
+                        from_stage.as_deref(),
+                        dry_run,
+                    ))?;
+                    emit_or_print(
+                        cli.json,
+                        CliEvent::RetryFinished,
+                        Some(result.job_id.to_string()),
+                        serde_json::json!({
+                            "from_stage": result.from_stage.map(|stage| stage.as_str()),
+                            "retryable_units": result.retryable_units,
+                            "retried_units": result.retried_units,
+                            "dry_run": result.dry_run,
+                        }),
+                        format!(
+                            "job {}: {} {} retryable work units",
+                            result.job_id,
+                            if result.dry_run {
+                                "would retry"
+                            } else {
+                                "retried"
+                            },
+                            if result.dry_run {
+                                result.retryable_units
+                            } else {
+                                result.retried_units
+                            }
+                        ),
+                    )?;
+                    Ok(ExitCode::Success)
                 }
                 JobsCmd::Rm { id } => {
                     let _lock = runtime.acquire_cli_processing_lock()?;
@@ -301,9 +361,76 @@ fn run(cli: Cli) -> Result<ExitCode, VcError> {
                 engine: "fake".into(),
                 model_path: None,
                 helper_path: None,
+                prompt_dir: None,
             })?;
             let _lock = runtime.acquire_cli_processing_lock()?;
-            println!("cache gc max_size={max_size}: skeleton (M5)");
+            let max_bytes = parse_size(&max_size)?;
+            let async_runtime = tokio::runtime::Runtime::new().map_err(|error| {
+                VcError::new(
+                    ErrorCode::Internal,
+                    format!("create Tokio runtime: {error}"),
+                )
+            })?;
+            let report = async_runtime.block_on(runtime.gc_cache(max_bytes))?;
+            emit_or_print(
+                cli.json,
+                CliEvent::CacheGcFinished,
+                None,
+                serde_json::json!({
+                    "max_bytes": max_bytes,
+                    "before_bytes": report.before_bytes,
+                    "after_bytes": report.after_bytes,
+                    "deleted_entries": report.deleted_entries,
+                    "skipped_leased": report.skipped_leased,
+                }),
+                format!(
+                    "cache GC: {} -> {} bytes, deleted {}, skipped {} leased",
+                    report.before_bytes,
+                    report.after_bytes,
+                    report.deleted_entries,
+                    report.skipped_leased,
+                ),
+            )?;
+            Ok(ExitCode::Success)
+        }
+        Commands::Providers {
+            action: ProvidersCmd::Probe { id, force },
+        } => {
+            let runtime = ApplicationRuntime::open(RuntimeConfig {
+                home: cli.home,
+                engine: "fake".into(),
+                model_path: None,
+                helper_path: None,
+                prompt_dir: None,
+            })?;
+            let async_runtime = tokio::runtime::Runtime::new().map_err(|error| {
+                VcError::new(
+                    ErrorCode::Internal,
+                    format!("create Tokio runtime: {error}"),
+                )
+            })?;
+            let result =
+                async_runtime.block_on(runtime.probe_llm_capabilities(id.as_deref(), force))?;
+            let data = serde_json::json!({
+                "provider_profile_id": result.provider_profile_id,
+                "profile_revision": result.profile_revision,
+                "model": result.model,
+                "probe_hash": result.probe_hash,
+                "capabilities": result.capabilities,
+                "warnings": result.warnings,
+            });
+            emit_or_print(
+                cli.json,
+                CliEvent::ProviderProbeFinished,
+                None,
+                data,
+                format!(
+                    "provider {} / {} probed (structured: {:?})",
+                    result.provider_profile_id,
+                    result.model,
+                    result.capabilities.effective_structured_mode(),
+                ),
+            )?;
             Ok(ExitCode::Success)
         }
     }
@@ -321,6 +448,51 @@ fn emit_or_print(
     } else {
         println!("{human}");
         Ok(())
+    }
+}
+
+fn emit_batch_result(
+    json: bool,
+    result: videocaptionerr_core::use_cases::RunBatchResponse,
+) -> Result<ExitCode, VcError> {
+    for job in &result.jobs {
+        emit_or_print(
+            json,
+            CliEvent::JobFinished,
+            Some(job.job.id().to_string()),
+            serde_json::json!({
+                "status": format!("{:?}", job.job.status()).to_ascii_lowercase(),
+                "cues": job.transcript.cues.len(),
+                "path": job.export_path,
+            }),
+            format!(
+                "job {} done: {} cues -> {}",
+                job.job.id(),
+                job.transcript.cues.len(),
+                job.export_path.display()
+            ),
+        )?;
+    }
+    for failure in &result.failures {
+        if json {
+            emit_event(
+                CliEvent::Error,
+                Some(failure.job_id.clone()),
+                serde_json::json!({
+                    "code": failure.error.code.as_str(),
+                    "message": failure.error.message,
+                }),
+            )?;
+        } else {
+            eprintln!("job {} failed: {}", failure.job_id, failure.error);
+        }
+    }
+    if result.failures.is_empty() {
+        Ok(ExitCode::Success)
+    } else if result.jobs.is_empty() {
+        Err(result.failures[0].error.clone())
+    } else {
+        Ok(ExitCode::PartialBatchSuccess)
     }
 }
 
@@ -366,4 +538,44 @@ fn map_error_code(error: &VcError) -> ExitCode {
         ErrorCode::PartialBatchSuccess => ExitCode::PartialBatchSuccess,
         _ => ExitCode::InvalidArgs,
     }
+}
+
+fn parse_size(input: &str) -> Result<u64, VcError> {
+    let normalized = input.trim().to_ascii_uppercase();
+    let (number, multiplier) = if let Some(value) = normalized.strip_suffix("TIB") {
+        (value, 1024u64.pow(4))
+    } else if let Some(value) = normalized.strip_suffix("TB") {
+        (value, 1_000_000_000_000)
+    } else if let Some(value) = normalized.strip_suffix("GIB") {
+        (value, 1024u64.pow(3))
+    } else if let Some(value) = normalized.strip_suffix("GB") {
+        (value, 1_000_000_000)
+    } else if let Some(value) = normalized.strip_suffix('G') {
+        (value, 1024u64.pow(3))
+    } else if let Some(value) = normalized.strip_suffix("MIB") {
+        (value, 1024u64.pow(2))
+    } else if let Some(value) = normalized.strip_suffix("MB") {
+        (value, 1_000_000)
+    } else if let Some(value) = normalized.strip_suffix('M') {
+        (value, 1024u64.pow(2))
+    } else if let Some(value) = normalized.strip_suffix("KIB") {
+        (value, 1024)
+    } else if let Some(value) = normalized.strip_suffix("KB") {
+        (value, 1_000)
+    } else if let Some(value) = normalized.strip_suffix('K') {
+        (value, 1024)
+    } else if let Some(value) = normalized.strip_suffix('B') {
+        (value, 1)
+    } else {
+        (normalized.as_str(), 1)
+    };
+    let value = number.trim().parse::<u64>().map_err(|error| {
+        VcError::new(
+            ErrorCode::InvalidArgument,
+            format!("invalid size '{input}': {error}"),
+        )
+    })?;
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| VcError::new(ErrorCode::InvalidArgument, "cache size exceeds u64"))
 }

@@ -1,6 +1,7 @@
 //! Atomic ffmpeg audio extraction to 16 kHz mono PCM s16le WAV.
 
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -186,6 +187,239 @@ pub fn extract_audio_wav(
         sample_rate: PCM_SAMPLE_RATE,
         channels: PCM_CHANNELS,
     })
+}
+
+/// Extract a read-context range from an already canonical PCM WAV.
+///
+/// The output is committed independently, so a failed chunk cannot replace a
+/// previously committed range or the full `audio.wav` artifact.
+pub fn extract_audio_range_wav(
+    input_wav: &Path,
+    output_path: &Path,
+    read_start_ms: u64,
+    read_end_ms: u64,
+    ffmpeg_path: Option<&Path>,
+) -> VcResult<ExtractResult> {
+    if !input_wav.is_file() {
+        return Err(VcError::new(
+            ErrorCode::InputNotFound,
+            format!("canonical audio not found: {}", input_wav.display()),
+        ));
+    }
+    if read_end_ms <= read_start_ms {
+        return Err(VcError::new(
+            ErrorCode::InvalidArgument,
+            "audio range end must be greater than start",
+        ));
+    }
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            VcError::new(
+                ErrorCode::FfmpegFailed,
+                format!("create chunk directory {}: {error}", parent.display()),
+            )
+        })?;
+    }
+    let ffmpeg = find_ffmpeg(ffmpeg_path)?;
+    let tmp = temporary_path(output_path);
+    let duration = (read_end_ms - read_start_ms) as f64 / 1000.0;
+    let start = read_start_ms as f64 / 1000.0;
+    let mut command = Command::new(ffmpeg);
+    command
+        .args(["-nostdin", "-hide_banner", "-loglevel", "error", "-i"])
+        .arg(input_wav)
+        .args([
+            "-ss",
+            &format!("{start:.3}"),
+            "-t",
+            &format!("{duration:.3}"),
+        ])
+        .args([
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            &PCM_SAMPLE_RATE.to_string(),
+            "-c:a",
+            "pcm_s16le",
+            "-f",
+            "wav",
+            "-y",
+        ])
+        .arg(&tmp)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let output = command.output().map_err(|error| {
+        let _ = fs::remove_file(&tmp);
+        VcError::new(
+            ErrorCode::FfmpegFailed,
+            format!("spawn ffmpeg for chunk: {error}"),
+        )
+    })?;
+    if !output.status.success() {
+        let _ = fs::remove_file(&tmp);
+        return Err(VcError::new(
+            ErrorCode::FfmpegFailed,
+            format!(
+                "ffmpeg chunk extraction failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        ));
+    }
+    validate_pcm_wav(&tmp)?;
+    let content_hash = commit_file(&tmp, output_path)?;
+    let pcm_hash = pcm_hash_file(output_path).unwrap_or(content_hash);
+    Ok(ExtractResult {
+        wav_path: output_path.to_path_buf(),
+        pcm_hash,
+        sample_rate: PCM_SAMPLE_RATE,
+        channels: PCM_CHANNELS,
+    })
+}
+
+/// A small Rust-side VAD fallback for canonical PCM. Energy is measured per
+/// 20 ms frame and silence regions are retained as cut candidates; no text or
+/// model output is involved.
+pub fn analyze_pcm_wav(
+    path: &Path,
+    duration_ms: u64,
+) -> VcResult<(
+    Vec<videocaptionerr_core::SilenceRegion>,
+    Vec<videocaptionerr_core::EnergySample>,
+)> {
+    let (data_offset, data_size) = wav_data_chunk(path)?;
+    let mut file = fs::File::open(path).map_err(|error| {
+        VcError::new(
+            ErrorCode::InputNotFound,
+            format!("open WAV for VAD {}: {error}", path.display()),
+        )
+    })?;
+    file.seek(SeekFrom::Start(data_offset)).map_err(|error| {
+        VcError::new(
+            ErrorCode::FfmpegFailed,
+            format!("seek WAV for VAD: {error}"),
+        )
+    })?;
+
+    const FRAME_BYTES: usize = 16_000 / 50 * 2;
+    let mut frame = [0_u8; FRAME_BYTES];
+    let mut remaining = data_size;
+    let mut position = 0_u64;
+    let mut energies = Vec::new();
+    while remaining > 0 {
+        let wanted = remaining.min(FRAME_BYTES as u64) as usize;
+        let mut read = 0;
+        while read < wanted {
+            let count = file.read(&mut frame[read..wanted]).map_err(|error| {
+                VcError::new(
+                    ErrorCode::FfmpegFailed,
+                    format!("read WAV for VAD: {error}"),
+                )
+            })?;
+            if count == 0 {
+                break;
+            }
+            read += count;
+        }
+        if read < 2 {
+            break;
+        }
+        let mut sum = 0.0_f64;
+        let mut samples = 0_u64;
+        for pair in frame[..read].chunks_exact(2) {
+            let sample = i16::from_le_bytes([pair[0], pair[1]]) as f64 / i16::MAX as f64;
+            sum += sample * sample;
+            samples += 1;
+        }
+        let rms = if samples == 0 {
+            0.0
+        } else {
+            (sum / samples as f64).sqrt()
+        };
+        energies.push(videocaptionerr_core::EnergySample {
+            at_ms: position.saturating_mul(1000) / 16_000,
+            energy: rms as f32,
+        });
+        position = position.saturating_add(samples);
+        remaining = remaining.saturating_sub(read as u64);
+    }
+
+    let peak = energies
+        .iter()
+        .map(|sample| sample.energy)
+        .fold(0.0_f32, f32::max);
+    let threshold = peak * 0.4;
+    let mut silences = Vec::new();
+    let mut silence_start = None;
+    for sample in &energies {
+        if sample.energy <= threshold {
+            silence_start.get_or_insert(sample.at_ms);
+        } else if let Some(start) = silence_start.take() {
+            let end = sample.at_ms.min(duration_ms);
+            if end.saturating_sub(start) >= videocaptionerr_core::VAD_MIN_SILENCE_MS {
+                silences.push(videocaptionerr_core::SilenceRegion {
+                    start_ms: start,
+                    end_ms: end,
+                });
+            }
+        }
+    }
+    if let Some(start) = silence_start {
+        let end = duration_ms;
+        if end.saturating_sub(start) >= videocaptionerr_core::VAD_MIN_SILENCE_MS {
+            silences.push(videocaptionerr_core::SilenceRegion {
+                start_ms: start,
+                end_ms: end,
+            });
+        }
+    }
+    Ok((silences, energies))
+}
+
+fn temporary_path(path: &Path) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(".tmp");
+    PathBuf::from(value)
+}
+
+fn wav_data_chunk(path: &Path) -> VcResult<(u64, u64)> {
+    let mut file = fs::File::open(path)
+        .map_err(|error| VcError::new(ErrorCode::InputNotFound, format!("open WAV: {error}")))?;
+    let mut header = [0_u8; 12];
+    file.read_exact(&mut header).map_err(|error| {
+        VcError::new(ErrorCode::FfmpegFailed, format!("read WAV header: {error}"))
+    })?;
+    if &header[0..4] != b"RIFF" || &header[8..12] != b"WAVE" {
+        return Err(VcError::new(
+            ErrorCode::FfmpegFailed,
+            "not a RIFF/WAVE file",
+        ));
+    }
+    let mut chunk_header = [0_u8; 8];
+    loop {
+        if file.read_exact(&mut chunk_header).is_err() {
+            break;
+        }
+        let size = u32::from_le_bytes(chunk_header[4..8].try_into().unwrap()) as u64;
+        let body = file.stream_position().map_err(|error| {
+            VcError::new(
+                ErrorCode::FfmpegFailed,
+                format!("locate WAV chunk: {error}"),
+            )
+        })?;
+        if &chunk_header[0..4] == b"data" {
+            return Ok((body, size));
+        }
+        file.seek(SeekFrom::Current((size + size % 2) as i64))
+            .map_err(|error| {
+                VcError::new(ErrorCode::FfmpegFailed, format!("skip WAV chunk: {error}"))
+            })?;
+    }
+    Err(VcError::new(
+        ErrorCode::FfmpegFailed,
+        "WAV data chunk missing",
+    ))
 }
 
 #[derive(Debug, Clone)]

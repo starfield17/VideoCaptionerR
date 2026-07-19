@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, ChildStdout, Command as TokioCommand};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio::time::timeout;
 use tracing::{debug, warn};
 use videocaptionerr_contracts::error::{ErrorCode, VcError, VcResult};
@@ -23,29 +23,111 @@ use crate::options::AsrOptions;
 /// Async NDJSON helper client (one active transcription).
 pub struct WorkerClient {
     child: tokio::process::Child,
-    stdin: ChildStdin,
+    stdin: std::sync::Arc<AsyncMutex<ChildStdin>>,
     stdout: BufReader<ChildStdout>,
     session_id: String,
     next_request_id: AtomicU64,
-    next_seq: AtomicU64,
+    next_seq: std::sync::Arc<AtomicU64>,
+    current_request_id: std::sync::Arc<AtomicU64>,
     descriptor: Option<EngineDescriptor>,
     helper_path: PathBuf,
     engine_arg: String,
     last_request_id: Option<u64>,
 }
 
-impl WorkerClient {
-    pub async fn spawn(helper_path: &Path, engine: &str) -> VcResult<Self> {
-        if !helper_path.exists() {
+/// Control path that can be cloned before a long transcription starts.
+/// It shares only the worker stdin and sequence allocator; stdout remains
+/// owned by the main client reader so terminal messages stay ordered.
+#[derive(Clone)]
+pub struct WorkerControl {
+    stdin: std::sync::Arc<AsyncMutex<ChildStdin>>,
+    session_id: String,
+    next_seq: std::sync::Arc<AtomicU64>,
+    current_request_id: std::sync::Arc<AtomicU64>,
+}
+
+impl WorkerControl {
+    async fn send(
+        &self,
+        request_id: Option<u64>,
+        msg_type: ProtocolMessageType,
+        data: Option<serde_json::Value>,
+    ) -> VcResult<()> {
+        send_to_worker(
+            &self.stdin,
+            &self.session_id,
+            &self.next_seq,
+            request_id,
+            msg_type,
+            data,
+        )
+        .await
+    }
+
+    pub async fn cancel_current(&self) -> VcResult<()> {
+        let target = self.current_request_id.load(Ordering::SeqCst);
+        if target == 0 {
             return Err(VcError::new(
-                ErrorCode::WorkerStartFailed,
-                format!("helper binary not found: {}", helper_path.display()),
+                ErrorCode::InvalidArgument,
+                "worker has no active transcription",
             ));
         }
+        self.cancel(target).await
+    }
 
-        let mut child = TokioCommand::new(helper_path)
-            .arg("--engine")
-            .arg(engine)
+    pub async fn cancel(&self, target_request_id: u64) -> VcResult<()> {
+        self.send(
+            None,
+            ProtocolMessageType::Cancel,
+            Some(serde_json::json!({"target_request_id": target_request_id})),
+        )
+        .await
+    }
+
+    /// Send a heartbeat while inference is running. The response is consumed
+    /// by the main reader and remains subject to the normal protocol checks.
+    pub async fn ping(&self) -> VcResult<()> {
+        self.send(None, ProtocolMessageType::Ping, None).await
+    }
+}
+
+impl WorkerClient {
+    pub async fn spawn(helper_path: &Path, engine: &str) -> VcResult<Self> {
+        let command = TokioCommand::new(helper_path);
+        Self::spawn_command(command, helper_path, engine).await
+    }
+
+    /// Spawn a managed Python runtime using the same versioned stdio protocol.
+    /// The Python script is an adapter boundary; it never owns application
+    /// retries, persistence or subtitle splitting.
+    pub async fn spawn_python(
+        python_path: &Path,
+        worker_script: &Path,
+        engine: &str,
+    ) -> VcResult<Self> {
+        if !python_path.exists() {
+            return Err(VcError::new(
+                ErrorCode::WorkerStartFailed,
+                format!("Python runtime not found: {}", python_path.display()),
+            ));
+        }
+        if !worker_script.exists() {
+            return Err(VcError::new(
+                ErrorCode::WorkerStartFailed,
+                format!("Python worker not found: {}", worker_script.display()),
+            ));
+        }
+        let mut command = TokioCommand::new(python_path);
+        command.arg(worker_script).arg("--engine").arg(engine);
+        Self::spawn_command(command, worker_script, engine).await
+    }
+
+    async fn spawn_command(
+        mut command: TokioCommand,
+        executable_path: &Path,
+        engine: &str,
+    ) -> VcResult<Self> {
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -66,13 +148,14 @@ impl WorkerClient {
 
         let mut client = Self {
             child,
-            stdin,
+            stdin: std::sync::Arc::new(AsyncMutex::new(stdin)),
             stdout: BufReader::new(stdout),
             session_id: String::new(),
             next_request_id: AtomicU64::new(1),
-            next_seq: AtomicU64::new(0),
+            next_seq: std::sync::Arc::new(AtomicU64::new(0)),
+            current_request_id: std::sync::Arc::new(AtomicU64::new(0)),
             descriptor: None,
-            helper_path: helper_path.to_path_buf(),
+            helper_path: executable_path.to_path_buf(),
             engine_arg: engine.to_string(),
             last_request_id: None,
         };
@@ -92,42 +175,38 @@ impl WorkerClient {
         self.last_request_id
     }
 
+    pub fn control(&self) -> WorkerControl {
+        WorkerControl {
+            stdin: self.stdin.clone(),
+            session_id: self.session_id.clone(),
+            next_seq: self.next_seq.clone(),
+            current_request_id: self.current_request_id.clone(),
+        }
+    }
+
     fn alloc_request_id(&self) -> u64 {
         self.next_request_id.fetch_add(1, Ordering::SeqCst)
     }
 
-    fn alloc_seq(&self) -> u64 {
-        self.next_seq.fetch_add(1, Ordering::SeqCst)
-    }
-
     async fn send(
-        &mut self,
+        &self,
         request_id: Option<u64>,
         msg_type: ProtocolMessageType,
         data: Option<serde_json::Value>,
     ) -> VcResult<()> {
-        let env = ProtocolEnvelope {
-            protocol_version: PROTOCOL_VERSION,
-            session_id: if self.session_id.is_empty() {
-                "bootstrap".into()
+        send_to_worker(
+            &self.stdin,
+            if self.session_id.is_empty() {
+                "bootstrap"
             } else {
-                self.session_id.clone()
+                &self.session_id
             },
+            &self.next_seq,
             request_id,
-            seq: self.alloc_seq(),
-            msg_type: msg_type.as_str().to_string(),
+            msg_type,
             data,
-        };
-        let line = env
-            .to_ndjson_line()
-            .map_err(|e| VcError::new(ErrorCode::WorkerProtocolError, format!("serialize: {e}")))?;
-        self.stdin.write_all(line.as_bytes()).await.map_err(|e| {
-            VcError::new(ErrorCode::WorkerProtocolError, format!("write stdin: {e}"))
-        })?;
-        self.stdin.flush().await.map_err(|e| {
-            VcError::new(ErrorCode::WorkerProtocolError, format!("flush stdin: {e}"))
-        })?;
-        Ok(())
+        )
+        .await
     }
 
     async fn read_envelope(&mut self) -> VcResult<ProtocolEnvelope> {
@@ -281,6 +360,22 @@ impl WorkerClient {
     ) -> VcResult<AsrRawResult> {
         let req = self.alloc_request_id();
         self.last_request_id = Some(req);
+        self.current_request_id.store(req, Ordering::SeqCst);
+        let result = self
+            .transcribe_request(req, audio, opts, sink, inject_delay_ms)
+            .await;
+        self.current_request_id.store(0, Ordering::SeqCst);
+        result
+    }
+
+    async fn transcribe_request(
+        &mut self,
+        req: u64,
+        audio: &Path,
+        opts: &AsrOptions,
+        sink: mpsc::Sender<AsrEvent>,
+        inject_delay_ms: Option<u64>,
+    ) -> VcResult<AsrRawResult> {
         let mut data = serde_json::json!({
             "audio_path": audio.to_string_lossy(),
             "word_timestamps": opts.word_timestamps,
@@ -406,13 +501,8 @@ impl WorkerClient {
         }
     }
 
-    pub async fn cancel(&mut self, target_request_id: u64) -> VcResult<()> {
-        self.send(
-            None,
-            ProtocolMessageType::Cancel,
-            Some(serde_json::json!({"target_request_id": target_request_id})),
-        )
-        .await
+    pub async fn cancel(&self, target_request_id: u64) -> VcResult<()> {
+        self.control().cancel(target_request_id).await
     }
 
     pub async fn shutdown(&mut self) -> VcResult<()> {
@@ -440,6 +530,41 @@ impl WorkerClient {
     pub fn engine_arg(&self) -> &str {
         &self.engine_arg
     }
+}
+
+async fn send_to_worker(
+    stdin: &std::sync::Arc<AsyncMutex<ChildStdin>>,
+    session_id: &str,
+    next_seq: &std::sync::Arc<AtomicU64>,
+    request_id: Option<u64>,
+    msg_type: ProtocolMessageType,
+    data: Option<serde_json::Value>,
+) -> VcResult<()> {
+    let env = ProtocolEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        session_id: if session_id.is_empty() {
+            "bootstrap".into()
+        } else {
+            session_id.to_owned()
+        },
+        request_id,
+        seq: next_seq.fetch_add(1, Ordering::SeqCst),
+        msg_type: msg_type.as_str().to_string(),
+        data,
+    };
+    let line = env
+        .to_ndjson_line()
+        .map_err(|e| VcError::new(ErrorCode::WorkerProtocolError, format!("serialize: {e}")))?;
+    let mut writer = stdin.lock().await;
+    writer
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|e| VcError::new(ErrorCode::WorkerProtocolError, format!("write stdin: {e}")))?;
+    writer
+        .flush()
+        .await
+        .map_err(|e| VcError::new(ErrorCode::WorkerProtocolError, format!("flush stdin: {e}")))?;
+    Ok(())
 }
 
 fn map_protocol_error(env: &ProtocolEnvelope) -> VcError {
@@ -515,9 +640,23 @@ pub fn resolve_helper_binary() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn helper_bin() -> PathBuf {
         resolve_helper_binary()
+    }
+
+    fn python_bin() -> Option<PathBuf> {
+        [
+            PathBuf::from("/home/hazel/miniconda3/envs/Lab/bin/python"),
+            PathBuf::from("/usr/bin/python3"),
+        ]
+        .into_iter()
+        .find(|path| path.is_file())
+    }
+
+    fn python_worker() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../python/runtimes/worker_common.py")
     }
 
     #[tokio::test]
@@ -569,5 +708,92 @@ mod tests {
         }
         assert!(events > 0);
         client.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn python_fake_worker_supports_heartbeat_and_control_cancel() {
+        let Some(python) = python_bin() else {
+            eprintln!("skip: managed Python runtime not installed");
+            return;
+        };
+        let script = python_worker();
+        if !script.is_file() {
+            eprintln!("skip: Python worker missing at {}", script.display());
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("python-worker.wav");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=0.3",
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                "-y",
+            ])
+            .arg(&wav)
+            .status();
+        if !status.map(|value| value.success()).unwrap_or(false) {
+            eprintln!("skip: ffmpeg failed");
+            return;
+        }
+
+        let mut client = WorkerClient::spawn_python(&python, &script, "fake")
+            .await
+            .unwrap();
+        client.load_model(None).await.unwrap();
+        let control = client.control();
+        let (sink, _events) = mpsc::channel(32);
+        let opts = AsrOptions {
+            word_timestamps: true,
+            ..Default::default()
+        };
+        let task =
+            tokio::spawn(async move { client.transcribe(&wav, &opts, sink, Some(1000)).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        control.ping().await.unwrap();
+        control.cancel_current().await.unwrap();
+        let error = task.await.unwrap().unwrap_err();
+        assert_eq!(error.code, ErrorCode::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn python_worker_rejects_dirty_partial_and_oversized_stdout() {
+        let Some(python) = python_bin() else {
+            eprintln!("skip: managed Python runtime not installed");
+            return;
+        };
+        let cases = [
+            ("print('dirty', flush=True)", ErrorCode::WorkerProtocolError),
+            (
+                "import sys; sys.stdout.write('{\\\"broken\\\"'); sys.stdout.flush()",
+                ErrorCode::WorkerProtocolError,
+            ),
+            (
+                "print('x' * (4 * 1024 * 1024 + 1), flush=True)",
+                ErrorCode::WorkerProtocolError,
+            ),
+        ];
+        for (index, (source, expected)) in cases.into_iter().enumerate() {
+            let dir = tempfile::tempdir().unwrap();
+            let script = dir.path().join(format!("bad-{index}.py"));
+            fs::write(&script, source).unwrap();
+            let error = match WorkerClient::spawn_python(&python, &script, "fake").await {
+                Ok(mut client) => {
+                    let _ = client.kill_tree().await;
+                    panic!("bad worker unexpectedly completed hello")
+                }
+                Err(error) => error,
+            };
+            assert_eq!(error.code, expected);
+        }
     }
 }

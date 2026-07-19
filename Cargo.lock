@@ -1950,6 +1950,9 @@ name = "videocaptionerr-bootstrap"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "ulid",
@@ -1957,6 +1960,7 @@ dependencies = [
  "videocaptionerr-contracts",
  "videocaptionerr-core",
  "videocaptionerr-domain",
+ "videocaptionerr-llm",
  "videocaptionerr-platform",
  "videocaptionerr-store",
 ]
@@ -1975,6 +1979,7 @@ dependencies = [
  "ulid",
  "videocaptionerr-bootstrap",
  "videocaptionerr-contracts",
+ "videocaptionerr-core",
 ]
 
 [[package]]
@@ -1998,6 +2003,7 @@ name = "videocaptionerr-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "pretty_assertions",
  "serde",
  "serde_json",
@@ -2069,6 +2075,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "chrono",
+ "fs2",
  "pretty_assertions",
  "rusqlite",
  "serde",

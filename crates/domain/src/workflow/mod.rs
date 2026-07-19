@@ -264,6 +264,33 @@ pub enum StageKind {
     Export,
 }
 
+impl StageKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Probe => "probe",
+            Self::ExtractAudio => "extract_audio",
+            Self::Asr => "asr",
+            Self::Split => "split",
+            Self::Correct => "correct",
+            Self::Translate => "translate",
+            Self::Export => "export",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value.trim().to_ascii_lowercase().as_str() {
+            "probe" => Self::Probe,
+            "extract_audio" | "extract-audio" => Self::ExtractAudio,
+            "asr" => Self::Asr,
+            "split" => Self::Split,
+            "correct" => Self::Correct,
+            "translate" => Self::Translate,
+            "export" => Self::Export,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StageStatus {
@@ -374,6 +401,30 @@ impl Job {
 
     pub fn stages(&self) -> &[StageState] {
         &self.stages
+    }
+
+    /// Point the stage at a newly committed transcript revision. The previous
+    /// artifact remains immutable and addressable through the artifact store.
+    pub fn record_transcript_revision(
+        &mut self,
+        kind: StageKind,
+        artifact: ArtifactRef,
+    ) -> DomainResult<()> {
+        if artifact.stage != kind {
+            return Err(DomainError::InvalidArgument(
+                "transcript revision artifact stage does not match".into(),
+            ));
+        }
+        let stage = self.stage_mut(kind)?;
+        if !stage.status.is_terminal() {
+            return Err(DomainError::IllegalTransition {
+                aggregate: "Stage",
+                from: format!("{:?}", stage.status),
+                to: "record_transcript_revision".into(),
+            });
+        }
+        stage.artifact = Some(artifact);
+        Ok(())
     }
 
     pub fn start(&mut self) -> DomainResult<()> {
@@ -530,6 +581,41 @@ impl Job {
                 stage.status = StageStatus::Cancelled;
             }
         }
+        Ok(())
+    }
+
+    /// Prepare an explicit retry without allowing a terminal job to silently
+    /// return to the running state. Completed prerequisite stages remain
+    /// reusable; the selected stage and all later stages are invalidated.
+    pub fn prepare_retry(&mut self, from_stage: Option<StageKind>) -> DomainResult<()> {
+        if !matches!(
+            self.status,
+            JobStatus::Failed | JobStatus::DoneDegraded | JobStatus::Cancelled
+        ) {
+            return Err(DomainError::IllegalTransition {
+                aggregate: "Job",
+                from: format!("{:?}", self.status),
+                to: "retry".into(),
+            });
+        }
+        let start_index = match from_stage {
+            Some(kind) => self.stage_index(kind)?,
+            None => self
+                .stages
+                .iter()
+                .position(|stage| {
+                    matches!(
+                        stage.status,
+                        StageStatus::Failed | StageStatus::Cancelled | StageStatus::WaitingProvider
+                    )
+                })
+                .unwrap_or(0),
+        };
+        for stage in self.stages.iter_mut().skip(start_index) {
+            stage.status = StageStatus::Pending;
+            stage.artifact = None;
+        }
+        self.status = JobStatus::Pending;
         Ok(())
     }
 
@@ -834,6 +920,33 @@ mod tests {
         job.complete_stage(StageKind::Probe, artifact, false)
             .unwrap();
         job.start_stage(StageKind::ExtractAudio).unwrap();
+    }
+
+    #[test]
+    fn retry_resets_failed_stage_and_preserves_prerequisite() {
+        let mut job = Job::new(id(), None, id(), "/media/input.wav");
+        job.start().unwrap();
+        job.start_stage(StageKind::Probe).unwrap();
+        job.complete_stage(
+            StageKind::Probe,
+            ArtifactRef {
+                id: id(),
+                stage: StageKind::Probe,
+                path: "probe.json".into(),
+                content_hash: "hash".into(),
+                schema_version: 1,
+                producer_fingerprint: "test".into(),
+            },
+            false,
+        )
+        .unwrap();
+        job.start_stage(StageKind::ExtractAudio).unwrap();
+        job.fail_stage(StageKind::ExtractAudio).unwrap();
+        assert_eq!(job.status(), JobStatus::Failed);
+        job.prepare_retry(None).unwrap();
+        assert_eq!(job.status(), JobStatus::Pending);
+        assert_eq!(job.stages()[0].status, StageStatus::Done);
+        assert_eq!(job.stages()[1].status, StageStatus::Pending);
     }
 
     #[test]

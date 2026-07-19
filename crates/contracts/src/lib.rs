@@ -22,6 +22,7 @@ pub use protocol::{
     HelloData, ProtocolEnvelope, ProtocolMessageType, PROTOCOL_VERSION, WORKER_MAX_LINE_BYTES,
 };
 pub use transcript::{
-    Cue, CueFlags, EngineFingerprint, FieldOrigin, RangeUsize, TimelineSource, Transcript, Word,
+    Cue, CueFlags, CueTextUpdate, EngineFingerprint, FieldOrigin, LlmResultBinding, LlmTextField,
+    RangeUsize, TimelineSource, Transcript, Word,
 };
 pub use version::{CONTRACTS_VERSION, SCHEMA_VERSION};

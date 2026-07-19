@@ -3,14 +3,16 @@
 pub mod config;
 pub mod constants;
 pub mod instance_lock;
+pub mod llm_log;
 pub mod media;
 pub mod media_gateway;
 pub mod paths;
 pub mod subtitle_gateway;
 pub mod subtitle_io;
 
-pub use config::{AppConfig, LlmProviderConfig};
+pub use config::{AppConfig, LlmCapabilityOverride, LlmProviderConfig};
 pub use instance_lock::{InstanceLock, LockOwner};
+pub use llm_log::FileLlmRequestRecorder;
 pub use media::{
     extract_audio_wav, media_hash_file, pcm_hash_file, probe_media, select_audio_stream,
     ExtractOptions,

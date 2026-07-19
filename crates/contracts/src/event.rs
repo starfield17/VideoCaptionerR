@@ -59,6 +59,9 @@ pub enum CliEvent {
     Error,
     JobFinished,
     JobListed,
+    RetryFinished,
+    CacheGcFinished,
+    ProviderProbeFinished,
     Cancelled,
 }
 
@@ -77,6 +80,9 @@ impl CliEvent {
             Self::Error => "error",
             Self::JobFinished => "job_finished",
             Self::JobListed => "job_listed",
+            Self::RetryFinished => "retry_finished",
+            Self::CacheGcFinished => "cache_gc_finished",
+            Self::ProviderProbeFinished => "provider_probe_finished",
             Self::Cancelled => "cancelled",
         }
     }

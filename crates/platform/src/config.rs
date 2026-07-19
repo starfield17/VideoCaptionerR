@@ -43,12 +43,38 @@ pub struct LlmSection {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmProviderConfig {
+    #[serde(default = "default_profile_revision")]
+    pub profile_revision: u64,
     pub base_url: String,
     /// Plaintext by design. Never copy into Job snapshots, logs, or request hashes.
     pub api_key: String,
     pub model: String,
     #[serde(default)]
     pub template: Option<String>,
+    #[serde(default)]
+    pub capability_override: Option<LlmCapabilityOverride>,
+}
+
+/// Secret-free manual capability settings. The LLM adapter maps these values
+/// to its provider capability type at the composition root.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LlmCapabilityOverride {
+    #[serde(default)]
+    pub structured_mode: Option<String>,
+    #[serde(default)]
+    pub returns_usage: Option<bool>,
+    #[serde(default)]
+    pub supports_seed: Option<bool>,
+    #[serde(default)]
+    pub supports_model_list: Option<bool>,
+    #[serde(default)]
+    pub max_context_tokens: Option<u32>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+}
+
+fn default_profile_revision() -> u64 {
+    1
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -171,10 +197,12 @@ mod tests {
         cfg.llm.providers.insert(
             "primary".into(),
             LlmProviderConfig {
+                profile_revision: 1,
                 base_url: "https://api.deepseek.com".into(),
                 api_key: "sk-test".into(),
                 model: "deepseek-v4-flash".into(),
                 template: Some("generic".into()),
+                capability_override: None,
             },
         );
         cfg.save(&path).unwrap();

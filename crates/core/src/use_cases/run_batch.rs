@@ -324,6 +324,15 @@ mod tests {
             })
         }
 
+        async fn load_transcript(
+            &self,
+            _artifact: &ArtifactRef,
+        ) -> AppResult<videocaptionerr_domain::Transcript> {
+            Err(ApplicationError::Invalid(
+                "fake store cannot load transcripts".into(),
+            ))
+        }
+
         async fn validate(&self, _artifact: &ArtifactRef) -> AppResult<()> {
             Ok(())
         }
@@ -416,9 +425,11 @@ mod tests {
                     engine_id: "fake".into(),
                     adapter_version: "test".into(),
                     runtime_version: "test".into(),
+                    fingerprint: "fake|test|test|fake|cpu".into(),
                     supports_word_timestamps: true,
                     supports_confidence: true,
                     cooperative_cancel: true,
+                    max_audio_secs: Some(3600),
                 },
                 close_count: self.closes.clone(),
                 fail_first: self.fail_first,
@@ -454,6 +465,7 @@ mod tests {
                 layout: crate::ports::SubtitleLayout::SourceOnly,
                 fallback_to_source: true,
             },
+            llm: None,
         }
     }
 

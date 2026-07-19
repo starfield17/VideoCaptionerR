@@ -8,6 +8,6 @@ pub mod transcript;
 pub use split::{rule_split, RuleSplitConfig};
 pub use text_joiner::{join_word_texts, join_words};
 pub use transcript::{
-    Cue, CueFlags, EngineFingerprint, FieldOrigin, RangeUsize, TimelineSource, Transcript, Word,
-    PROB_UNAVAILABLE,
+    Cue, CueFlags, CueTextUpdate, EngineFingerprint, FieldOrigin, LlmResultBinding, LlmTextField,
+    RangeUsize, TimelineSource, Transcript, Word, PROB_UNAVAILABLE,
 };

@@ -18,4 +18,4 @@ pub use engine::{AsrEngine, AsrEvent, AsrRawResult};
 pub use model::{download_model, verify_model_file, ModelEntry, ModelManifest};
 pub use normalize::{normalize_asr, NormalizeOptions};
 pub use options::AsrOptions;
-pub use worker::{kill_process_tree, resolve_helper_binary, WorkerClient};
+pub use worker::{kill_process_tree, resolve_helper_binary, WorkerClient, WorkerControl};

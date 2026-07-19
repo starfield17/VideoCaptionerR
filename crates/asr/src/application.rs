@@ -19,9 +19,15 @@ use crate::worker::WorkerClient;
 
 #[derive(Debug, Clone)]
 pub struct WorkerAsrRuntime {
-    helper_path: PathBuf,
+    launch: WorkerLaunch,
     engine: String,
     model_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+enum WorkerLaunch {
+    Helper { path: PathBuf },
+    Python { python: PathBuf, script: PathBuf },
 }
 
 impl WorkerAsrRuntime {
@@ -31,7 +37,25 @@ impl WorkerAsrRuntime {
         model_path: Option<PathBuf>,
     ) -> Self {
         Self {
-            helper_path: helper_path.into(),
+            launch: WorkerLaunch::Helper {
+                path: helper_path.into(),
+            },
+            engine: engine.into(),
+            model_path,
+        }
+    }
+
+    pub fn python(
+        python_path: impl Into<PathBuf>,
+        worker_script: impl Into<PathBuf>,
+        engine: impl Into<String>,
+        model_path: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            launch: WorkerLaunch::Python {
+                python: python_path.into(),
+                script: worker_script.into(),
+            },
             engine: engine.into(),
             model_path,
         }
@@ -50,9 +74,13 @@ impl AsrRuntime for WorkerAsrRuntime {
                 self.engine, profile.asr_engine
             )));
         }
-        let mut client = WorkerClient::spawn(&self.helper_path, &self.engine)
-            .await
-            .map_err(ApplicationError::Adapter)?;
+        let mut client = match &self.launch {
+            WorkerLaunch::Helper { path } => WorkerClient::spawn(path, &self.engine).await,
+            WorkerLaunch::Python { python, script } => {
+                WorkerClient::spawn_python(python, script, &self.engine).await
+            }
+        }
+        .map_err(ApplicationError::Adapter)?;
         client
             .load_model(self.model_path.as_deref())
             .await
@@ -70,6 +98,15 @@ impl AsrRuntime for WorkerAsrRuntime {
             )));
         }
         let application_descriptor = map_descriptor(&descriptor);
+        let mut application_descriptor = application_descriptor;
+        application_descriptor.fingerprint = format!(
+            "{}|{}|{}|{}|{}",
+            application_descriptor.engine_id,
+            application_descriptor.adapter_version,
+            application_descriptor.runtime_version,
+            profile.asr_model,
+            profile.device
+        );
         Ok(Box::new(WorkerAsrSession {
             client,
             descriptor: application_descriptor,
@@ -150,11 +187,16 @@ fn map_descriptor(descriptor: &EngineDescriptor) -> ApplicationAsrDescriptor {
         engine_id: descriptor.engine_id.clone(),
         adapter_version: descriptor.adapter_version.clone(),
         runtime_version: descriptor.runtime_version.clone(),
+        fingerprint: format!(
+            "{}|{}|{}",
+            descriptor.engine_id, descriptor.adapter_version, descriptor.runtime_version
+        ),
         supports_word_timestamps: matches!(
             descriptor.timestamp_granularity,
             TimestampGranularity::Word | TimestampGranularity::Character
         ),
         supports_confidence: !matches!(descriptor.confidence_kind, ConfidenceKind::None),
         cooperative_cancel: descriptor.cooperative_cancel,
+        max_audio_secs: descriptor.max_audio_secs,
     }
 }

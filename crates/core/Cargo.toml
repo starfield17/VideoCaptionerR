@@ -13,6 +13,7 @@ videocaptionerr-domain = { workspace = true }
 videocaptionerr-contracts = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+blake3 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
