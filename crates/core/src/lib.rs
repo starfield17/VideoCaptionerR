@@ -2,14 +2,18 @@
 //!
 //! This crate MUST NOT import Tauri, React, or terminal-rendering concerns.
 
+pub mod application_error;
 pub mod config;
 pub mod constants;
 pub mod media;
 pub mod pipeline;
+pub mod ports;
 pub mod split;
 pub mod subtitle;
 pub mod text_joiner;
+pub mod use_cases;
 
+pub use application_error::{AppResult, ApplicationError};
 pub use config::{AppConfig, LlmProviderConfig};
 pub use constants::*;
 pub use media::{

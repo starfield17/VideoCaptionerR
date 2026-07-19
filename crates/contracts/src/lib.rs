@@ -16,12 +16,12 @@ pub mod version;
 pub use artifact::{ArtifactKind, ArtifactMeta};
 pub use error::{ErrorCategory, ErrorCode, VcError};
 pub use event::{CliEvent, EventEnvelope};
-pub use ids::{JobId, RequestId, SessionId, UlidStr};
+pub use ids::{BatchId, JobId, RequestId, SessionId, UlidStr, WorkUnitId};
 pub use media::{AudioStream, MediaProbe};
 pub use protocol::{
     HelloData, ProtocolEnvelope, ProtocolMessageType, PROTOCOL_VERSION, WORKER_MAX_LINE_BYTES,
 };
 pub use transcript::{
-    Cue, CueFlags, EngineFingerprint, FieldOrigin, TimelineSource, Transcript, Word,
+    Cue, CueFlags, EngineFingerprint, FieldOrigin, RangeUsize, TimelineSource, Transcript, Word,
 };
 pub use version::{CONTRACTS_VERSION, SCHEMA_VERSION};

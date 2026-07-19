@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use videocaptionerr_contracts::error::{ErrorCode, VcError, VcResult};
+use videocaptionerr_contracts::error::VcResult;
 
 use crate::openai::{endpoint, OpenAiConfig, OpenAiProvider};
 use crate::provider::{
@@ -86,6 +86,10 @@ impl CapabilityCache {
     pub fn len(&self) -> usize {
         self.entries.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 pub struct CapabilityProbe {
@@ -113,10 +117,12 @@ impl CapabilityProbe {
         let provider = OpenAiProvider::new(openai_config)?;
 
         // Connectivity/auth/model acceptance is the only mandatory probe.
-        let basic_request = probe_request(&self.config.model, StructuredMode::PromptOnly, None, None);
+        let basic_request =
+            probe_request(&self.config.model, StructuredMode::PromptOnly, None, None);
         let basic = provider.post_chat_request(&basic_request).await?;
         let mut capabilities = ProviderCapabilities::conservative_default();
-        capabilities.returns_usage = basic.prompt_tokens.is_some() || basic.completion_tokens.is_some();
+        capabilities.returns_usage =
+            basic.prompt_tokens.is_some() || basic.completion_tokens.is_some();
         let mut warnings = Vec::new();
 
         let schema = json!({
@@ -208,7 +214,9 @@ fn probe_request(
 ) -> ChatRequest {
     ChatRequest {
         model: model.to_owned(),
-        messages: vec![ChatMessage::user("Reply with a minimal JSON object: {\"ok\":true}.")],
+        messages: vec![ChatMessage::user(
+            "Reply with a minimal JSON object: {\"ok\":true}.",
+        )],
         temperature: Some(0.0),
         max_tokens: Some(16),
         response_format_json: None,
@@ -241,9 +249,22 @@ mod tests {
         let mut a = ProbeConfig::new("p", 3, "https://example.test/v1", "secret-a", "m");
         let mut b = a.clone();
         b.api_key = "secret-b".into();
-        assert_eq!(CapabilityProbe::new(a.clone()).cache_key(), CapabilityProbe::new(b).cache_key());
+        assert_eq!(
+            CapabilityProbe::new(a.clone()).cache_key(),
+            CapabilityProbe::new(b).cache_key()
+        );
         a.profile_revision += 1;
-        assert_ne!(CapabilityProbe::new(a).cache_key(), CapabilityProbe::new(ProbeConfig::new("p", 3, "https://example.test/v1", "secret-a", "m")).cache_key());
+        assert_ne!(
+            CapabilityProbe::new(a).cache_key(),
+            CapabilityProbe::new(ProbeConfig::new(
+                "p",
+                3,
+                "https://example.test/v1",
+                "secret-a",
+                "m"
+            ))
+            .cache_key()
+        );
     }
 
     #[test]

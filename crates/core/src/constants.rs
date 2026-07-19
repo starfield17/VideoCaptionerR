@@ -1,19 +1,13 @@
 //! Frozen default constants from the architecture manual (Appendix A).
 
-pub const MAX_WORD_COUNT_CJK: usize = 25;
+pub use videocaptionerr_domain::subtitle::constants::{
+    MAX_GAP_MS, MAX_WORD_COUNT_CJK, MAX_WORD_COUNT_ENGLISH, MERGE_MIN_WORDS, MERGE_SHORT_GAP_MS,
+    MERGE_VERY_SHORT_GAP_MS, MERGE_VERY_SHORT_WORDS, PREFIX_WORD_RATIO, RULE_SPLIT_GAP_MS,
+    SUFFIX_WORD_RATIO, TIME_GAP_MULTIPLIER, TIME_GAP_WINDOW_SIZE,
+};
+
 pub const LLM_TARGET_CJK_LENGTH: usize = 18;
-pub const MAX_WORD_COUNT_ENGLISH: usize = 18;
 pub const LLM_TARGET_ENGLISH_WORDS: usize = 12;
-pub const MAX_GAP_MS: u64 = 1500;
-pub const RULE_SPLIT_GAP_MS: u64 = 500;
-pub const MERGE_SHORT_GAP_MS: u64 = 200;
-pub const MERGE_VERY_SHORT_GAP_MS: u64 = 500;
-pub const MERGE_MIN_WORDS: usize = 5;
-pub const MERGE_VERY_SHORT_WORDS: usize = 3;
-pub const TIME_GAP_WINDOW_SIZE: usize = 5;
-pub const TIME_GAP_MULTIPLIER: u64 = 3;
-pub const PREFIX_WORD_RATIO: f64 = 0.6;
-pub const SUFFIX_WORD_RATIO: f64 = 0.4;
 pub const SEGMENT_WORD_THRESHOLD: usize = 500;
 pub const LLM_MAX_ITEMS: usize = 20;
 pub const CORRECTION_SIMILARITY: f64 = 0.7;

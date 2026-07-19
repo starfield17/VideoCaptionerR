@@ -1,9 +1,9 @@
-# VideoCaptionerR — Implementation Decisions and Architecture Manual
+# VideoCaptionerR — Implementation Decisions and DDD Architecture Manual
 
 > Final implementation baseline for coding and testing agents  
 > Repository: `https://github.com/starfield17/VideoCaptionerR`  
 > License: `GPL-3.0-only`  
-> Status: **Frozen implementation baseline for v1**
+> Status: **Frozen implementation baseline for v1, including the mandatory DDD architecture and existing-code migration plan**
 
 ---
 
@@ -16,6 +16,17 @@ This document combines and supersedes the implementation-relevant content of:
 3. the completed implementation questionnaire and all later corrections.
 
 It is intended to be handed directly to Claude Code, Codex, or another coding agent. It defines product scope, architecture, contracts, defaults, persistence rules, failure behavior, milestones, and acceptance gates.
+
+This DDD revision additionally defines:
+
+- the domain model and aggregate boundaries;
+- the application/use-case layer;
+- owned ports and external adapters;
+- bounded-context language;
+- the required dependency inversion;
+- a concrete migration plan for the partially implemented repository snapshot supplied with this document.
+
+DDD requirements in this document are normative. They are not an optional refactoring style and MUST be completed before the Batch scheduler and desktop shell are allowed to expand the current dependency graph.
 
 ### 0.1 Normative language
 
@@ -43,6 +54,39 @@ A coding agent MUST NOT reopen a frozen decision merely because another approach
 - required third-party licensing makes it impossible.
 
 In that case, the agent MUST state the exact contradiction and propose the smallest correction. It MUST NOT silently substitute another design.
+
+
+### 0.4 Existing-code baseline
+
+The migration instructions in this document are based on static inspection of the supplied `VideoCaptionerR-main.zip` source snapshot on 2026-07-19.
+
+The inspected snapshot contains approximately 10,000 lines of Rust across:
+
+- `contracts`;
+- `core`;
+- `asr`;
+- `llm`;
+- `store`;
+- `cli`;
+- `test-support`;
+- `whisper-helper`;
+- `xtask`.
+
+The repository has completed substantial M0-M2 work and contains an incomplete M3 LLM checkpoint. The coding agent MUST preserve already-correct behavior and tests while changing ownership and dependency direction.
+
+The source snapshot has one known compile-blocking inconsistency:
+
+```text
+crates/llm/src/lib.rs declares `pub mod agent;`
+but crates/llm/src/agent.rs does not exist.
+```
+
+Before measuring the migration baseline, the coding agent MUST either:
+
+1. restore the intended `agent.rs` implementation from the active work branch; or
+2. remove the module declaration temporarily if no code depends on it.
+
+It MUST NOT invent a large agent-loop implementation merely to silence this missing module. Implement that functionality in its correct DDD layer during the relevant migration phase.
 
 ---
 
@@ -176,6 +220,9 @@ v1 MUST NOT implement:
 8. **No hidden degradation:** every fallback is recorded and visible.
 9. **Deterministic export:** same IR and options produce byte-identical files.
 10. **No duplicated business logic:** CLI and GUI call the same application services.
+11. **Domain ownership:** business invariants live in domain aggregates or domain services, not in SQL, CLI branches, HTTP adapters, workers, or filesystem code.
+12. **Dependency inversion:** application use cases own the ports they require; ASR, LLM, SQLite, ffmpeg, subtitle codecs, and desktop/CLI code implement or call those ports from the outside.
+13. **Pragmatic DDD:** use aggregates, value objects, domain services, ports, and repositories only where they protect real invariants. Do not add ceremonial layers, generic repositories, or event sourcing.
 
 ---
 
@@ -220,32 +267,503 @@ CI and automated releases MAY be introduced only after the implementation is sub
 
 ---
 
-## 4. Repository and workspace layout
+## 4. Mandatory DDD architecture and workspace layout
 
-The initial workspace SHOULD be:
+VideoCaptionerR uses a pragmatic Domain-Driven Design plus ports-and-adapters architecture.
+
+DDD here means:
+
+- business terms have one precise meaning;
+- aggregate roots own their invariants and legal state transitions;
+- application use cases orchestrate work without owning infrastructure;
+- ports are owned by the application side that needs them;
+- external technology is implemented as replaceable adapters;
+- CLI and GUI are inbound adapters;
+- SQLite, ffmpeg, whisper runtimes, HTTP Providers, model downloads, and subtitle files are outbound adapters.
+
+DDD does **not** mean:
+
+- one crate per entity;
+- a generic repository abstraction;
+- getters/setters for every field;
+- event sourcing;
+- CQRS for simple reads;
+- wrapping every standard type in a newtype;
+- duplicating transport DTOs and domain types when they have identical stable semantics;
+- adding empty `domain/application/infrastructure` folders inside every crate.
+
+### 4.1 Ubiquitous language
+
+Coding agents MUST use the following terms consistently.
+
+| Term | Meaning and owner |
+|---|---|
+| `Batch` | Ordered execution request with one frozen ASR execution profile and one model-session lifetime |
+| `Job` | Processing request for one source media or imported subtitle document |
+| `Stage` | One named pipeline step such as Probe, ExtractAudio, ASR, Split, Correct, Translate, or Export |
+| `WorkUnit` | Independently retryable and commit-able part of a Stage, such as an ASR chunk or LLM batch |
+| `Artifact` | Immutable, validated, content-hashed output committed by a Stage or WorkUnit |
+| `Transcript` | Aggregate root for normalized words, cues, timeline rules, revisions, and field provenance |
+| `Cue` | Entity inside a Transcript identified by a stable cue ID |
+| `Word` | Immutable timestamped ASR value owned by a Transcript |
+| `ProfileRevision` | Immutable effective configuration snapshot referenced by a Batch/Job |
+| `ModelSession` | Loaded ASR model bound to one Batch execution profile |
+| `ProviderProfile` | LLM endpoint/model configuration with detected and overridden capabilities |
+| `StageSnapshot` | Immutable prompt/config/input snapshot used by all work units in one Stage run |
+| `Lease` | Time-bounded ownership of a running WorkUnit |
+| `DomainEvent` | Fact produced by a legal domain transition; not an instruction to external technology |
+
+Do not rename these concepts casually. In particular:
+
+- `Job` is not a process/thread;
+- `WorkUnit` is not the same as a Job;
+- `Artifact` is not an arbitrary temporary file;
+- `Transcript.revision` is not a database row version alone;
+- `ModelSession` lifetime is the Batch, not an individual Job.
+
+### 4.2 Bounded contexts and ownership
+
+The implementation has two core domain areas and several supporting/integration areas.
+
+#### 4.2.1 Subtitle Document domain
+
+Owns:
+
+- `Transcript`;
+- `Word`;
+- `Cue`;
+- cue IDs and tombstones;
+- timeline source;
+- field provenance/revisions;
+- manual split/merge/edit operations;
+- rule-based sentence splitting;
+- `TextJoiner`;
+- subtitle-quality rules that do not depend on a specific file codec;
+- stale-result protection inputs.
+
+It MUST NOT know about:
+
+- SQLite;
+- ffmpeg;
+- worker processes;
+- HTTP Providers;
+- output filesystem paths;
+- Tauri;
+- CLI formatting.
+
+#### 4.2.2 Processing Workflow domain
+
+Owns:
+
+- `Batch`;
+- `Job`;
+- `Stage`;
+- `WorkUnit`;
+- legal lifecycle transitions;
+- retry attempt counters and lease semantics;
+- Batch single-model invariant;
+- terminal-state semantics;
+- cancellation semantics at the state-model level;
+- immutable `ProfileRevision` identity;
+- immutable `ArtifactRef` metadata after commit;
+- domain events describing transitions.
+
+It MUST NOT start processes, send HTTP, write files, or execute SQL.
+
+#### 4.2.3 Supporting and integration areas
+
+These are not allowed to redefine core business rules:
+
+- Media integration: ffprobe, ffmpeg, media hashing, PCM extraction;
+- ASR integration: helper/worker protocol, model/runtime adapters, normalization adapter details;
+- LLM integration: OpenAI-compatible HTTP, capability probes, rate/circuit behavior;
+- Persistence: SQLite repositories, migrations, artifact-file implementation;
+- Subtitle I/O: SRT/VTT/ASS parsing and writing, output path allocation;
+- Runtime/platform: application paths, configuration files, instance lock, sidecar discovery;
+- Inbound interfaces: CLI and Tauri desktop.
+
+### 4.3 Layer responsibilities
+
+#### Domain layer
+
+The domain layer contains:
+
+- aggregate roots;
+- entities;
+- value objects;
+- domain services;
+- domain policies;
+- domain errors;
+- domain events.
+
+The domain layer MUST:
+
+- be deterministic;
+- be testable without network, filesystem, database, process spawning, Tokio runtime, or environment variables;
+- reject illegal state transitions;
+- expose behavior-oriented methods rather than requiring callers to mutate fields;
+- never depend on another VideoCaptionerR crate.
+
+The domain layer MAY depend on small serialization/schema crates because the canonical Transcript artifact is itself a frozen product contract. This is an explicit pragmatic exception. Serialization attributes MUST NOT contain persistence-specific SQL or Provider behavior.
+
+#### Application layer
+
+`videocaptionerr-core` becomes the application layer.
+
+It owns:
+
+- commands and use-case request/response types;
+- application services/use cases;
+- ports required by use cases;
+- orchestration across aggregates and adapters;
+- transaction/commit boundaries;
+- retry/degradation decisions defined by this manual;
+- mapping domain events to outbound work;
+- authorization of stale-result checks;
+- resource-independent scheduling decisions.
+
+It MUST NOT:
+
+- depend on concrete `asr`, `llm`, `store`, `platform`, or subtitle-codec crates;
+- call `std::fs`, `std::process`, `reqwest`, `rusqlite`, or Tauri;
+- create SQL;
+- discover binaries from PATH;
+- parse CLI flags;
+- format terminal output;
+- own an HTTP client or worker client;
+- directly create wall-clock timestamps or random IDs when deterministic injection is required.
+
+#### Infrastructure/outbound adapter layer
+
+Concrete outbound adapters include:
+
+- `videocaptionerr-store`;
+- `videocaptionerr-asr`;
+- `videocaptionerr-llm`;
+- `videocaptionerr-platform`;
+- helper/worker executables.
+
+They implement application ports and translate:
+
+```text
+application request
+<-> technology-specific request/response/error
+```
+
+Adapters MUST NOT decide:
+
+- pipeline order;
+- whether a Stage is skipped;
+- Batch FIFO semantics;
+- when a model is unloaded relative to Batch terminal state;
+- whether user edits may be overwritten;
+- cache invalidation policy;
+- retry budget beyond adapter-local transport attempts explicitly allowed here.
+
+#### Inbound adapter layer
+
+CLI and desktop:
+
+- parse/render;
+- acquire the exclusive processing instance through bootstrap/runtime services;
+- translate user actions into application commands;
+- subscribe to application events;
+- never execute SQL or invoke ASR/LLM adapters directly;
+- never duplicate validation already owned by domain/application.
+
+#### Composition root
+
+A dedicated bootstrap/runtime crate wires concrete adapters to application ports.
+
+Only the composition root is allowed to know the full concrete graph.
+
+### 4.4 Aggregate roots and invariants
+
+#### 4.4.1 Transcript aggregate
+
+`Transcript` remains the canonical subtitle-domain aggregate root.
+
+It owns:
+
+- immutable `words`;
+- `cues`;
+- `next_cue_id`;
+- transcript revision;
+- timeline source;
+- cue field origins and revisions.
+
+Legal mutations MUST occur through methods such as:
+
+```rust
+split_cue(...)
+merge_cues(...)
+replace_rule_split(...)
+apply_corrected_text(...)
+apply_translation(...)
+edit_text(...)
+edit_translation(...)
+restore_filtered_fragment(...)
+```
+
+Those method names are illustrative; exact APIs MAY differ.
+
+External crates MUST NOT directly:
+
+- replace `words`;
+- assign cue IDs;
+- decrement revisions;
+- alter ASR timestamps;
+- overwrite user-origin fields;
+- apply an LLM result without checking its bound revision.
+
+During migration, public fields MAY remain temporarily for Serde compatibility, but new code MUST use behavior methods. The migration is complete only when illegal mutations are structurally difficult or tested by a narrow mutation API.
+
+#### 4.4.2 Batch aggregate
+
+`Batch` owns:
+
+- ordered `JobId` membership;
+- frozen `BatchExecutionProfile`;
+- Batch lifecycle;
+- cancellation intent;
+- terminal result summary.
+
+It enforces:
+
+- all Jobs use the same ASR engine/model/device/compute type;
+- Job order is stable FIFO;
+- no Job-level ASR model override;
+- terminal Batch cannot return to Running;
+- model unload is requested exactly once after terminal transition.
+
+The domain event should express `BatchReachedTerminal`; the application layer reacts by closing/unloading the Batch model session.
+
+The domain does not call `unload_model()` itself.
+
+#### 4.4.3 Job aggregate
+
+`Job` owns:
+
+- source identity and selected stream;
+- frozen Profile revision reference;
+- ordered Stage states;
+- current Job status;
+- committed Artifact references;
+- cancellation/degradation/failure summary.
+
+It enforces legal Stage progression. A Stage cannot become Done before its prerequisite state and committed artifact requirements are satisfied.
+
+#### 4.4.4 WorkUnit aggregate
+
+`WorkUnit` owns:
+
+- unit identity and input hash;
+- state;
+- attempt;
+- lease;
+- error summary;
+- committed Artifact reference.
+
+It enforces:
+
+- one active lease;
+- Done units are not leased again;
+- terminal result after cancellation does not become Done without an explicit new attempt;
+- attempt increments on recovery/retry;
+- artifact association occurs only through the commit operation;
+- expired leases return through a legal recovery transition.
+
+#### 4.4.5 ProfileRevision and ArtifactRef
+
+`ProfileRevision` and committed `ArtifactRef` are immutable.
+
+Do not expose update methods that modify an existing revision or committed artifact identity in place. Create a new revision/artifact instead.
+
+### 4.5 Domain services and policies
+
+Use a domain service only when behavior does not naturally belong to one aggregate/entity.
+
+Approved domain services/policies include:
+
+- rule sentence splitter;
+- `TextJoiner`;
+- subtitle-quality evaluation independent of output codec;
+- translation/correction result validator;
+- canonical cache-key input policy;
+- legal Stage dependency policy.
+
+Do not move technology-specific behavior into a “domain service.” Examples that remain adapters:
+
+- ffmpeg command construction;
+- OpenAI JSON payload construction;
+- SQLite transactions;
+- Hugging Face downloads;
+- SRT byte encoding;
+- process-tree kill.
+
+### 4.6 Application ports
+
+Ports are defined by `videocaptionerr-core`, because the application owns the need.
+
+Do not define application-facing ports inside the concrete adapter crate merely because that adapter was implemented first.
+
+Required port families:
+
+```rust
+#[async_trait]
+pub trait BatchRepository { /* load/save Batch aggregate */ }
+
+#[async_trait]
+pub trait JobRepository { /* load/save Job aggregate and queries */ }
+
+#[async_trait]
+pub trait WorkUnitRepository { /* lease/recover/save WorkUnit */ }
+
+#[async_trait]
+pub trait ArtifactStore { /* write temp, validate, commit, read */ }
+
+#[async_trait]
+pub trait MediaGateway { /* probe, hash, extract */ }
+
+#[async_trait]
+pub trait AsrRuntime { /* open one Batch-scoped model session */ }
+
+#[async_trait]
+pub trait AsrSession { /* transcribe Jobs/chunks, unload/close */ }
+
+#[async_trait]
+pub trait LlmGateway { /* chat/capability operations used by use cases */ }
+
+#[async_trait]
+pub trait SubtitleGateway { /* import/export/output allocation */ }
+
+#[async_trait]
+pub trait EventPublisher { /* publish application/domain events */ }
+
+pub trait Clock { /* deterministic current time */ }
+
+pub trait IdGenerator { /* deterministic ULID-compatible IDs */ }
+```
+
+Exact signatures MAY be smaller. Avoid one method per SQL statement and avoid a single unbounded “god port.”
+
+Repository interfaces are aggregate-oriented. For example:
+
+```rust
+save_job(job)
+load_job(job_id)
+save_work_unit(unit)
+lease_next_ready_work_unit(...)
+```
+
+Do not expose:
+
+```rust
+execute_sql(...)
+connection()
+table_rows(...)
+generic Repository<T>
+```
+
+### 4.7 Application use cases
+
+At minimum, the application layer SHOULD converge on these use-case boundaries:
+
+```text
+CreateBatch
+RunBatch
+TranscribeJob
+ProcessJob
+ImportSubtitle
+ExportJob
+RetryFailedWorkUnits
+CancelBatch
+DeleteJob
+UpdateCue
+ProbeLlmCapabilities
+InstallOrVerifyModel
+Doctor
+CacheGc
+```
+
+A use case:
+
+1. accepts a command DTO;
+2. loads or creates aggregates through repositories;
+3. invokes aggregate behavior;
+4. calls required ports;
+5. commits artifacts through the required atomic protocol;
+6. persists aggregate state;
+7. publishes resulting events;
+8. returns a response DTO.
+
+A long-running Stage is not wrapped in one long SQLite transaction. Persist state transitions at explicit boundaries.
+
+### 4.8 Batch-scoped ASR session
+
+The application design MUST make the Batch model lifetime structurally clear.
+
+Recommended shape:
+
+```rust
+pub trait AsrRuntime {
+    async fn open_session(
+        &self,
+        profile: &BatchExecutionProfile,
+    ) -> AppResult<Box<dyn AsrSession>>;
+}
+
+pub trait AsrSession {
+    fn descriptor(&self) -> &EngineDescriptor;
+
+    async fn transcribe(
+        &mut self,
+        request: AsrTranscribeRequest,
+        events: &dyn EventPublisher,
+    ) -> AppResult<AsrRawResult>;
+
+    async fn close(self: Box<Self>) -> AppResult<()>;
+}
+```
+
+`RunBatch`:
+
+1. opens one session;
+2. processes Jobs in FIFO order;
+3. keeps the session across Job failures when Batch policy continues;
+4. transitions the Batch to terminal;
+5. closes/unloads the model once;
+6. records cleanup failure without rewriting the already-determined Batch business result.
+
+`TranscribeJob` MUST NOT unload or shut down the model.
+
+### 4.9 Final workspace layout
+
+The target v1 workspace is:
 
 ```text
 VideoCaptionerR/
 ├── Cargo.toml
 ├── crates/
-│   ├── contracts/       # IR, protocol, events, error codes, schema source
-│   ├── core/            # pipeline and application/business services
-│   ├── asr/             # ASR traits, helpers, worker clients, adapters
-│   ├── llm/             # provider client, capability probe, agent loop
-│   ├── store/           # SQLite store actor, migrations, artifact metadata
-│   ├── cli/             # clap adapter and terminal/NDJSON rendering
-│   └── test-support/    # fake worker, fake provider, fault injection fixtures
+│   ├── domain/          # pure aggregates, value objects, domain services/policies/events
+│   ├── contracts/       # external/persisted DTOs, protocol, event envelope, error codes, schemas
+│   ├── core/            # application ports, commands, use cases, orchestration
+│   ├── asr/             # ASR outbound adapters and worker/helper client
+│   ├── llm/             # LLM outbound adapters, HTTP, capability probe, circuit
+│   ├── store/           # SQLite repository/artifact adapter and migrations
+│   ├── platform/        # config, paths, media/ffmpeg, subtitle I/O, instance lock, sidecars
+│   ├── bootstrap/       # composition root shared by CLI and desktop
+│   ├── cli/             # inbound CLI adapter and rendering only
+│   ├── test-support/    # fake ports/adapters and deterministic clocks/IDs
+│   └── whisper-helper/  # isolated whisper.cpp/fake protocol executable
 ├── apps/
-│   └── desktop/         # Tauri 2 + React + TypeScript + Vite
+│   └── desktop/         # Tauri inbound adapter
 ├── python/
 │   └── runtimes/
 │       ├── faster-whisper/
 │       └── mlx-whisper/
 ├── prompts/
-│   ├── split/
-│   ├── correct/
-│   └── translate/
-├── schemas/             # generated; do not hand-edit
+├── schemas/
 ├── migrations/
 ├── tools/
 │   └── xtask/
@@ -253,42 +771,149 @@ VideoCaptionerR/
     └── adr/
 ```
 
-### 4.1 Dependency direction
+`platform` is one pragmatic supporting crate. Do not split it further unless compile/platform boundaries become materially painful.
 
-The dependency direction MUST remain acyclic:
+### 4.10 Target dependency direction
+
+The target internal dependency graph is:
 
 ```text
-CLI / Desktop
-    -> application services in core
-        -> contracts
-        -> asr
-        -> llm
-        -> store
+domain
+  ↑
+contracts
+  ↑
+core (application ports/use cases)
+  ↑              ↑              ↑              ↑
+store          asr            llm          platform
+   \             |              |              /
+    \            |              |             /
+              bootstrap
+                 ↑
+           CLI / Desktop
 ```
 
-`contracts` MUST NOT depend on UI, database, scheduling, or runtime implementations.
-
-`core` MUST NOT import Tauri, React, or terminal-rendering concerns.
-
-`asr` and `llm` MUST NOT own Job scheduling or persistence policy.
-
-### 4.2 Technology selections
+More precisely:
 
 ```text
-Rust async runtime: Tokio
+domain:
+  depends on no VideoCaptionerR crate
+
+contracts:
+  may depend on domain
+  MUST NOT depend on core or adapters
+
+core:
+  depends on domain + contracts
+  MUST NOT depend on store/asr/llm/platform/bootstrap/cli/desktop
+
+store/asr/llm/platform:
+  may depend on domain + contracts + core
+  MUST NOT depend on CLI/Desktop
+  MUST NOT depend on bootstrap
+
+bootstrap:
+  depends on core and concrete adapters
+  contains the composition root
+
+CLI/Desktop:
+  depend on bootstrap and stable command/event contracts
+  MUST NOT depend directly on store/asr/llm internals
+```
+
+`whisper-helper` remains an independent executable depending on protocol/contracts and its runtime binding. It does not depend on application use cases.
+
+### 4.11 Forbidden dependency and API rules
+
+The following are mandatory architecture gates:
+
+- no `videocaptionerr-store`, `videocaptionerr-asr`, `videocaptionerr-llm`, or `videocaptionerr-platform` dependency in `crates/core/Cargo.toml`;
+- no `rusqlite`, `reqwest`, Tauri, ffmpeg process invocation, or filesystem writes in `domain` or application-use-case modules;
+- no raw SQL outside `store`;
+- no public SQLite connection escape hatch;
+- no CLI/Tauri branch that calls an adapter directly;
+- no adapter that imports CLI/Desktop;
+- no domain type that uses `chrono::Utc::now()`, random ULID creation, environment variables, or global configuration;
+- no error mapping by parsing human-readable error strings;
+- no direct aggregate-state update from repository SQL without passing through an allowed transition or validated reconstruction path.
+
+Add an `xtask verify-architecture` command that uses `cargo metadata` and source checks to enforce at least the Cargo dependency rules and raw-SQL/forbidden-import checks.
+
+### 4.12 Contracts and domain serialization
+
+Business ownership and schema ownership are distinct:
+
+- `domain` owns business semantics and invariants;
+- `contracts` owns persisted/external schema exposure, protocol envelopes, stable error codes, and cross-language generation.
+
+For the canonical Transcript artifact, either of these is acceptable:
+
+1. domain aggregate types derive Serde/Schemars directly and `contracts` re-exports them; or
+2. `contracts` defines `TranscriptDto` with explicit lossless conversion to/from the domain aggregate.
+
+For v1 migration, option 1 is recommended because it preserves the existing JSON schema and minimizes churn.
+
+During migration:
+
+```rust
+// contracts compatibility module
+pub mod transcript {
+    pub use videocaptionerr_domain::subtitle::*;
+}
+```
+
+This compatibility re-export MAY remain through v1. New domain/application code SHOULD import domain types from `videocaptionerr-domain` directly.
+
+### 4.13 Composition root and shared shell
+
+Add `videocaptionerr-bootstrap`.
+
+It owns construction of:
+
+- `Sqlite...Repository` adapters;
+- artifact adapter;
+- ffmpeg/media adapter;
+- subtitle I/O adapter;
+- ASR runtime adapter;
+- LLM Provider adapters;
+- event publisher;
+- clock and ID generator;
+- application use-case facade.
+
+CLI and Tauri use the same bootstrap facade.
+
+The bootstrap crate may resolve configuration and platform paths, but it MUST NOT contain subtitle business rules or pipeline state transitions.
+
+### 4.14 Pragmatic limits
+
+To keep the project “simple but work”:
+
+- do not add a dependency-injection framework;
+- use explicit constructors and `Arc<dyn Port>` where runtime polymorphism is required;
+- use concrete types in pure domain tests;
+- do not create a message bus for in-process calls;
+- domain events may be simple enums returned from methods;
+- do not implement event sourcing;
+- do not add generic Unit of Work abstractions; create explicit repository commit operations needed by Stage/artifact atomicity;
+- do not split the domain crate by bounded context into more crates in v1;
+- do not rename `videocaptionerr-core` merely to make it say “application”; document its role and keep the stable package name.
+
+### 4.15 Technology selections
+
+```text
+Rust async runtime: Tokio, outside the pure domain layer
 Desktop: Tauri 2
 Frontend: React + TypeScript + Vite
 Frontend package manager: pnpm
-Database access: rusqlite
-Database write model: single-writer store actor
-Public identifiers: ULID strings
-User-editable configuration: TOML
-Schema generation: Rust contracts -> xtask -> JSON Schema / TS / Python fixtures
+Database access: rusqlite in the store adapter
+Database write model: true single-writer store actor
+Public identifiers: ULID-compatible domain IDs generated through IdGenerator
+User-editable configuration: TOML in the platform adapter
+Schema generation: domain/contracts -> xtask -> JSON Schema / TS / Python fixtures
+Dependency wiring: explicit bootstrap constructors, no DI framework
 ```
 
 Do not introduce an ORM unless a later decision explicitly replaces `rusqlite`.
 
----
 
 ## 5. Application directories and configuration
 
@@ -370,27 +995,31 @@ A Job snapshot references a provider profile by stable ID/revision and stores no
 
 ## 6. Core contracts and schemas
 
-### 6.1 Single source of truth
+### 6.1 Business and contract sources of truth
 
-Rust types in `crates/contracts` are the source of truth for:
+The sources of truth are split deliberately:
 
-- Transcript IR;
-- worker protocol;
-- helper protocol;
-- CLI event envelope;
-- GUI command/event payloads;
-- error codes;
-- artifact metadata;
-- profile and capability schemas.
+```text
+crates/domain:
+  business semantics, aggregates, invariants, legal transitions
 
-`xtask` SHOULD generate:
+crates/contracts:
+  persisted/external schemas, protocol, events, stable error codes,
+  artifact metadata, capability DTOs, and schema generation surface
+```
+
+The canonical Transcript business type is owned by `domain`. For v1, `contracts` SHOULD re-export the same type for schema compatibility rather than maintain a divergent copy.
+
+`xtask` generates:
 
 - JSON Schema;
 - TypeScript interfaces;
 - Python schema fixtures/constants;
-- stable error-code lists.
+- stable error-code lists;
+- optional architecture dependency reports.
 
 Python and TypeScript MUST NOT maintain divergent hand-written copies of business defaults.
+
 
 ### 6.2 Schema compatibility
 
@@ -528,6 +1157,25 @@ It MUST handle:
 - Unicode NFC normalization in normalized IR while preserving raw adapter output separately.
 
 Do not use `join(" ")` as the universal word assembly strategy.
+
+
+### 7.7 Aggregate mutation boundary
+
+`Transcript` is not a passive transport bag even when it derives Serde.
+
+New code MUST use domain methods for:
+
+- cue allocation;
+- split/merge;
+- source or translation edits;
+- LLM result application;
+- filtered-fragment restoration;
+- revision increments;
+- user-origin protection.
+
+Deserialization/reconstruction MUST call `validate()` or an equivalent checked constructor before the object is used.
+
+Repository and adapter code may reconstruct from persisted data, but MUST NOT apply business mutations directly.
 
 ---
 
@@ -1580,6 +2228,64 @@ Expose only:
 
 Unknown progress is indeterminate, not a fabricated percentage.
 
+
+### 20.8 Workflow aggregate transitions
+
+Persisted state strings are representations of typed domain states, not the state model itself.
+
+At minimum define typed enums for:
+
+```rust
+BatchStatus
+JobStatus
+StageStatus
+WorkUnitStatus
+```
+
+Transition methods MUST reject illegal transitions. Examples:
+
+```text
+Pending -> Running
+Running -> Done / DoneDegraded / Failed / Cancelled / WaitingProvider
+Running lease expired -> Pending with attempt + 1
+Done -> no transition except explicit invalidation creating a new run/revision
+Batch terminal -> no return to Running
+```
+
+SQL MUST NOT contain hidden transition logic that is absent from the domain/application layer.
+
+### 20.9 Use-case orchestration
+
+The current linear pipeline is implemented as application use cases and Stage runners, not one function that owns every adapter.
+
+Recommended decomposition:
+
+```text
+RunBatch
+  -> open Batch-scoped ASR session
+  -> for each ordered Job:
+       PrepareMedia
+       RunAsrStage
+       RunSplitStage
+       RunCorrectStage
+       RunTranslateStage
+       RunExportStage
+  -> finalize Batch
+  -> unload model session
+```
+
+Stage runners MAY be internal application services. They must still depend only on ports.
+
+Every Stage runner has explicit:
+
+- input snapshot identity;
+- ready/prerequisite check;
+- work-unit plan;
+- success artifact kind;
+- degradation/failure mapping;
+- cancellation boundary;
+- commit boundary.
+
 ---
 
 ## 21. State store, artifacts, and recovery
@@ -1640,6 +2346,43 @@ Enable:
 - foreign keys;
 - busy timeout;
 - application instance lock.
+
+
+### 21.3.1 Repository ownership
+
+Repository traits live in `core::ports`, while SQLite implementations live in `store`.
+
+The store adapter MUST expose domain/application operations rather than a public connection.
+
+Remove or make private any API equivalent to:
+
+```rust
+pub fn conn(&self) -> &rusqlite::Connection
+```
+
+CLI and desktop MUST use application queries/use cases such as:
+
+```text
+ListJobs
+DeleteJob
+RetryFailedWorkUnits
+```
+
+They MUST NOT prepare SQL.
+
+### 21.3.2 True single-writer behavior
+
+The inspected code uses `Arc<Mutex<Store>>`, which serializes callers but is not a dedicated store actor and may block async executor threads.
+
+Before M5 scheduler concurrency, replace it with one of:
+
+1. a dedicated blocking database thread receiving typed commands and replying through oneshot channels; or
+2. a strictly controlled `spawn_blocking` executor with one owned connection and typed command queue.
+
+Option 1 is recommended.
+
+The application layer only sees async repository ports. It does not know whether rusqlite is blocking.
+
 
 ### 21.4 Stage commit protocol
 
@@ -1737,30 +2480,31 @@ A manual diagnostic/export command SHOULD be provided.
 
 ## 22. GUI and CLI
 
-### 22.1 Shared application services
+### 22.1 Shared application services and composition root
 
 Conceptually:
 
 ```text
-                   CLI adapter
-                  /
-Application service
-                  \
-                   Tauri desktop adapter
+CLI adapter --------\
+                     -> bootstrap -> application use cases -> owned ports
+Tauri adapter ------/                                  <- concrete adapters
 ```
 
-The GUI is a shell over the same command/application layer as the CLI. It SHOULD NOT repeatedly spawn the CLI binary as a subprocess for normal operations.
+The GUI is a shell over the same command/application layer as the CLI. It MUST NOT repeatedly spawn the CLI binary for normal operations.
 
 Both use the same:
 
-- command structs;
+- application command/response types;
 - validation;
-- scheduler;
-- store actor;
+- Batch scheduler;
+- repositories through ports;
 - event schemas;
 - error codes;
-- OutputPlanner;
-- Doctor.
+- output planning use case;
+- Doctor use case.
+
+The CLI/Desktop crates MUST NOT directly depend on concrete store/ASR/LLM internals once the DDD migration is complete.
+
 
 ### 22.2 Exclusive processing instance
 
@@ -2039,6 +2783,28 @@ The following are release-blocking at the milestone that introduces the componen
 
 A milestone is not complete if its cancellation, timeout, crash, and recovery tests are deferred.
 
+
+### 24.7 Architecture tests
+
+Add a local architecture gate:
+
+```bash
+cargo run -p xtask -- verify-architecture
+```
+
+It MUST fail when:
+
+- `domain` depends on another VideoCaptionerR crate;
+- `core` depends on `store`, `asr`, `llm`, `platform`, `bootstrap`, `cli`, or desktop;
+- CLI/Desktop directly depend on store internals;
+- raw SQL exists outside `store`;
+- `domain` imports `reqwest`, `rusqlite`, Tauri, Tokio process, or filesystem/process APIs;
+- application-use-case modules invoke filesystem/process/network/database APIs;
+- a public `Store::conn()`-style escape hatch exists;
+- known aggregate fields are directly mutated outside approved domain modules after the compatibility phase.
+
+The check SHOULD use `cargo metadata` for dependency rules and targeted source scanning for forbidden imports. It is a local gate and does not imply early CI.
+
 ---
 
 ## 25. Implementation milestones
@@ -2117,6 +2883,41 @@ Gate:
 - cancellation timeout/kill tests;
 - CPU end-to-end subtitle export;
 - adapter structural conformance.
+
+
+## M2.5 — Mandatory DDD extraction and dependency inversion
+
+This migration is required before expanding the current M3 WIP or starting M5 scheduler work.
+
+Implement:
+
+1. add `videocaptionerr-domain`;
+2. move/re-export Transcript and IDs without changing JSON shape;
+3. move rule split and TextJoiner into the domain;
+4. add Batch/Job/Stage/WorkUnit typed aggregates and transitions;
+5. define application ports in `videocaptionerr-core`;
+6. replace `run_transcribe` with an injected `TranscribeJob` use case;
+7. add `platform` and `bootstrap` crates;
+8. make store/ASR/LLM/platform implement application ports;
+9. remove concrete adapter dependencies from `core`;
+10. remove direct SQL and concrete adapter calls from CLI;
+11. add architecture verification tests;
+12. preserve M0-M2 observable behavior and artifact schemas.
+
+Gate:
+
+```text
+cargo fmt --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace
+cargo run -p xtask -- verify-architecture
+existing fake-helper transcribe vertical slice still passes
+existing JSON schemas remain backward compatible
+CLI jobs list/delete use application use cases, not SQL
+core Cargo.toml has no store/asr/llm/platform dependency
+```
+
+Do not continue building a scheduler around the pre-DDD `run_transcribe` function.
 
 ## M3 — LLM pipeline
 
@@ -2275,6 +3076,23 @@ A feature is complete only when all applicable statements are true:
 - `fmt`, `clippy -D warnings`, and relevant tests pass locally;
 - every changed line is connected to the task.
 
+
+### 26.1 DDD completion conditions
+
+A task that changes business behavior is incomplete unless:
+
+- the invariant has one domain owner;
+- the application use case invokes behavior through that owner;
+- infrastructure does not reproduce the rule;
+- repository updates preserve legal transitions;
+- adapter errors are translated to stable application errors;
+- tests cover the aggregate transition and the use-case path;
+- the dependency direction remains valid.
+
+An infrastructure task is incomplete if it requires `core` to import the adapter.
+
+A CLI/GUI task is incomplete if it performs SQL, filesystem orchestration, worker calls, or Provider calls directly.
+
 ---
 
 ## 27. Coding-task template
@@ -2293,6 +3111,9 @@ Allowed changes:
 
 Forbidden changes:
   List frozen interfaces and unrelated areas.
+
+Dependency rule:
+  State which crate/layer may depend on which other crate/layer.
 
 Invariants:
   3-8 explicit rules.
@@ -2329,7 +3150,7 @@ Do not assign “implement worker + scheduler + GUI” as one task. A suitable d
 
 Create concise ADRs before or during M0/M1 for:
 
-1. Rust core is the only business-logic layer;
+1. Rust domain owns business invariants; `core` is the application/use-case layer;
 2. Transcript word timeline is immutable;
 3. A2 is the minimum full ASR capability;
 4. versioned stdio NDJSON protocol;
@@ -2351,6 +3172,22 @@ Create concise ADRs before or during M0/M1 for:
 20. exclusive GUI/CLI processing instance;
 21. JSON artifacts as full-data authority and SQLite as control authority;
 22. no early CI/private corpus/no WER-CER v1 policy.
+23. pragmatic DDD and bounded-context ownership;
+24. domain/application/infrastructure dependency inversion;
+25. application-owned ports and adapter implementations;
+26. Transcript, Batch, Job, and WorkUnit aggregate boundaries;
+27. shared bootstrap composition root for CLI/Desktop;
+28. no raw SQL or concrete adapter access from inbound interfaces.
+
+The existing repository ADR `docs/adr/0001-rust-core-business-logic.md` is partially superseded. Replace it with a new ADR or amend it so that:
+
+```text
+domain = owner of business invariants and domain behavior
+core   = owner of application use cases, ports, and orchestration
+Python/GUI/adapters = no duplicated business rules
+```
+
+Its original intent—Rust, not Python or GUI, owns business behavior—remains valid.
 
 ---
 
@@ -2547,3 +3384,531 @@ The following earlier recommendations are intentionally replaced:
 | in-process whisper-rs | isolated Rust helper process |
 
 All other compatible contracts from the two source manuals remain active.
+
+---
+
+## Appendix E — Existing-code DDD migration plan
+
+This appendix is specific to the inspected `VideoCaptionerR-main.zip` snapshot. It tells a coding agent what to change next.
+
+### E.1 Static assessment summary
+
+The current code has strong foundations:
+
+- `Transcript` already validates timestamps/ranges and owns revision/cue-ID helpers;
+- word timeline immutability is represented;
+- worker/helper protocol and capability descriptor are separated;
+- JSON artifacts and SQLite metadata are distinguished;
+- fake ASR and fake LLM components exist;
+- LLM capability probing, circuit breaker, prompt snapshot utilities, and token estimation have begun;
+- ADRs already freeze most non-DDD decisions.
+
+The current code is not yet DDD-compliant because:
+
+1. `core` depends directly on `store`, `asr`, and `llm`;
+2. `core::pipeline::run_transcribe` directly performs application orchestration, process/runtime control, filesystem writes, output planning, and SQLite state changes;
+3. `core` contains concrete ffmpeg/ffprobe, filesystem subtitle I/O, configuration I/O, and path logic;
+4. CLI directly opens SQLite, calls `Store::conn()`, prepares SQL, and deletes rows;
+5. ports are currently owned by adapter crates (`AsrEngine`, `LlmProvider`) rather than the application-facing need;
+6. persisted lifecycle states are mostly raw strings or infrastructure enums, not domain aggregates;
+7. current model unload happens inside one Job transcription;
+8. failure paths may return while Job/WorkUnit remain `running`;
+9. the work-unit placeholder input identity is based on a path string;
+10. `StoreHandle` is a mutex wrapper, not the documented dedicated actor;
+11. human error text is parsed to determine CLI exit codes;
+12. `contracts` mixes the domain aggregate with transport/protocol ownership;
+13. aggregate fields can be directly mutated across crates;
+14. `crates/llm/src/lib.rs` references a missing `agent.rs`.
+
+This is a dependency/ownership migration, not a rewrite.
+
+### E.2 Required target crates
+
+Add to the workspace:
+
+```text
+crates/domain
+crates/platform
+crates/bootstrap
+```
+
+Add workspace dependencies:
+
+```toml
+videocaptionerr-domain = { path = "crates/domain" }
+videocaptionerr-platform = { path = "crates/platform" }
+videocaptionerr-bootstrap = { path = "crates/bootstrap" }
+```
+
+Do not delete existing crates.
+
+### E.3 File ownership map
+
+| Current file/module | Target owner | Required action |
+|---|---|---|
+| `contracts/src/transcript.rs` | `domain/src/subtitle/transcript.rs` | move business type/behavior; keep contracts compatibility re-export |
+| `contracts/src/ids.rs` | `domain/src/identity.rs` | move domain IDs/generator-independent value objects; re-export from contracts |
+| `core/src/constants.rs` | domain/application/platform by meaning | move subtitle policy constants to domain; leave non-domain defaults near owning adapter |
+| `core/src/text_joiner.rs` | `domain/src/subtitle/text_joiner.rs` | move with tests unchanged |
+| `core/src/split/rule.rs` | `domain/src/subtitle/split.rs` | move as domain service; map domain errors at boundary |
+| `core/src/subtitle/preflight.rs` | domain quality policy + platform report adapter | split pure cue/timing diagnostics from codec/file concerns |
+| `core/src/media/probe.rs` | `platform/src/media/probe.rs` | move concrete ffprobe adapter |
+| `core/src/media/extract.rs` | `platform/src/media/extract.rs` | move concrete ffmpeg adapter |
+| `core/src/media/hash.rs` | `platform/src/media/hash.rs` | move file/PCM hashing adapter |
+| `core/src/subtitle/import.rs` | `platform/src/subtitle_io/import.rs` | move SRT/VTT parsing adapter |
+| `core/src/subtitle/export.rs` | `platform/src/subtitle_io/export.rs` | move deterministic file writer adapter |
+| `core/src/subtitle/time.rs` | `platform/src/subtitle_io/time.rs` | move codec time parsing/formatting |
+| `core/src/subtitle/planner.rs` | `platform/src/subtitle_io/planner.rs` | move filesystem conflict allocator; expose through application port |
+| `core/src/config.rs` | `platform/src/config.rs` | move TOML I/O; keep effective-config command DTO in application/contracts |
+| `core/src/pipeline.rs` | `core/src/use_cases/transcribe_job.rs` | rewrite as injected use case; no direct concrete adapter imports |
+| `asr/src/engine.rs` | adapter plus `core::ports::asr` | application-facing session port belongs in core; adapter implements it |
+| `llm/src/provider.rs` | LLM adapter internal + `core::ports::llm` | retain HTTP/provider primitive; implement application gateway |
+| `store/src/store.rs` | repository adapter | implement core repository ports; remove connection escape hatch |
+| `store/src/paths.rs` | `platform/src/paths.rs` | move application/platform path ownership |
+| `store/src/instance_lock.rs` | `platform/src/instance_lock.rs` | move process-instance concern |
+| `store/src/artifact.rs` | store/artifact adapter | keep atomic file implementation if cohesive; implement `ArtifactStore` port |
+| `cli/src/main.rs` | inbound adapter | parse commands/render responses only; call bootstrap application facade |
+| `test-support/fake_asr.rs` | fake application port | implement `AsrRuntime/AsrSession`, not only adapter-owned trait |
+| `test-support/fake_llm.rs` | fake application port | implement `LlmGateway`; lower-level provider fake may remain |
+| `whisper-helper` | protocol helper | keep independent; no domain/application dependency needed |
+| `xtask` | architecture/schema tooling | add `verify-architecture` |
+
+### E.4 Migration sequence
+
+The sequence is mandatory because it keeps the tree buildable and avoids a big-bang rewrite.
+
+#### DDD-0 — Freeze and repair baseline
+
+Tasks:
+
+1. restore or remove the missing `llm::agent` module declaration;
+2. run and record baseline:
+   ```bash
+   cargo fmt --check
+   cargo clippy --workspace --all-targets --all-features -- -D warnings
+   cargo test --workspace
+   ```
+3. run one fake-helper transcription;
+4. save generated schema hashes;
+5. do not change behavior yet.
+
+Acceptance:
+
+- baseline compiles;
+- failures are recorded before migration;
+- no speculative implementation is added.
+
+#### DDD-1 — Extract domain without changing public JSON
+
+Tasks:
+
+1. create `videocaptionerr-domain`;
+2. move Transcript/Word/Cue/timeline/provenance logic;
+3. move typed IDs;
+4. create `DomainError` and checked constructors;
+5. move `TextJoiner`;
+6. move rule splitting and its constants;
+7. add workflow state enums and transition tests;
+8. make `contracts` re-export migrated types;
+9. preserve existing serialized field names and schema version.
+
+Acceptance:
+
+- old imports remain compiling through compatibility re-exports;
+- transcript JSON schema has no unintended breaking change;
+- domain has no internal VideoCaptionerR dependency;
+- domain tests run without filesystem/process/network/database.
+
+#### DDD-2 — Add application ports and use-case skeleton
+
+Create:
+
+```text
+crates/core/src/
+├── commands/
+├── ports/
+│   ├── repositories.rs
+│   ├── media.rs
+│   ├── asr.rs
+│   ├── llm.rs
+│   ├── subtitle.rs
+│   ├── artifact.rs
+│   ├── events.rs
+│   └── system.rs
+├── use_cases/
+│   ├── transcribe_job.rs
+│   ├── run_batch.rs
+│   ├── list_jobs.rs
+│   ├── delete_job.rs
+│   └── probe_llm_capabilities.rs
+└── lib.rs
+```
+
+Tasks:
+
+1. define the minimum port signatures needed by current behavior;
+2. implement `TranscribeJob` using injected ports;
+3. do not yet delete the old `run_transcribe`;
+4. create fakes for every new port;
+5. reproduce current fake-helper vertical slice in a pure application test.
+
+Acceptance:
+
+- the new use case contains no concrete adapter imports;
+- application tests use fakes only;
+- no DI framework;
+- no generic repository.
+
+#### DDD-3 — Extract concrete platform adapters
+
+Tasks:
+
+1. add `videocaptionerr-platform`;
+2. move media/config/path/instance-lock/subtitle-I/O code;
+3. implement `MediaGateway` and `SubtitleGateway`;
+4. preserve output names and artifact byte determinism;
+5. keep compatibility re-exports temporarily if needed.
+
+Acceptance:
+
+- `core` no longer uses `std::fs`/`std::process` for pipeline work;
+- existing media/subtitle tests pass in platform;
+- deterministic output hashes remain unchanged.
+
+#### DDD-4 — Adapt ASR/LLM/store
+
+ASR:
+
+1. define `AsrRuntime` and Batch-scoped `AsrSession` in core;
+2. implement them around current `WorkerClient`;
+3. keep helper protocol unchanged;
+4. move normalization ownership deliberately:
+   - adapter-specific unit/time normalization remains ASR adapter;
+   - creation/acceptance of valid Transcript uses domain checked construction.
+
+LLM:
+
+1. retain OpenAI HTTP, probing, circuit, tolerant parse, and low-level Provider types in `llm`;
+2. implement `LlmGateway`;
+3. place subtitle-specific correction/translation validation in domain/application, not the HTTP adapter;
+4. implement the missing generic agent-loop behavior in application only when M3 requires it.
+
+Store:
+
+1. implement typed aggregate repository ports;
+2. map rows to checked domain reconstruction;
+3. remove public `conn()`;
+4. move ULID/time creation to injected application services where required;
+5. replace raw status strings at boundaries with typed states;
+6. retain migration SQL and atomic transaction behavior.
+
+Acceptance:
+
+- adapters depend inward on core ports;
+- core has no adapter dependencies;
+- CLI cannot access SQL;
+- stable `VcError` mapping is structural.
+
+#### DDD-5 — Add bootstrap and migrate CLI
+
+Tasks:
+
+1. add `videocaptionerr-bootstrap`;
+2. wire repositories, ports, clock, IDs, and application facade;
+3. migrate `doctor`, `transcribe`, `jobs list`, and `jobs rm`;
+4. remove CLI dependencies on `store`, `asr`, and `llm` internals;
+5. remove SQL from CLI;
+6. replace string-matching exit mapping with `VcError.code`/typed application errors.
+
+Acceptance:
+
+```text
+rg "SELECT |INSERT |UPDATE |DELETE " crates/cli -> no matches
+rg "\.conn\(" crates/cli -> no matches
+CLI Cargo.toml -> no store/asr/llm direct dependency
+```
+
+CLI output and exit semantics remain compatible.
+
+#### DDD-6 — Replace old pipeline and correct lifecycle
+
+Tasks:
+
+1. switch production transcribe command to `TranscribeJob`;
+2. delete or reduce the old `run_transcribe` compatibility wrapper;
+3. ensure every failure path updates Job/Stage/WorkUnit state;
+4. remove `media_hash_placeholder(path)`;
+5. compute/commit correct input hashes;
+6. commit Probe, Extract, ASR, Split, and Export artifacts with correct Stage labels;
+7. stop ignoring directory/model-cleanup errors without structured recording;
+8. move model unload from Job use case to `RunBatch`;
+9. create a one-Job Batch for the existing transcribe command.
+
+Acceptance:
+
+- a Job failure never remains Running without a live lease;
+- current single-file behavior still works;
+- model is loaded once and unloaded after Batch terminal;
+- Stage artifact metadata names the real producing Stage.
+
+#### DDD-7 — Implement true store actor before M5 concurrency
+
+Tasks:
+
+1. create typed store commands;
+2. own the rusqlite connection on one dedicated blocking thread;
+3. return through oneshot responses;
+4. keep reads either on that actor or a clearly safe read path;
+5. eliminate blocking mutex use from async application paths;
+6. add actor shutdown/recovery tests.
+
+Acceptance:
+
+- one writer connection;
+- no `Arc<Mutex<Store>>` on async request paths;
+- cancellation does not corrupt the command channel;
+- migrations and artifact transactions remain deterministic.
+
+#### DDD-8 — Continue M3-M8 on the new architecture
+
+Only after DDD-0 through DDD-6 pass may coding agents add substantial new LLM Stage orchestration or Batch scheduler behavior.
+
+M5 MUST also require DDD-7.
+
+### E.5 Current `run_transcribe` changes
+
+The existing function currently performs too many responsibilities:
+
+```text
+input validation
+Job ID and directory creation
+DB Job/WorkUnit insert
+probe
+audio selection
+artifact write
+media hash
+ffmpeg extraction
+PCM hash
+worker spawn
+capability validation
+model load
+event drain
+ASR
+model unload/shutdown
+raw artifact write
+normalization
+split
+output planning
+export preflight
+export write
+artifact metadata creation
+DB commit
+Job finalization
+```
+
+Replace it with:
+
+```text
+RunBatchUseCase
+  owns Batch/session lifecycle
+
+TranscribeJobUseCase
+  orchestrates one Job through ports
+
+domain services
+  own split/TextJoiner/Transcript invariants
+
+platform adapter
+  owns ffprobe/ffmpeg/files/subtitle codecs/output allocation
+
+ASR adapter
+  owns worker/helper communication
+
+store adapter
+  owns SQL and atomic metadata transaction
+```
+
+Do not merely divide the original function into many private functions while preserving concrete dependencies. The dependency direction must change.
+
+### E.6 Required new domain APIs
+
+The exact signatures may vary, but tests must demonstrate behavior equivalent to:
+
+```rust
+impl Transcript {
+    pub fn apply_rule_split(&self, plan: SplitPlan) -> DomainResult<Self>;
+    pub fn edit_text(&self, cue_id: CueId, expected_revision: u64, text: String)
+        -> DomainResult<Self>;
+    pub fn edit_translation(
+        &self,
+        cue_id: CueId,
+        expected_revision: u64,
+        translation: String,
+    ) -> DomainResult<Self>;
+    pub fn apply_llm_text(
+        &self,
+        binding: LlmResultBinding,
+        updates: Vec<CueTextUpdate>,
+    ) -> DomainResult<Self>;
+}
+```
+
+```rust
+impl WorkUnit {
+    pub fn lease(...);
+    pub fn complete(artifact: ArtifactRef, ...);
+    pub fn fail(error: DomainFailure, ...);
+    pub fn cancel(...);
+    pub fn recover_expired(...);
+}
+```
+
+```rust
+impl Batch {
+    pub fn start(...);
+    pub fn record_job_terminal(...);
+    pub fn cancel(...);
+    pub fn finish(...);
+}
+```
+
+Do not add setters such as `set_status(String)`.
+
+### E.7 Error mapping
+
+Use three error levels:
+
+```text
+DomainError
+  illegal business state/invariant
+
+ApplicationError
+  use-case failure, adapter category, cancellation/degradation
+
+VcError / protocol error DTO
+  stable cross-boundary error code and diagnostics
+```
+
+`From`/mapping functions MUST be explicit.
+
+Do not determine an exit code by searching human message text. The inspected CLI currently does this and it must be replaced.
+
+### E.8 Transaction and artifact boundary
+
+A repository `save(job)` call alone is not enough to satisfy artifact atomicity.
+
+The application-owned commit port must represent the required operation:
+
+```text
+validated final file exists
++ artifact metadata insert
++ WorkUnit/Stage state transition
++ event append
+```
+
+The store adapter executes the metadata part in one SQLite transaction after atomic rename.
+
+The domain/application layer decides that the transition is legal; the store adapter guarantees persistence atomicity.
+
+### E.9 Compatibility policy
+
+During migration:
+
+- preserve CLI command names and output where feasible;
+- preserve protocol envelopes;
+- preserve schema versions unless a deliberate migration is created;
+- preserve artifact filenames;
+- preserve current tests;
+- use re-exports/deprecated wrappers for one migration phase;
+- remove compatibility APIs once all internal callers move.
+
+Do not keep duplicate active implementations of split, export planning, or pipeline orchestration.
+
+### E.10 Coding-agent task order
+
+Recommended agent task queue:
+
+```text
+DDD-001 repair missing llm agent module / establish baseline
+DDD-002 add domain crate and compatibility re-exports
+DDD-003 move Transcript and IDs
+DDD-004 move TextJoiner and rule split
+DDD-005 add workflow aggregates and transition tests
+DDD-006 add application ports
+DDD-007 implement fake ports and TranscribeJob use case
+DDD-008 add platform crate and move media
+DDD-009 move subtitle I/O/config/paths/lock
+DDD-010 implement store repository ports; remove conn escape
+DDD-011 implement ASR Batch session port
+DDD-012 implement LLM gateway port
+DDD-013 add bootstrap composition root
+DDD-014 migrate CLI jobs queries and transcribe
+DDD-015 replace old pipeline and fix failure/artifact lifecycle
+DDD-016 implement architecture xtask
+DDD-017 replace StoreHandle mutex with true actor
+DDD-018 resume M3 agent loop/correct/translate implementation
+```
+
+Each task MUST use the task template in §27 and include allowed/forbidden files.
+
+---
+
+## Appendix F — DDD dependency matrix
+
+`ALLOW` means the dependency is permitted, not mandatory.
+
+| From \ To | domain | contracts | core | store | asr | llm | platform | bootstrap | CLI/Desktop |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| domain | — | NO | NO | NO | NO | NO | NO | NO | NO |
+| contracts | ALLOW | — | NO | NO | NO | NO | NO | NO | NO |
+| core | ALLOW | ALLOW | — | NO | NO | NO | NO | NO | NO |
+| store | ALLOW | ALLOW | ALLOW | — | NO | NO | NO | NO | NO |
+| asr | ALLOW | ALLOW | ALLOW | NO | — | NO | platform only if strictly required | NO | NO |
+| llm | ALLOW | ALLOW | ALLOW | NO | NO | — | NO | NO | NO |
+| platform | ALLOW | ALLOW | ALLOW | optional narrow use | NO | NO | — | NO | NO |
+| bootstrap | ALLOW | ALLOW | ALLOW | ALLOW | ALLOW | ALLOW | ALLOW | — | NO |
+| CLI/Desktop | NO direct domain mutation | contracts/commands | via bootstrap facade | NO | NO | NO | NO | ALLOW | — |
+
+Any exception requires an ADR and must not create a cycle.
+
+---
+
+## Appendix G — DDD review checklist
+
+Before merging a change, answer:
+
+### Domain
+
+- Which aggregate or domain service owns the invariant?
+- Can the rule be tested without I/O?
+- Is an illegal state representable or directly mutable?
+- Does a domain method return a meaningful error/event?
+
+### Application
+
+- What use case owns orchestration?
+- Are all external actions behind owned ports?
+- Are commit and cancellation boundaries explicit?
+- Is model/session lifetime at Batch scope?
+
+### Infrastructure
+
+- Does the adapter only translate technology-specific behavior?
+- Does it avoid pipeline/scheduling policy?
+- Does it map errors structurally?
+- Does it preserve atomic artifact and protocol rules?
+
+### Inbound adapters
+
+- Is CLI/GUI only parsing/rendering/calling use cases?
+- Is there any direct SQL, HTTP, worker, ffmpeg, or filesystem orchestration?
+- Are machine events and exit codes typed?
+
+### Tests
+
+- Is the aggregate transition unit-tested?
+- Is the use case tested with fakes?
+- Is the adapter contract tested independently?
+- Are cancellation, failure, recovery, and stale-result paths covered?
+- Does `xtask verify-architecture` pass?
+

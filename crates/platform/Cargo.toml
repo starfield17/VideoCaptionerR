@@ -1,0 +1,21 @@
+[package]
+name = "videocaptionerr-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Filesystem, ffmpeg, and subtitle I/O adapters for VideoCaptionerR"
+
+[dependencies]
+videocaptionerr-contracts = { workspace = true }
+videocaptionerr-domain = { workspace = true }
+videocaptionerr-core = { workspace = true }
+videocaptionerr-store = { workspace = true }
+serde = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

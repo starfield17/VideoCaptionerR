@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::{params, Connection, OptionalExtension};
+use ulid::Ulid;
 use videocaptionerr_contracts::artifact::{ArtifactKind, ArtifactMeta};
 use videocaptionerr_contracts::error::{ErrorCode, VcError, VcResult};
 use videocaptionerr_contracts::ids::UlidStr;
@@ -286,7 +287,7 @@ impl Store {
         event_type: &str,
         payload_json: Option<&str>,
     ) -> VcResult<String> {
-        let id = UlidStr::new().into_string();
+        let id = UlidStr::from(Ulid::new()).into_string();
         let next_seq: i64 = self
             .conn
             .query_row(
@@ -315,7 +316,7 @@ impl Store {
         producer_fingerprint: &str,
     ) -> ArtifactMeta {
         ArtifactMeta::new(
-            UlidStr::new().into_string(),
+            UlidStr::from(Ulid::new()).into_string(),
             job_id,
             stage,
             kind,

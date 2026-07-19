@@ -9,6 +9,7 @@ rust-version.workspace = true
 description = "Pipeline and application services for VideoCaptionerR"
 
 [dependencies]
+videocaptionerr-domain = { workspace = true }
 videocaptionerr-contracts = { workspace = true }
 videocaptionerr-store = { workspace = true }
 videocaptionerr-asr = { workspace = true }

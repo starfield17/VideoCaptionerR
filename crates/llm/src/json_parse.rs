@@ -91,16 +91,13 @@ fn find_balanced_json(text: &str) -> Option<&str> {
                 }
                 depth += 1;
             }
-            b'}' | b']' => {
-                if depth > 0 {
-                    depth -= 1;
-                    if depth == 0 {
-                        let s = start?;
-                        let closer_ok = (opener == b'{' && b == b'}')
-                            || (opener == b'[' && b == b']');
-                        if closer_ok {
-                            return Some(&text[s..=i]);
-                        }
+            b'}' | b']' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    let s = start?;
+                    let closer_ok = (opener == b'{' && b == b'}') || (opener == b'[' && b == b']');
+                    if closer_ok {
+                        return Some(&text[s..=i]);
                     }
                 }
             }

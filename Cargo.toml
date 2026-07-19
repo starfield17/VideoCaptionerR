@@ -1,8 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/domain",
     "crates/contracts",
     "crates/core",
+    "crates/platform",
     "crates/asr",
     "crates/llm",
     "crates/store",
@@ -30,8 +32,10 @@ authors = ["VideoCaptionerR contributors"]
 rust-version = "1.85"
 
 [workspace.dependencies]
+videocaptionerr-domain = { path = "crates/domain" }
 videocaptionerr-contracts = { path = "crates/contracts" }
 videocaptionerr-core = { path = "crates/core" }
+videocaptionerr-platform = { path = "crates/platform" }
 videocaptionerr-asr = { path = "crates/asr" }
 videocaptionerr-llm = { path = "crates/llm" }
 videocaptionerr-store = { path = "crates/store" }

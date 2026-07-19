@@ -13,8 +13,7 @@ use serde_json::{json, Map, Value};
 use videocaptionerr_contracts::error::{ErrorCode, VcError, VcResult};
 
 use crate::provider::{
-    ChatMessage, ChatRequest, ChatResponse, LlmProvider, ProviderCapabilities, Role,
-    StructuredMode,
+    ChatMessage, ChatRequest, ChatResponse, LlmProvider, ProviderCapabilities, Role, StructuredMode,
 };
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -98,14 +97,7 @@ impl OpenAiProvider {
         &self.api_key
     }
 
-    pub(crate) fn configured_model(&self) -> &str {
-        &self.model
-    }
-
-    pub(crate) async fn post_chat_request(
-        &self,
-        request: &ChatRequest,
-    ) -> VcResult<ChatResponse> {
+    pub(crate) async fn post_chat_request(&self, request: &ChatRequest) -> VcResult<ChatResponse> {
         let body = request_body(request, self.capabilities.effective_structured_mode());
         let mut builder = self
             .client
@@ -128,7 +120,10 @@ impl OpenAiProvider {
 
         let retry_after_ms = retry_after_ms(response.headers());
         if !response.status().is_success() {
-            return Err(http_status_error(response.status().as_u16(), retry_after_ms));
+            return Err(http_status_error(
+                response.status().as_u16(),
+                retry_after_ms,
+            ));
         }
 
         let body: Value = response.json().await.map_err(|_| {
@@ -162,10 +157,7 @@ impl LlmProvider for OpenAiProvider {
 
 pub(crate) fn request_body(request: &ChatRequest, effective_mode: StructuredMode) -> Value {
     let mut body = Map::new();
-    body.insert(
-        "model".into(),
-        Value::String(request.model.clone()),
-    );
+    body.insert("model".into(), Value::String(request.model.clone()));
     body.insert(
         "messages".into(),
         Value::Array(
@@ -339,8 +331,14 @@ mod tests {
 
     #[test]
     fn accepts_host_and_v1_base_urls() {
-        assert_eq!(endpoint("https://example.test", "chat/completions"), "https://example.test/chat/completions");
-        assert_eq!(endpoint("https://example.test/v1/", "chat/completions"), "https://example.test/v1/chat/completions");
+        assert_eq!(
+            endpoint("https://example.test", "chat/completions"),
+            "https://example.test/chat/completions"
+        );
+        assert_eq!(
+            endpoint("https://example.test/v1/", "chat/completions"),
+            "https://example.test/v1/chat/completions"
+        );
     }
 
     #[test]

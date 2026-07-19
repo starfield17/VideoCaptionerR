@@ -154,6 +154,7 @@ mod tests {
             response_format_json: None,
             seed: None,
             structured_mode: None,
+            response_schema: None,
         };
         assert_eq!(
             p.chat(&req).await.unwrap_err().code,

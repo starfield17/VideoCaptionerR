@@ -4,6 +4,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use videocaptionerr_domain::error::DomainError;
 
 /// Error categories used for retry/degrade decisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -262,6 +263,45 @@ impl VcError {
 }
 
 pub type VcResult<T> = Result<T, VcError>;
+
+impl From<DomainError> for VcError {
+    fn from(error: DomainError) -> Self {
+        let (code, message) = match error {
+            DomainError::InvalidArgument(message) => (ErrorCode::InvalidArgument, message),
+            DomainError::TimestampInvalid(message) => (ErrorCode::TimestampInvalid, message),
+            DomainError::IllegalTransition {
+                aggregate,
+                from,
+                to,
+            } => (
+                ErrorCode::InvalidArgument,
+                format!("illegal {aggregate} transition from {from} to {to}"),
+            ),
+            DomainError::StaleRevision { expected, actual } => (
+                ErrorCode::StaleResult,
+                format!("stale revision: expected {expected}, actual {actual}"),
+            ),
+            DomainError::BatchProfileMismatch => (
+                ErrorCode::InvalidArgument,
+                "batch execution profile mismatch".into(),
+            ),
+            DomainError::AlreadyTerminal { aggregate } => (
+                ErrorCode::InvalidArgument,
+                format!("{aggregate} is already terminal"),
+            ),
+            DomainError::MemberNotFound { aggregate, id } => (
+                ErrorCode::InvalidArgument,
+                format!("{aggregate} member not found: {id}"),
+            ),
+            DomainError::LeaseConflict(message) => (ErrorCode::InvalidArgument, message),
+            DomainError::LeaseRequired => (
+                ErrorCode::InvalidArgument,
+                "work unit has no active lease".into(),
+            ),
+        };
+        VcError::new(code, message)
+    }
+}
 
 #[cfg(test)]
 mod tests {

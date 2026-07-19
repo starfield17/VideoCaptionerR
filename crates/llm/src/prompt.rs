@@ -45,7 +45,9 @@ impl PromptBundle {
         let mut files = BTreeMap::new();
         for entry in entries {
             let path = entry
-                .map_err(|e| VcError::new(ErrorCode::InvalidConfig, format!("read prompt entry: {e}")))?
+                .map_err(|e| {
+                    VcError::new(ErrorCode::InvalidConfig, format!("read prompt entry: {e}"))
+                })?
                 .path();
             if !path.is_file() {
                 continue;
@@ -53,7 +55,9 @@ impl PromptBundle {
             let name = path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .ok_or_else(|| VcError::new(ErrorCode::InvalidConfig, "prompt filename is not UTF-8"))?
+                .ok_or_else(|| {
+                    VcError::new(ErrorCode::InvalidConfig, "prompt filename is not UTF-8")
+                })?
                 .to_owned();
             let raw = fs::read_to_string(&path).map_err(|e| {
                 VcError::new(
@@ -97,7 +101,10 @@ impl PromptBundle {
 
     /// Copy the normalized prompt files into an immutable Job stage snapshot.
     pub fn snapshot_to(&self, job_dir: &Path) -> VcResult<PathBuf> {
-        let directory = job_dir.join("llm").join("prompts").join(self.stage.as_str());
+        let directory = job_dir
+            .join("llm")
+            .join("prompts")
+            .join(self.stage.as_str());
         fs::create_dir_all(&directory).map_err(|e| {
             VcError::new(
                 ErrorCode::ArtifactCommitFailed,
@@ -128,12 +135,26 @@ impl PromptBundle {
         });
         let metadata_path = directory.join("bundle.json");
         let metadata_tmp = PathBuf::from(format!("{}.tmp", metadata_path.display()));
-        fs::write(&metadata_tmp, serde_json::to_vec_pretty(&metadata).map_err(|e| {
-            VcError::new(ErrorCode::ArtifactCommitFailed, format!("serialize prompt metadata: {e}"))
-        })?)
-        .map_err(|e| VcError::new(ErrorCode::ArtifactCommitFailed, format!("write prompt metadata: {e}")))?;
+        fs::write(
+            &metadata_tmp,
+            serde_json::to_vec_pretty(&metadata).map_err(|e| {
+                VcError::new(
+                    ErrorCode::ArtifactCommitFailed,
+                    format!("serialize prompt metadata: {e}"),
+                )
+            })?,
+        )
+        .map_err(|e| {
+            VcError::new(
+                ErrorCode::ArtifactCommitFailed,
+                format!("write prompt metadata: {e}"),
+            )
+        })?;
         fs::rename(&metadata_tmp, &metadata_path).map_err(|e| {
-            VcError::new(ErrorCode::ArtifactCommitFailed, format!("commit prompt metadata: {e}"))
+            VcError::new(
+                ErrorCode::ArtifactCommitFailed,
+                format!("commit prompt metadata: {e}"),
+            )
         })?;
         Ok(directory)
     }
@@ -163,7 +184,10 @@ mod tests {
         assert_eq!(bundle.system_prompt(), "line one\nline two\n");
         let job = tempdir().unwrap();
         let snapshot = bundle.snapshot_to(job.path()).unwrap();
-        assert_eq!(fs::read_to_string(snapshot.join("system.txt")).unwrap(), "line one\nline two\n");
+        assert_eq!(
+            fs::read_to_string(snapshot.join("system.txt")).unwrap(),
+            "line one\nline two\n"
+        );
         assert!(snapshot.join("bundle.json").is_file());
     }
 

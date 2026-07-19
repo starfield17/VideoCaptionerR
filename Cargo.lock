@@ -2051,6 +2051,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "ulid",
+ "videocaptionerr-domain",
 ]
 
 [[package]]
@@ -2075,9 +2076,22 @@ dependencies = [
  "unicode-normalization",
  "videocaptionerr-asr",
  "videocaptionerr-contracts",
+ "videocaptionerr-domain",
  "videocaptionerr-llm",
  "videocaptionerr-store",
  "videocaptionerr-test-support",
+]
+
+[[package]]
+name = "videocaptionerr-domain"
+version = "0.1.0"
+dependencies = [
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "ulid",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -2099,6 +2113,20 @@ dependencies = [
  "ulid",
  "unicode-normalization",
  "videocaptionerr-contracts",
+]
+
+[[package]]
+name = "videocaptionerr-platform"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "tempfile",
+ "tokio",
+ "videocaptionerr-contracts",
+ "videocaptionerr-core",
+ "videocaptionerr-domain",
+ "videocaptionerr-store",
 ]
 
 [[package]]

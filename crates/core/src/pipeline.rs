@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use tokio::sync::mpsc;
 use tracing::info;
+use ulid::Ulid;
 use videocaptionerr_asr::{
     normalize_asr, resolve_helper_binary, AsrOptions, NormalizeOptions, WorkerClient,
 };
@@ -78,7 +79,7 @@ pub async fn run_transcribe(
         }
     }
 
-    let job_id = UlidStr::new().into_string();
+    let job_id = UlidStr::from(Ulid::new()).into_string();
     let stem = req
         .input
         .file_stem()
@@ -95,7 +96,7 @@ pub async fn run_transcribe(
         &job_dir.to_string_lossy(),
         "running",
     )?;
-    let unit_id = UlidStr::new().into_string();
+    let unit_id = UlidStr::from(Ulid::new()).into_string();
     store.insert_work_unit(
         &unit_id,
         &job_id,

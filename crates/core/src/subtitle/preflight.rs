@@ -53,6 +53,7 @@ pub fn preflight_export(transcript: &Transcript, opts: &ExportOptions) -> VcResu
 
     // Structural validate first.
     if let Err(e) = transcript.validate() {
+        let e: VcError = e.into();
         report.errors.push(ExportDiagnostic {
             level: ExportDiagnosticLevel::Error,
             code: e.code.as_str().into(),
@@ -69,6 +70,7 @@ pub fn preflight_export(transcript: &Transcript, opts: &ExportOptions) -> VcResu
         let (start, end) = match transcript.cue_times(cue) {
             Ok(v) => v,
             Err(e) => {
+                let e: VcError = e.into();
                 report.errors.push(ExportDiagnostic {
                     level: ExportDiagnosticLevel::Error,
                     code: ErrorCode::TimestampInvalid.as_str().into(),
