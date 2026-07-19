@@ -1,0 +1,28 @@
+[package]
+name = "videocaptionerr-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "SQLite store actor, migrations, and atomic artifacts for VideoCaptionerR"
+
+[dependencies]
+videocaptionerr-contracts = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+rusqlite = { workspace = true }
+blake3 = { workspace = true }
+ulid = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+fs2 = { workspace = true }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }

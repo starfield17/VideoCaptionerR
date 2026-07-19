@@ -1,0 +1,81 @@
+{
+  "$id": "https://videocaptionerr.local/schemas/transcript.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "cues": {
+      "type": "array"
+    },
+    "engine": {
+      "type": "object"
+    },
+    "language": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "next_cue_id": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "revision": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "schema_version": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "source_hash": {
+      "type": "string"
+    },
+    "timeline_source": {
+      "enum": [
+        "asr_words",
+        "imported_cue"
+      ],
+      "type": "string"
+    },
+    "words": {
+      "items": {
+        "properties": {
+          "end_ms": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "prob": {
+            "type": "number"
+          },
+          "start_ms": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "text",
+          "start_ms",
+          "end_ms",
+          "prob"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "revision",
+    "source_hash",
+    "engine",
+    "words",
+    "cues",
+    "next_cue_id",
+    "timeline_source"
+  ],
+  "title": "Transcript",
+  "type": "object"
+}

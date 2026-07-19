@@ -1,0 +1,36 @@
+{
+  "$id": "https://videocaptionerr.local/schemas/protocol_envelope.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "data": {},
+    "protocol_version": {
+      "const": 1,
+      "type": "integer"
+    },
+    "request_id": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "seq": {
+      "minimum": 0,
+      "type": "integer"
+    },
+    "session_id": {
+      "type": "string"
+    },
+    "type": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "protocol_version",
+    "session_id",
+    "seq",
+    "type"
+  ],
+  "title": "ProtocolEnvelope",
+  "type": "object"
+}

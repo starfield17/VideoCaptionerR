@@ -1,0 +1,23 @@
+[package]
+name = "videocaptionerr-test-support"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "Fake worker, fake provider, and fault injection fixtures"
+
+[dependencies]
+videocaptionerr-contracts = { workspace = true }
+videocaptionerr-asr = { workspace = true }
+videocaptionerr-llm = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+ulid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+pretty_assertions = { workspace = true }
