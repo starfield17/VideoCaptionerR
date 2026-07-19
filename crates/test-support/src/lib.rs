@@ -6,4 +6,4 @@ pub mod fixtures;
 
 pub use fake_asr::{FakeAsrEngine, FakeAsrMode};
 pub use fake_llm::{FakeLlmMode, FakeLlmProvider};
-pub use fixtures::sample_words;
+pub use fixtures::{sample_transcript, sample_words};
