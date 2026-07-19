@@ -2,6 +2,7 @@
 //!
 //! This crate MUST NOT own Job scheduling or persistence policy.
 
+pub mod application;
 pub mod descriptor;
 pub mod engine;
 pub mod model;
@@ -9,6 +10,7 @@ pub mod normalize;
 pub mod options;
 pub mod worker;
 
+pub use application::WorkerAsrRuntime;
 pub use descriptor::{
     CapabilityLevel, ConfidenceKind, DeviceDescriptor, EngineDescriptor, TimestampGranularity,
 };

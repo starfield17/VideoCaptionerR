@@ -19,6 +19,8 @@ pub struct AsrDescriptor {
 pub struct AsrTranscribeRequest {
     pub audio_path: PathBuf,
     pub language: Option<String>,
+    pub source_hash: String,
+    pub duration_ms: Option<u64>,
 }
 
 pub struct NormalizedAsrResult {

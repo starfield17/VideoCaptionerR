@@ -2,6 +2,7 @@
 //!
 //! This crate MUST NOT own Job scheduling or persistence policy.
 
+pub mod application;
 pub mod circuit;
 pub mod json_parse;
 pub mod openai;
@@ -11,6 +12,7 @@ pub mod provider;
 pub mod templates;
 pub mod token;
 
+pub use application::ProviderLlmGateway;
 pub use provider::{
     ChatMessage, ChatRequest, ChatResponse, LlmProvider, ProviderCapabilities, Role, StructuredMode,
 };

@@ -17,6 +17,6 @@ pub use subtitle::{
     RangeUsize, RuleSplitConfig, TimelineSource, Transcript, Word, PROB_UNAVAILABLE,
 };
 pub use workflow::{
-    ArtifactRef, Batch, BatchExecutionProfile, BatchStatus, DomainEvent, Job, JobStatus, StageKind,
-    StageState, StageStatus, WorkUnit, WorkUnitStatus,
+    ArtifactRef, Batch, BatchExecutionProfile, BatchStatus, DomainEvent, Job, JobStatus,
+    JobTerminalStatus, StageKind, StageState, StageStatus, WorkUnit, WorkUnitStatus,
 };

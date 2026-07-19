@@ -19,31 +19,34 @@ impl SubtitleGateway for FileSubtitleGateway {
     ) -> videocaptionerr_core::AppResult<ExportedSubtitle> {
         let transcript = transcript.clone();
         tokio::task::spawn_blocking(move || {
-            let options = videocaptionerr_core::subtitle::ExportOptions {
+            let options = crate::subtitle_io::ExportOptions {
                 format: match request.format {
-                    SubtitleFormat::Srt => videocaptionerr_core::subtitle::ExportFormat::Srt,
-                    SubtitleFormat::Vtt => videocaptionerr_core::subtitle::ExportFormat::Vtt,
-                    SubtitleFormat::Ass => videocaptionerr_core::subtitle::ExportFormat::Ass,
+                    SubtitleFormat::Srt => crate::subtitle_io::ExportFormat::Srt,
+                    SubtitleFormat::Vtt => crate::subtitle_io::ExportFormat::Vtt,
+                    SubtitleFormat::Ass => crate::subtitle_io::ExportFormat::Ass,
                 },
                 layout: match request.layout {
-                    SubtitleLayout::SourceOnly => videocaptionerr_core::subtitle::ExportLayout::SourceOnly,
-                    SubtitleLayout::TranslationOnly => videocaptionerr_core::subtitle::ExportLayout::TranslationOnly,
-                    SubtitleLayout::BilingualSourceFirst => videocaptionerr_core::subtitle::ExportLayout::BilingualSourceFirst,
-                    SubtitleLayout::BilingualTranslationFirst => videocaptionerr_core::subtitle::ExportLayout::BilingualTranslationFirst,
+                    SubtitleLayout::SourceOnly => crate::subtitle_io::ExportLayout::SourceOnly,
+                    SubtitleLayout::TranslationOnly => {
+                        crate::subtitle_io::ExportLayout::TranslationOnly
+                    }
+                    SubtitleLayout::BilingualSourceFirst => {
+                        crate::subtitle_io::ExportLayout::BilingualSourceFirst
+                    }
+                    SubtitleLayout::BilingualTranslationFirst => {
+                        crate::subtitle_io::ExportLayout::BilingualTranslationFirst
+                    }
                 },
                 missing_translation: if request.fallback_to_source {
-                    videocaptionerr_core::subtitle::export::MissingTranslationPolicy::FallbackToSource
+                    crate::subtitle_io::export::MissingTranslationPolicy::FallbackToSource
                 } else {
-                    videocaptionerr_core::subtitle::export::MissingTranslationPolicy::Fail
+                    crate::subtitle_io::export::MissingTranslationPolicy::Fail
                 },
             };
             let path = request.output_path;
-            let content_hash = videocaptionerr_core::subtitle::export::write_export(
-                &path,
-                &transcript,
-                &options,
-            )
-            .map_err(videocaptionerr_core::ApplicationError::Adapter)?;
+            let content_hash =
+                crate::subtitle_io::export::write_export(&path, &transcript, &options)
+                    .map_err(videocaptionerr_core::ApplicationError::Adapter)?;
             Ok(ExportedSubtitle { path, content_hash })
         })
         .await

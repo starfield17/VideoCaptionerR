@@ -10,6 +10,7 @@ description = "LLM provider client, capability probe, and agent loop for VideoCa
 
 [dependencies]
 videocaptionerr-contracts = { workspace = true }
+videocaptionerr-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

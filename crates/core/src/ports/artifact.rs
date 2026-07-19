@@ -6,6 +6,7 @@ use videocaptionerr_domain::{ArtifactRef, JobId, StageKind, UlidStr, WorkUnitId}
 use crate::application_error::AppResult;
 
 pub struct ArtifactCommit {
+    pub job_id: JobId,
     pub artifact: ArtifactRef,
     pub work_unit_id: Option<WorkUnitId>,
 }

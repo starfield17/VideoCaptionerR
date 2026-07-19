@@ -26,6 +26,8 @@ enum Commands {
     },
     /// Run fmt + clippy -D warnings + tests.
     Check,
+    /// Verify DDD crate dependency and source-boundary rules.
+    VerifyArchitecture,
 }
 
 fn main() -> Result<()> {
@@ -33,6 +35,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::GenSchemas { out } => gen_schemas(&out)?,
         Commands::Check => check()?,
+        Commands::VerifyArchitecture => verify_architecture()?,
     }
     Ok(())
 }
@@ -167,6 +170,142 @@ fn run(cmd: &mut Command) -> Result<()> {
     let status = cmd.status().context("spawn command")?;
     if !status.success() {
         bail!("command failed: {status}");
+    }
+    Ok(())
+}
+
+fn verify_architecture() -> Result<()> {
+    let output = Command::new("cargo")
+        .args(["metadata", "--format-version", "1", "--no-deps"])
+        .output()
+        .context("run cargo metadata")?;
+    if !output.status.success() {
+        bail!("cargo metadata failed: {}", output.status);
+    }
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("parse cargo metadata output")?;
+    let packages = metadata
+        .get("packages")
+        .and_then(serde_json::Value::as_array)
+        .context("cargo metadata packages missing")?;
+
+    let dependencies = |package_name: &str| -> Result<Vec<String>> {
+        let package = packages
+            .iter()
+            .find(|package| {
+                package.get("name").and_then(serde_json::Value::as_str) == Some(package_name)
+            })
+            .with_context(|| format!("package {package_name} missing from metadata"))?;
+        Ok(package
+            .get("dependencies")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|dependency| {
+                dependency
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect())
+    };
+
+    assert_no_dependencies(
+        "videocaptionerr-core",
+        &dependencies("videocaptionerr-core")?,
+        &[
+            "videocaptionerr-store",
+            "videocaptionerr-asr",
+            "videocaptionerr-llm",
+            "videocaptionerr-platform",
+            "videocaptionerr-bootstrap",
+        ],
+    )?;
+    assert_no_dependencies(
+        "videocaptionerr-cli",
+        &dependencies("videocaptionerr-cli")?,
+        &[
+            "videocaptionerr-store",
+            "videocaptionerr-asr",
+            "videocaptionerr-llm",
+            "videocaptionerr-platform",
+        ],
+    )?;
+    assert_no_dependencies(
+        "videocaptionerr-domain",
+        &dependencies("videocaptionerr-domain")?,
+        &[
+            "videocaptionerr-contracts",
+            "videocaptionerr-core",
+            "videocaptionerr-store",
+            "videocaptionerr-asr",
+            "videocaptionerr-llm",
+            "videocaptionerr-platform",
+            "videocaptionerr-bootstrap",
+        ],
+    )?;
+
+    let mut source_files = Vec::new();
+    collect_files(Path::new("crates"), &mut source_files)?;
+    for path in source_files {
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("read source file {}", path.display()))?;
+        let path_text = path.to_string_lossy();
+        if !path_text.starts_with("crates/store/")
+            && ["SELECT ", "INSERT ", "UPDATE ", "DELETE "]
+                .iter()
+                .any(|needle| text.contains(needle))
+        {
+            bail!("raw SQL found outside store: {}", path.display());
+        }
+        if !path_text.starts_with("crates/store/") && text.contains(".conn(") {
+            bail!(
+                "SQLite connection escape found outside store: {}",
+                path.display()
+            );
+        }
+        if path_text.starts_with("crates/cli/")
+            && [
+                "videocaptionerr_store",
+                "videocaptionerr_asr",
+                "videocaptionerr_llm",
+                "videocaptionerr_platform",
+            ]
+            .iter()
+            .any(|needle| text.contains(needle))
+        {
+            bail!("CLI imports a concrete adapter: {}", path.display());
+        }
+    }
+
+    println!("architecture verification passed");
+    Ok(())
+}
+
+fn assert_no_dependencies(
+    package: &str,
+    dependencies: &[String],
+    forbidden: &[&str],
+) -> Result<()> {
+    for name in forbidden {
+        if dependencies.iter().any(|dependency| dependency == name) {
+            bail!("{package} must not depend on {name}");
+        }
+    }
+    Ok(())
+}
+
+fn collect_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    if !root.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root).with_context(|| format!("read {}", root.display()))? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_files(&path, files)?;
+        } else if path.extension().and_then(|value| value.to_str()) == Some("rs") {
+            files.push(path);
+        }
     }
     Ok(())
 }

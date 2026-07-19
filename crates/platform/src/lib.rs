@@ -1,11 +1,24 @@
 //! Outbound adapters for operating-system and file-based services.
-//!
-//! The initial migration keeps the existing, tested core implementations
-//! behind these adapters. Later DDD tasks move their concrete modules here
-//! without changing application ports.
 
+pub mod config;
+pub mod constants;
+pub mod instance_lock;
+pub mod media;
 pub mod media_gateway;
+pub mod paths;
 pub mod subtitle_gateway;
+pub mod subtitle_io;
 
+pub use config::{AppConfig, LlmProviderConfig};
+pub use instance_lock::{InstanceLock, LockOwner};
+pub use media::{
+    extract_audio_wav, media_hash_file, pcm_hash_file, probe_media, select_audio_stream,
+    ExtractOptions,
+};
 pub use media_gateway::FfmpegMediaGateway;
+pub use paths::{sanitize_stem, AppPaths};
 pub use subtitle_gateway::FileSubtitleGateway;
+pub use subtitle_io::{
+    import_srt, import_vtt, preflight_export, write_ass, write_srt, write_vtt, ConflictPolicy,
+    ExportFormat, ExportLayout, ExportOptions, ImportLayout, ImportOptions, OutputPlanner,
+};

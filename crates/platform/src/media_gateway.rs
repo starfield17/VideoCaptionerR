@@ -24,8 +24,7 @@ impl MediaGateway for FfmpegMediaGateway {
     ) -> videocaptionerr_core::AppResult<ProbedMedia> {
         let ffprobe_path = self.ffprobe_path.clone();
         blocking(move || {
-            let probe =
-                videocaptionerr_core::media::probe_media(&request.input, ffprobe_path.as_deref())?;
+            let probe = crate::media::probe_media(&request.input, ffprobe_path.as_deref())?;
             std::fs::create_dir_all(&request.job_dir).map_err(|e| {
                 VcError::new(
                     ErrorCode::ArtifactCommitFailed,
@@ -50,7 +49,7 @@ impl MediaGateway for FfmpegMediaGateway {
 
     async fn media_hash(&self, input: &Path) -> videocaptionerr_core::AppResult<String> {
         let input = input.to_path_buf();
-        blocking(move || videocaptionerr_core::media::media_hash_file(&input)).await
+        blocking(move || crate::media::media_hash_file(&input)).await
     }
 
     async fn extract_audio(
@@ -59,10 +58,10 @@ impl MediaGateway for FfmpegMediaGateway {
     ) -> videocaptionerr_core::AppResult<AudioExtraction> {
         let ffmpeg_path = self.ffmpeg_path.clone();
         blocking(move || {
-            let extracted = videocaptionerr_core::media::extract_audio_wav(
+            let extracted = crate::media::extract_audio_wav(
                 &request.input,
                 &request.job_dir,
-                &videocaptionerr_core::media::ExtractOptions {
+                &crate::media::ExtractOptions {
                     stream_index: request.stream_index,
                     ffmpeg_path,
                     expected_duration_ms: request.expected_duration_ms,

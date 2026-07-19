@@ -5,6 +5,7 @@ members = [
     "crates/contracts",
     "crates/core",
     "crates/platform",
+    "crates/bootstrap",
     "crates/asr",
     "crates/llm",
     "crates/store",
@@ -36,6 +37,7 @@ videocaptionerr-domain = { path = "crates/domain" }
 videocaptionerr-contracts = { path = "crates/contracts" }
 videocaptionerr-core = { path = "crates/core" }
 videocaptionerr-platform = { path = "crates/platform" }
+videocaptionerr-bootstrap = { path = "crates/bootstrap" }
 videocaptionerr-asr = { path = "crates/asr" }
 videocaptionerr-llm = { path = "crates/llm" }
 videocaptionerr-store = { path = "crates/store" }

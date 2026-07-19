@@ -78,6 +78,8 @@ impl TranscribeJob {
 
         let mut current_stage = None;
         let result: AppResult<TranscribeJobResponse> = async {
+            let source_hash = self.media.media_hash(&command.input).await?;
+            job.start_stage(StageKind::Probe)?;
             current_stage = Some(StageKind::Probe);
             let probed = self
                 .media
@@ -103,13 +105,12 @@ impl TranscribeJob {
                     ))
                 })?
                 .stream_index;
-            job.start_stage(StageKind::Probe)?;
-            let probe_artifact = self.commit_input(probed.artifact).await?;
+            let probe_artifact = self.commit_input(&command.job_id, probed.artifact).await?;
             job.complete_stage(StageKind::Probe, probe_artifact, false)?;
             self.jobs.save_job(&job).await?;
 
-            current_stage = Some(StageKind::ExtractAudio);
             job.start_stage(StageKind::ExtractAudio)?;
+            current_stage = Some(StageKind::ExtractAudio);
             let extracted = self
                 .media
                 .extract_audio(crate::ports::ExtractAudioRequest {
@@ -119,12 +120,14 @@ impl TranscribeJob {
                     job_dir: command.job_dir.clone(),
                 })
                 .await?;
-            let extract_artifact = self.commit_input(extracted.artifact).await?;
+            let extract_artifact = self
+                .commit_input(&command.job_id, extracted.artifact)
+                .await?;
             job.complete_stage(StageKind::ExtractAudio, extract_artifact, false)?;
             self.jobs.save_job(&job).await?;
 
-            current_stage = Some(StageKind::Asr);
             job.start_stage(StageKind::Asr)?;
+            current_stage = Some(StageKind::Asr);
             if !session.descriptor().supports_word_timestamps {
                 return Err(ApplicationError::Adapter(VcError::new(
                     ErrorCode::EngineCapabilityInsufficient,
@@ -136,6 +139,8 @@ impl TranscribeJob {
                     AsrTranscribeRequest {
                         audio_path: extracted.wav_path,
                         language: command.language.clone(),
+                        source_hash,
+                        duration_ms: Some(probed.probe.duration_ms),
                     },
                     self.events.as_ref(),
                 )
@@ -155,8 +160,8 @@ impl TranscribeJob {
             job.complete_stage(StageKind::Asr, asr_artifact, false)?;
             self.jobs.save_job(&job).await?;
 
-            current_stage = Some(StageKind::Split);
             job.start_stage(StageKind::Split)?;
+            current_stage = Some(StageKind::Split);
             let split = videocaptionerr_domain::rule_split(
                 &asr.transcript,
                 &videocaptionerr_domain::RuleSplitConfig::default(),
@@ -181,8 +186,8 @@ impl TranscribeJob {
             job.skip_stage(StageKind::Translate)?;
             self.jobs.save_job(&job).await?;
 
-            current_stage = Some(StageKind::Export);
             job.start_stage(StageKind::Export)?;
+            current_stage = Some(StageKind::Export);
             let exported = self.subtitles.export(&split, command.export).await?;
             let export_ref = ArtifactRef {
                 id: self.ids.next_id(),
@@ -194,6 +199,7 @@ impl TranscribeJob {
             };
             self.artifacts
                 .commit(ArtifactCommit {
+                    job_id: command.job_id.clone(),
                     artifact: export_ref.clone(),
                     work_unit_id: None,
                 })
@@ -212,7 +218,9 @@ impl TranscribeJob {
 
         if let Err(error) = result {
             if let Some(stage) = current_stage {
-                let _ = job.fail_stage(stage);
+                if job.fail_stage(stage).is_err() && !job.status().is_terminal() {
+                    let _ = job.cancel();
+                }
             } else if !job.status().is_terminal() {
                 let _ = job.cancel();
             }
@@ -222,7 +230,7 @@ impl TranscribeJob {
         result
     }
 
-    async fn commit_input(&self, input: ArtifactInput) -> AppResult<ArtifactRef> {
+    async fn commit_input(&self, job_id: &JobId, input: ArtifactInput) -> AppResult<ArtifactRef> {
         let artifact = ArtifactRef {
             id: self.ids.next_id(),
             stage: input.stage,
@@ -233,6 +241,7 @@ impl TranscribeJob {
         };
         self.artifacts
             .commit(ArtifactCommit {
+                job_id: job_id.clone(),
                 artifact: artifact.clone(),
                 work_unit_id: None,
             })

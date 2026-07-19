@@ -12,6 +12,17 @@ pub enum SubtitleFormat {
     Ass,
 }
 
+impl SubtitleFormat {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "srt" => Some(Self::Srt),
+            "vtt" => Some(Self::Vtt),
+            "ass" => Some(Self::Ass),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubtitleLayout {
     SourceOnly,

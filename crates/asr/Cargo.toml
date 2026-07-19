@@ -9,6 +9,8 @@ rust-version.workspace = true
 description = "ASR traits, worker clients, and adapters for VideoCaptionerR"
 
 [dependencies]
+videocaptionerr-domain = { workspace = true }
+videocaptionerr-core = { workspace = true }
 videocaptionerr-contracts = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

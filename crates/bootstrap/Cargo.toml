@@ -1,25 +1,23 @@
 [package]
-name = "videocaptionerr-platform"
+name = "videocaptionerr-bootstrap"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
-description = "Filesystem, ffmpeg, and subtitle I/O adapters for VideoCaptionerR"
+description = "Composition root and shared application facade for VideoCaptionerR"
 
 [dependencies]
-videocaptionerr-contracts = { workspace = true }
 videocaptionerr-domain = { workspace = true }
+videocaptionerr-contracts = { workspace = true }
 videocaptionerr-core = { workspace = true }
+videocaptionerr-platform = { workspace = true }
+videocaptionerr-asr = { workspace = true }
 videocaptionerr-store = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-toml = { workspace = true }
-blake3 = { workspace = true }
-fs2 = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
+ulid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

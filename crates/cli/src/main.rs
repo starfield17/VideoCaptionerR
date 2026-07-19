@@ -1,15 +1,17 @@
-//! VideoCaptionerR CLI entry point.
+//! Inbound CLI adapter.
+//!
+//! This module parses commands, renders responses, and calls the shared
+//! bootstrap facade. It does not know about SQL, workers, ffmpeg, or files.
 
 use std::path::PathBuf;
 use std::process::ExitCode as StdExitCode;
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
-use videocaptionerr_contracts::error::ErrorCode;
-use videocaptionerr_contracts::event::ExitCode;
-use videocaptionerr_core::{run_transcribe, ExportFormat, TranscribeRequest};
-use videocaptionerr_store::instance_lock::LockOwner;
-use videocaptionerr_store::{AppPaths, InstanceLock, Store};
+use ulid::Ulid;
+use videocaptionerr_bootstrap::{ApplicationRuntime, RuntimeConfig, TranscribeOptions};
+use videocaptionerr_contracts::error::{ErrorCode, VcError};
+use videocaptionerr_contracts::event::{CliEvent, EventEnvelope, ExitCode};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -18,7 +20,7 @@ use videocaptionerr_store::{AppPaths, InstanceLock, Store};
     about = "Batch subtitle generation (ASR + LLM correction/translation)"
 )]
 struct Cli {
-    /// Emit machine NDJSON events on stdout; human logs on stderr.
+    /// Emit machine NDJSON events on stdout; human logs are written to stderr.
     #[arg(long, global = true)]
     json: bool,
 
@@ -34,7 +36,7 @@ struct Cli {
 enum Commands {
     /// Show version and workspace health.
     Doctor,
-    /// Transcribe media to subtitles (ASR only).
+    /// Transcribe media to subtitles (ASR and rule splitting).
     Transcribe {
         #[arg(required = true)]
         files: Vec<PathBuf>,
@@ -54,7 +56,7 @@ enum Commands {
         #[arg(long, default_value = "srt")]
         format: String,
     },
-    /// Full process: ASR + split + correct + translate. Implemented from M3/M5.
+    /// Full process: ASR + split + correct + translate. Implemented in a later milestone.
     Process {
         #[arg(required = true)]
         files: Vec<PathBuf>,
@@ -95,10 +97,10 @@ fn main() -> StdExitCode {
     init_tracing(cli.json);
 
     let code = match run(cli) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("error: {e}");
-            map_error_code(e.as_ref())
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("error: {error}");
+            map_error_code(&error)
         }
     };
     StdExitCode::from(code.as_i32() as u8)
@@ -106,41 +108,48 @@ fn main() -> StdExitCode {
 
 fn init_tracing(json: bool) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr);
     if json {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_writer(std::io::stderr)
-            .json()
-            .init();
+        builder.json().init();
     } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_writer(std::io::stderr)
-            .init();
+        builder.init();
     }
 }
 
-fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    if let Some(home) = &cli.home {
-        std::env::set_var("VIDEOCAPTIONERR_HOME", home);
-    }
-    let paths = AppPaths::resolve().map_err(|e| e.to_string())?;
-    paths.ensure_layout().map_err(|e| e.to_string())?;
-
+fn run(cli: Cli) -> Result<ExitCode, VcError> {
     match cli.command {
         Commands::Doctor => {
-            println!("videocaptionerr {}", env!("CARGO_PKG_VERSION"));
-            println!("home: {}", paths.home.display());
-            println!("db: {}", paths.db_path.display());
-            let store = Store::open(&paths.db_path).map_err(|e| e.to_string())?;
-            println!("store: ok ({})", store.path().display());
-            println!("ffmpeg: {}", which("ffmpeg"));
-            println!("ffprobe: {}", which("ffprobe"));
-            let helper = videocaptionerr_asr::resolve_helper_binary();
+            let runtime = ApplicationRuntime::open(RuntimeConfig {
+                home: cli.home,
+                engine: "fake".into(),
+                model_path: None,
+                helper_path: None,
+            })?;
+            let report = runtime.doctor();
+            println!("videocaptionerr {}", report.version);
+            println!("home: {}", report.paths.home.display());
+            println!("db: {}", report.paths.db_path.display());
+            println!("store: ok ({})", report.paths.db_path.display());
+            println!(
+                "ffmpeg: {}",
+                report
+                    .ffmpeg
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "not found".into())
+            );
+            println!(
+                "ffprobe: {}",
+                report
+                    .ffprobe
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "not found".into())
+            );
             println!(
                 "helper: {}",
-                if helper.exists() {
-                    helper.display().to_string()
+                if report.helper.exists() {
+                    report.helper.display().to_string()
                 } else {
                     "not found".into()
                 }
@@ -149,89 +158,137 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         }
         Commands::Transcribe {
             files,
-            profile: _,
+            profile,
             engine,
             model,
             helper,
             language,
             format,
         } => {
-            let _lock = InstanceLock::try_acquire(&paths.instance_lock_path(), LockOwner::Cli)
-                .map_err(|e| e.to_string())?;
-            let export_format = ExportFormat::parse(&format)
-                .ok_or_else(|| format!("unsupported format '{format}' (expected srt|vtt|ass)"))?;
-
-            let rt = tokio::runtime::Runtime::new()?;
-            let mut store = Store::open(&paths.db_path).map_err(|e| e.to_string())?;
-            let mut any_fail = false;
-            for file in files {
-                let req = TranscribeRequest {
-                    input: file.clone(),
-                    model_path: model.clone(),
-                    engine: engine.clone(),
-                    helper_path: helper.clone(),
-                    language: language.clone(),
-                    export_format,
-                };
-                match rt.block_on(run_transcribe(&paths, &mut store, &req)) {
-                    Ok(res) => {
-                        println!(
-                            "job {} done: {} cues -> {}",
-                            res.job_id,
-                            res.cue_count,
-                            res.export_path.display()
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("transcribe {}: {e}", file.display());
-                        any_fail = true;
-                    }
+            let runtime = ApplicationRuntime::open(RuntimeConfig {
+                home: cli.home,
+                engine,
+                model_path: model,
+                helper_path: helper,
+            })?;
+            let _lock = runtime.acquire_cli_processing_lock()?;
+            let options = TranscribeOptions {
+                files,
+                language,
+                format,
+                profile,
+            };
+            let async_runtime = tokio::runtime::Runtime::new().map_err(|error| {
+                VcError::new(
+                    ErrorCode::Internal,
+                    format!("create Tokio runtime: {error}"),
+                )
+            })?;
+            let result = async_runtime.block_on(runtime.transcribe(options))?;
+            for job in &result.jobs {
+                emit_or_print(
+                    cli.json,
+                    CliEvent::JobFinished,
+                    Some(job.job.id().to_string()),
+                    serde_json::json!({
+                        "status": format!("{:?}", job.job.status()).to_ascii_lowercase(),
+                        "cues": job.transcript.cues.len(),
+                        "path": job.export_path,
+                    }),
+                    format!(
+                        "job {} done: {} cues -> {}",
+                        job.job.id(),
+                        job.transcript.cues.len(),
+                        job.export_path.display()
+                    ),
+                )?;
+            }
+            for failure in &result.failures {
+                if cli.json {
+                    emit_event(
+                        CliEvent::Error,
+                        Some(failure.job_id.clone()),
+                        serde_json::json!({
+                            "code": failure.error.code.as_str(),
+                            "message": failure.error.message,
+                        }),
+                    )?;
+                } else {
+                    eprintln!("job {} failed: {}", failure.job_id, failure.error);
                 }
             }
-            if any_fail {
-                Ok(ExitCode::AsrFailure)
-            } else {
+            if result.failures.is_empty() {
                 Ok(ExitCode::Success)
+            } else if result.jobs.is_empty() {
+                Err(result.failures[0].error.clone())
+            } else {
+                Ok(ExitCode::PartialBatchSuccess)
             }
         }
-        Commands::Process { .. } => {
-            let _lock = InstanceLock::try_acquire(&paths.instance_lock_path(), LockOwner::Cli)
-                .map_err(|e| e.to_string())?;
-            eprintln!("not implemented yet (milestone M3/M5)");
-            Ok(ExitCode::InvalidArgs)
+        Commands::Process {
+            files: _,
+            profile: _,
+            target_lang: _,
+        } => {
+            let runtime = ApplicationRuntime::open(RuntimeConfig {
+                home: cli.home,
+                engine: "fake".into(),
+                model_path: None,
+                helper_path: None,
+            })?;
+            let _lock = runtime.acquire_cli_processing_lock()?;
+            Err(VcError::new(
+                ErrorCode::InvalidArgument,
+                "process pipeline is not enabled in the current milestone",
+            ))
         }
         Commands::Jobs { action } => {
-            let store = Store::open(&paths.db_path).map_err(|e| e.to_string())?;
+            let runtime = ApplicationRuntime::open(RuntimeConfig {
+                home: cli.home,
+                engine: "fake".into(),
+                model_path: None,
+                helper_path: None,
+            })?;
             match action {
                 JobsCmd::List => {
-                    let mut stmt = store
-                        .conn()
-                        .prepare("SELECT id, status, source_path FROM jobs ORDER BY created_at")
-                        .map_err(|e| e.to_string())?;
-                    let rows = stmt
-                        .query_map([], |r| {
-                            Ok((
-                                r.get::<_, String>(0)?,
-                                r.get::<_, String>(1)?,
-                                r.get::<_, String>(2)?,
-                            ))
-                        })
-                        .map_err(|e| e.to_string())?;
-                    for row in rows {
-                        let (id, status, src) = row.map_err(|e| e.to_string())?;
-                        println!("{id}\t{status}\t{src}");
+                    let async_runtime = tokio::runtime::Runtime::new().map_err(|error| {
+                        VcError::new(
+                            ErrorCode::Internal,
+                            format!("create Tokio runtime: {error}"),
+                        )
+                    })?;
+                    for job in async_runtime.block_on(runtime.list_jobs())? {
+                        if cli.json {
+                            emit_event(
+                                CliEvent::JobListed,
+                                Some(job.id().to_string()),
+                                serde_json::json!({
+                                    "status": format!("{:?}", job.status()).to_ascii_lowercase(),
+                                    "source_path": job.source_path(),
+                                }),
+                            )?;
+                        } else {
+                            println!("{}\t{:?}\t{}", job.id(), job.status(), job.source_path());
+                        }
                     }
                     Ok(ExitCode::Success)
                 }
                 JobsCmd::Retry { id } => {
-                    eprintln!("jobs retry {id}: not fully implemented (M5)");
-                    Ok(ExitCode::InvalidArgs)
+                    let _lock = runtime.acquire_cli_processing_lock()?;
+                    Err(VcError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("jobs retry {id} is not enabled in the current milestone"),
+                    ))
                 }
                 JobsCmd::Rm { id } => {
-                    store
-                        .conn()
-                        .execute("DELETE FROM jobs WHERE id = ?1", [&id])
-                        .map_err(|e| e.to_string())?;
+                    let _lock = runtime.acquire_cli_processing_lock()?;
+                    let async_runtime = tokio::runtime::Runtime::new().map_err(|error| {
+                        VcError::new(
+                            ErrorCode::Internal,
+                            format!("create Tokio runtime: {error}"),
+                        )
+                    })?;
+                    async_runtime.block_on(runtime.remove_job(&id))?;
                     Ok(ExitCode::Success)
                 }
             }
@@ -239,38 +296,74 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         Commands::Cache {
             action: CacheCmd::Gc { max_size },
         } => {
+            let runtime = ApplicationRuntime::open(RuntimeConfig {
+                home: cli.home,
+                engine: "fake".into(),
+                model_path: None,
+                helper_path: None,
+            })?;
+            let _lock = runtime.acquire_cli_processing_lock()?;
             println!("cache gc max_size={max_size}: skeleton (M5)");
             Ok(ExitCode::Success)
         }
     }
 }
 
-fn which(cmd: &str) -> String {
-    std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("command -v {cmd} || true"))
-        .output()
-        .ok()
-        .and_then(|o| {
-            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if s.is_empty() {
-                None
-            } else {
-                Some(s)
-            }
-        })
-        .unwrap_or_else(|| "not found".into())
+fn emit_or_print(
+    json: bool,
+    event: CliEvent,
+    job_id: Option<String>,
+    data: serde_json::Value,
+    human: String,
+) -> Result<(), VcError> {
+    if json {
+        emit_event(event, job_id, data)
+    } else {
+        println!("{human}");
+        Ok(())
+    }
 }
 
-fn map_error_code(err: &dyn std::error::Error) -> ExitCode {
-    let msg = err.to_string();
-    if msg.contains(ErrorCode::InstanceBusy.as_str()) {
-        ExitCode::DependencyUnavailable
-    } else if msg.contains(ErrorCode::AsrFailed.as_str())
-        || msg.contains(ErrorCode::WorkerCrashed.as_str())
-    {
-        ExitCode::AsrFailure
-    } else {
-        ExitCode::InvalidArgs
+fn emit_event(
+    event: CliEvent,
+    job_id: Option<String>,
+    data: serde_json::Value,
+) -> Result<(), VcError> {
+    let envelope = EventEnvelope::new(Ulid::new().to_string(), job_id, event.as_str(), Some(data));
+    let line = envelope.to_ndjson_line().map_err(|error| {
+        VcError::new(ErrorCode::Internal, format!("serialize CLI event: {error}"))
+    })?;
+    print!("{line}");
+    Ok(())
+}
+
+fn map_error_code(error: &VcError) -> ExitCode {
+    match error.code {
+        ErrorCode::InstanceBusy
+        | ErrorCode::FfmpegUnavailable
+        | ErrorCode::RuntimeUnavailable
+        | ErrorCode::WorkerStartFailed
+        | ErrorCode::DeviceUnavailable => ExitCode::DependencyUnavailable,
+        ErrorCode::InputNotFound
+        | ErrorCode::InputUnsupported
+        | ErrorCode::ProbeFailed
+        | ErrorCode::AudioStreamNotFound => ExitCode::InputFailure,
+        ErrorCode::AsrFailed
+        | ErrorCode::AsrOom
+        | ErrorCode::WorkerCrashed
+        | ErrorCode::WorkerTimeout
+        | ErrorCode::WorkerProtocolError
+        | ErrorCode::EngineCapabilityInsufficient => ExitCode::AsrFailure,
+        ErrorCode::LlmAuthFailed
+        | ErrorCode::LlmModelNotFound
+        | ErrorCode::LlmRateLimited
+        | ErrorCode::LlmProviderUnavailable
+        | ErrorCode::LlmContextExceeded
+        | ErrorCode::LlmInvalidResponse
+        | ErrorCode::LlmValidationFailed => ExitCode::LlmFailure,
+        ErrorCode::ExportValidationFailed | ErrorCode::ExportFailed => ExitCode::ExportFailure,
+        ErrorCode::Cancelled => ExitCode::Cancelled,
+        ErrorCode::PartialBatchSuccess => ExitCode::PartialBatchSuccess,
+        _ => ExitCode::InvalidArgs,
     }
 }

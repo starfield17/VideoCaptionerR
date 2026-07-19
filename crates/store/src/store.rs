@@ -1,9 +1,11 @@
 //! Single-writer store actor over SQLite.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 
 use rusqlite::{params, Connection, OptionalExtension};
+use tokio::sync::oneshot;
 use ulid::Ulid;
 use videocaptionerr_contracts::artifact::{ArtifactKind, ArtifactMeta};
 use videocaptionerr_contracts::error::{ErrorCode, VcError, VcResult};
@@ -44,28 +46,323 @@ impl WorkUnitStatus {
     }
 }
 
-/// Blocking store handle. All writes go through this mutex (single writer).
+/// Async handle to the dedicated SQLite store actor.
 #[derive(Clone)]
 pub struct StoreHandle {
-    inner: Arc<Mutex<Store>>,
+    commands: Sender<StoreCommand>,
+}
+
+pub(crate) struct WorkUnitRecord {
+    pub id: String,
+    pub job_id: String,
+    pub stage: String,
+    pub unit_kind: String,
+    pub unit_index: u32,
+    pub input_hash: String,
+    pub status: String,
+    pub attempt: u32,
+    pub lease_owner: Option<String>,
+    pub lease_expires_at: Option<String>,
+    pub artifact_id: Option<String>,
+    pub aggregate_json: String,
 }
 
 impl StoreHandle {
     pub fn open(db_path: &Path) -> VcResult<Self> {
-        Ok(Self {
-            inner: Arc::new(Mutex::new(Store::open(db_path)?)),
-        })
+        let (commands, receiver) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let path = db_path.to_path_buf();
+        thread::Builder::new()
+            .name("videocaptionerr-store".into())
+            .spawn(move || store_actor(path, receiver, ready_tx))
+            .map_err(|error| {
+                VcError::new(
+                    ErrorCode::InvalidConfig,
+                    format!("spawn store actor: {error}"),
+                )
+            })?;
+        ready_rx.recv().map_err(|error| {
+            VcError::new(
+                ErrorCode::InvalidConfig,
+                format!("start store actor: {error}"),
+            )
+        })??;
+        Ok(Self { commands })
     }
 
-    pub fn with<F, T>(&self, f: F) -> VcResult<T>
-    where
-        F: FnOnce(&mut Store) -> VcResult<T>,
-    {
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|_| VcError::new(ErrorCode::Internal, "store mutex poisoned"))?;
-        f(&mut guard)
+    pub(crate) async fn save_job_aggregate(
+        &self,
+        id: &str,
+        batch_id: Option<&str>,
+        status: &str,
+        source_path: &str,
+        aggregate_json: &str,
+    ) -> VcResult<()> {
+        let (reply, result) = response_channel();
+        self.send(StoreCommand::SaveJobAggregate {
+            id: id.into(),
+            batch_id: batch_id.map(str::to_owned),
+            status: status.into(),
+            source_path: source_path.into(),
+            aggregate_json: aggregate_json.into(),
+            reply,
+        })?;
+        await_response(result).await
+    }
+
+    pub(crate) async fn load_job_aggregate(&self, id: &str) -> VcResult<Option<String>> {
+        let (reply, result) = response_channel();
+        self.send(StoreCommand::LoadJobAggregate {
+            id: id.into(),
+            reply,
+        })?;
+        await_response(result).await
+    }
+
+    pub(crate) async fn list_job_aggregates(&self) -> VcResult<Vec<String>> {
+        let (reply, result) = response_channel();
+        self.send(StoreCommand::ListJobAggregates { reply })?;
+        await_response(result).await
+    }
+
+    pub(crate) async fn delete_job_record(&self, id: &str) -> VcResult<()> {
+        let (reply, result) = response_channel();
+        self.send(StoreCommand::DeleteJob {
+            id: id.into(),
+            reply,
+        })?;
+        await_response(result).await
+    }
+
+    pub(crate) async fn save_batch_aggregate(
+        &self,
+        id: &str,
+        status: &str,
+        asr_model: &str,
+        device: &str,
+        aggregate_json: &str,
+    ) -> VcResult<()> {
+        let (reply, result) = response_channel();
+        self.send(StoreCommand::SaveBatchAggregate {
+            id: id.into(),
+            status: status.into(),
+            asr_model: asr_model.into(),
+            device: device.into(),
+            aggregate_json: aggregate_json.into(),
+            reply,
+        })?;
+        await_response(result).await
+    }
+
+    pub(crate) async fn load_batch_aggregate(&self, id: &str) -> VcResult<Option<String>> {
+        let (reply, result) = response_channel();
+        self.send(StoreCommand::LoadBatchAggregate {
+            id: id.into(),
+            reply,
+        })?;
+        await_response(result).await
+    }
+
+    pub(crate) async fn save_work_unit_aggregate(&self, record: WorkUnitRecord) -> VcResult<()> {
+        let (reply, result) = response_channel();
+        self.send(StoreCommand::SaveWorkUnitAggregate { record, reply })?;
+        await_response(result).await
+    }
+
+    pub(crate) async fn load_work_unit_aggregate(&self, id: &str) -> VcResult<Option<String>> {
+        let (reply, result) = response_channel();
+        self.send(StoreCommand::LoadWorkUnitAggregate {
+            id: id.into(),
+            reply,
+        })?;
+        await_response(result).await
+    }
+
+    pub(crate) async fn list_expired_work_unit_aggregates(
+        &self,
+        now_rfc3339: &str,
+    ) -> VcResult<Vec<String>> {
+        let (reply, result) = response_channel();
+        self.send(StoreCommand::ListExpiredWorkUnitAggregates {
+            now_rfc3339: now_rfc3339.into(),
+            reply,
+        })?;
+        await_response(result).await
+    }
+
+    pub(crate) async fn commit_artifact_and_unit(
+        &self,
+        meta: ArtifactMeta,
+        work_unit_id: Option<String>,
+    ) -> VcResult<()> {
+        let (reply, result) = response_channel();
+        self.send(StoreCommand::CommitArtifact {
+            meta,
+            work_unit_id,
+            reply,
+        })?;
+        await_response(result).await
+    }
+
+    fn send(&self, command: StoreCommand) -> VcResult<()> {
+        self.commands.send(command).map_err(|_| {
+            VcError::new(
+                ErrorCode::Internal,
+                "store actor stopped before accepting the command",
+            )
+        })
+    }
+}
+
+type StoreResponse<T> = oneshot::Sender<VcResult<T>>;
+
+fn response_channel<T>() -> (StoreResponse<T>, oneshot::Receiver<VcResult<T>>) {
+    oneshot::channel()
+}
+
+async fn await_response<T>(receiver: oneshot::Receiver<VcResult<T>>) -> VcResult<T> {
+    receiver.await.map_err(|_| {
+        VcError::new(
+            ErrorCode::Internal,
+            "store actor stopped before returning a response",
+        )
+    })?
+}
+
+enum StoreCommand {
+    SaveJobAggregate {
+        id: String,
+        batch_id: Option<String>,
+        status: String,
+        source_path: String,
+        aggregate_json: String,
+        reply: StoreResponse<()>,
+    },
+    LoadJobAggregate {
+        id: String,
+        reply: StoreResponse<Option<String>>,
+    },
+    ListJobAggregates {
+        reply: StoreResponse<Vec<String>>,
+    },
+    DeleteJob {
+        id: String,
+        reply: StoreResponse<()>,
+    },
+    SaveBatchAggregate {
+        id: String,
+        status: String,
+        asr_model: String,
+        device: String,
+        aggregate_json: String,
+        reply: StoreResponse<()>,
+    },
+    LoadBatchAggregate {
+        id: String,
+        reply: StoreResponse<Option<String>>,
+    },
+    SaveWorkUnitAggregate {
+        record: WorkUnitRecord,
+        reply: StoreResponse<()>,
+    },
+    LoadWorkUnitAggregate {
+        id: String,
+        reply: StoreResponse<Option<String>>,
+    },
+    ListExpiredWorkUnitAggregates {
+        now_rfc3339: String,
+        reply: StoreResponse<Vec<String>>,
+    },
+    CommitArtifact {
+        meta: ArtifactMeta,
+        work_unit_id: Option<String>,
+        reply: StoreResponse<()>,
+    },
+}
+
+fn store_actor(
+    db_path: PathBuf,
+    receiver: Receiver<StoreCommand>,
+    ready: mpsc::SyncSender<VcResult<()>>,
+) {
+    let mut store = match Store::open(&db_path) {
+        Ok(store) => {
+            let _ = ready.send(Ok(()));
+            store
+        }
+        Err(error) => {
+            let _ = ready.send(Err(error));
+            return;
+        }
+    };
+
+    while let Ok(command) = receiver.recv() {
+        command.execute(&mut store);
+    }
+}
+
+impl StoreCommand {
+    fn execute(self, store: &mut Store) {
+        match self {
+            Self::SaveJobAggregate {
+                id,
+                batch_id,
+                status,
+                source_path,
+                aggregate_json,
+                reply,
+            } => {
+                let result = store.save_job_aggregate(
+                    &id,
+                    batch_id.as_deref(),
+                    &status,
+                    &source_path,
+                    &aggregate_json,
+                );
+                let _ = reply.send(result);
+            }
+            Self::LoadJobAggregate { id, reply } => {
+                let _ = reply.send(store.load_job_aggregate(&id));
+            }
+            Self::ListJobAggregates { reply } => {
+                let _ = reply.send(store.list_job_aggregates());
+            }
+            Self::DeleteJob { id, reply } => {
+                let _ = reply.send(store.delete_job_record(&id));
+            }
+            Self::SaveBatchAggregate {
+                id,
+                status,
+                asr_model,
+                device,
+                aggregate_json,
+                reply,
+            } => {
+                let result =
+                    store.save_batch_aggregate(&id, &status, &asr_model, &device, &aggregate_json);
+                let _ = reply.send(result);
+            }
+            Self::LoadBatchAggregate { id, reply } => {
+                let _ = reply.send(store.load_batch_aggregate(&id));
+            }
+            Self::SaveWorkUnitAggregate { record, reply } => {
+                let result = store.save_work_unit_aggregate(&record);
+                let _ = reply.send(result);
+            }
+            Self::LoadWorkUnitAggregate { id, reply } => {
+                let _ = reply.send(store.load_work_unit_aggregate(&id));
+            }
+            Self::ListExpiredWorkUnitAggregates { now_rfc3339, reply } => {
+                let _ = reply.send(store.list_expired_work_unit_aggregates(&now_rfc3339));
+            }
+            Self::CommitArtifact {
+                meta,
+                work_unit_id,
+                reply,
+            } => {
+                let _ = reply.send(store.commit_artifact_and_unit(&meta, work_unit_id.as_deref()));
+            }
+        }
     }
 }
 
@@ -99,8 +396,176 @@ impl Store {
         &self.path
     }
 
-    pub fn conn(&self) -> &Connection {
-        &self.conn
+    pub(crate) fn save_job_aggregate(
+        &self,
+        id: &str,
+        batch_id: Option<&str>,
+        status: &str,
+        source_path: &str,
+        aggregate_json: &str,
+    ) -> VcResult<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO jobs (
+                    id, batch_id, status, source_path, job_dir, aggregate_json,
+                    created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+                 ON CONFLICT(id) DO UPDATE SET
+                    batch_id = excluded.batch_id,
+                    status = excluded.status,
+                    source_path = excluded.source_path,
+                    aggregate_json = excluded.aggregate_json,
+                    updated_at = excluded.updated_at",
+                params![id, batch_id, status, source_path, "", aggregate_json, now],
+            )
+            .map_err(|e| VcError::new(ErrorCode::Internal, format!("save job aggregate: {e}")))?;
+        Ok(())
+    }
+
+    pub(crate) fn save_batch_aggregate(
+        &self,
+        id: &str,
+        status: &str,
+        asr_model: &str,
+        device: &str,
+        aggregate_json: &str,
+    ) -> VcResult<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO batches (
+                    id, status, asr_model_id, asr_device, aggregate_json,
+                    created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                 ON CONFLICT(id) DO UPDATE SET
+                    status = excluded.status,
+                    asr_model_id = excluded.asr_model_id,
+                    asr_device = excluded.asr_device,
+                    aggregate_json = excluded.aggregate_json,
+                    updated_at = excluded.updated_at",
+                params![id, status, asr_model, device, aggregate_json, now],
+            )
+            .map_err(|e| VcError::new(ErrorCode::Internal, format!("save batch aggregate: {e}")))?;
+        Ok(())
+    }
+
+    pub(crate) fn save_work_unit_aggregate(&self, record: &WorkUnitRecord) -> VcResult<()> {
+        self.conn
+            .execute(
+                "INSERT INTO work_units (
+                    id, job_id, stage, unit_kind, unit_index, input_hash, status, attempt,
+                    artifact_id, lease_owner, lease_expires_at, aggregate_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 ON CONFLICT(id) DO UPDATE SET
+                    job_id = excluded.job_id,
+                    stage = excluded.stage,
+                    unit_kind = excluded.unit_kind,
+                    unit_index = excluded.unit_index,
+                    input_hash = excluded.input_hash,
+                    status = excluded.status,
+                    attempt = excluded.attempt,
+                    artifact_id = excluded.artifact_id,
+                    lease_owner = excluded.lease_owner,
+                    lease_expires_at = excluded.lease_expires_at,
+                    aggregate_json = excluded.aggregate_json",
+                params![
+                    record.id,
+                    record.job_id,
+                    record.stage,
+                    record.unit_kind,
+                    record.unit_index as i64,
+                    record.input_hash,
+                    record.status,
+                    record.attempt as i64,
+                    record.artifact_id,
+                    record.lease_owner,
+                    record.lease_expires_at,
+                    record.aggregate_json,
+                ],
+            )
+            .map_err(|e| VcError::new(ErrorCode::Internal, format!("save work unit: {e}")))?;
+        Ok(())
+    }
+
+    pub(crate) fn load_batch_aggregate(&self, id: &str) -> VcResult<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT aggregate_json FROM batches WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| VcError::new(ErrorCode::Internal, format!("load batch aggregate: {e}")))
+    }
+
+    pub(crate) fn load_work_unit_aggregate(&self, id: &str) -> VcResult<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT aggregate_json FROM work_units WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| VcError::new(ErrorCode::Internal, format!("load work unit: {e}")))
+    }
+
+    pub(crate) fn list_expired_work_unit_aggregates(
+        &self,
+        now_rfc3339: &str,
+    ) -> VcResult<Vec<String>> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT aggregate_json FROM work_units
+                 WHERE status = 'running'
+                   AND lease_expires_at IS NOT NULL
+                   AND lease_expires_at < ?1
+                   AND aggregate_json IS NOT NULL
+                 ORDER BY unit_index, id",
+            )
+            .map_err(|e| {
+                VcError::new(ErrorCode::Internal, format!("prepare expired units: {e}"))
+            })?;
+        let rows = statement
+            .query_map([now_rfc3339], |row| row.get::<_, String>(0))
+            .map_err(|e| VcError::new(ErrorCode::Internal, format!("query expired units: {e}")))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| VcError::new(ErrorCode::Internal, format!("read expired units: {e}")))
+    }
+
+    pub(crate) fn load_job_aggregate(&self, id: &str) -> VcResult<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT aggregate_json FROM jobs WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| VcError::new(ErrorCode::Internal, format!("load job aggregate: {e}")))
+    }
+
+    pub(crate) fn list_job_aggregates(&self) -> VcResult<Vec<String>> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT aggregate_json FROM jobs
+                 WHERE aggregate_json IS NOT NULL
+                 ORDER BY created_at, id",
+            )
+            .map_err(|e| VcError::new(ErrorCode::Internal, format!("list job aggregates: {e}")))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| VcError::new(ErrorCode::Internal, format!("query job aggregates: {e}")))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| VcError::new(ErrorCode::Internal, format!("read job aggregates: {e}")))
+    }
+
+    pub(crate) fn delete_job_record(&self, id: &str) -> VcResult<()> {
+        self.conn
+            .execute("DELETE FROM jobs WHERE id = ?1", [id])
+            .map_err(|e| VcError::new(ErrorCode::Internal, format!("delete job: {e}")))?;
+        Ok(())
     }
 
     pub fn insert_job(
@@ -421,5 +886,33 @@ mod tests {
             })
             .unwrap();
         assert_eq!(attempt, 2);
+    }
+
+    #[tokio::test]
+    async fn store_handle_uses_typed_actor_commands() {
+        let dir = tempdir().unwrap();
+        let handle = StoreHandle::open(&dir.path().join("actor.db")).unwrap();
+
+        handle
+            .save_job_aggregate("job1", None, "pending", "/media/a.wav", "{\"id\":1}")
+            .await
+            .unwrap();
+        handle
+            .save_batch_aggregate("batch1", "pending", "fake", "cpu", "{\"id\":1}")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            handle.load_job_aggregate("job1").await.unwrap(),
+            Some("{\"id\":1}".into())
+        );
+        assert_eq!(
+            handle.load_batch_aggregate("batch1").await.unwrap(),
+            Some("{\"id\":1}".into())
+        );
+        assert_eq!(handle.list_job_aggregates().await.unwrap().len(), 1);
+
+        handle.delete_job_record("job1").await.unwrap();
+        assert!(handle.load_job_aggregate("job1").await.unwrap().is_none());
     }
 }

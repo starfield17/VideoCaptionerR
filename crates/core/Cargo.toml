@@ -11,25 +11,13 @@ description = "Pipeline and application services for VideoCaptionerR"
 [dependencies]
 videocaptionerr-domain = { workspace = true }
 videocaptionerr-contracts = { workspace = true }
-videocaptionerr-store = { workspace = true }
-videocaptionerr-asr = { workspace = true }
-videocaptionerr-llm = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-anyhow = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
-tracing = { workspace = true }
-ulid = { workspace = true }
-blake3 = { workspace = true }
-chrono = { workspace = true }
-regex = { workspace = true }
-unicode-normalization = { workspace = true }
-toml = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 pretty_assertions = { workspace = true }
-proptest = { workspace = true }
-videocaptionerr-test-support = { workspace = true }
+tempfile = { workspace = true }
+ulid = { workspace = true }

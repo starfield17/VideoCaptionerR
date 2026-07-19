@@ -17,10 +17,11 @@ impl Migration {
 }
 
 /// Ordered migrations. Append-only; never edit applied SQL in place.
-pub static MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "init",
-    sql: r#"
+pub static MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "init",
+        sql: r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version INTEGER PRIMARY KEY,
   name TEXT NOT NULL,
@@ -163,8 +164,30 @@ CREATE INDEX IF NOT EXISTS idx_jobs_batch ON jobs(batch_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_work_units_job ON work_units(job_id, status);
 CREATE INDEX IF NOT EXISTS idx_artifacts_job ON artifacts(job_id);
+    "#,
+    },
+    Migration {
+        version: 2,
+        name: "job_aggregate_json",
+        sql: r#"
+ALTER TABLE jobs ADD COLUMN aggregate_json TEXT;
 "#,
-}];
+    },
+    Migration {
+        version: 3,
+        name: "batch_aggregate_json",
+        sql: r#"
+ALTER TABLE batches ADD COLUMN aggregate_json TEXT;
+"#,
+    },
+    Migration {
+        version: 4,
+        name: "work_unit_aggregate_json",
+        sql: r#"
+ALTER TABLE work_units ADD COLUMN aggregate_json TEXT;
+"#,
+    },
+];
 
 /// Apply pending migrations. Verifies checksums of already-applied versions.
 pub fn migrate(conn: &Connection) -> VcResult<i64> {
@@ -281,12 +304,12 @@ mod tests {
         let path = dir.path().join("test.db");
         let conn = Connection::open(&path).unwrap();
         let v = migrate(&conn).unwrap();
-        assert_eq!(v, 1);
+        assert_eq!(v, MIGRATIONS.last().unwrap().version);
 
         // Re-open and migrate again is idempotent.
         let conn2 = Connection::open(&path).unwrap();
         let v2 = migrate(&conn2).unwrap();
-        assert_eq!(v2, 1);
+        assert_eq!(v2, MIGRATIONS.last().unwrap().version);
 
         // Tables exist.
         let n: i64 = conn2

@@ -58,6 +58,7 @@ pub enum CliEvent {
     Warning,
     Error,
     JobFinished,
+    JobListed,
     Cancelled,
 }
 
@@ -75,6 +76,7 @@ impl CliEvent {
             Self::Warning => "warning",
             Self::Error => "error",
             Self::JobFinished => "job_finished",
+            Self::JobListed => "job_listed",
             Self::Cancelled => "cancelled",
         }
     }
