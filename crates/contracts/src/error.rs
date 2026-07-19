@@ -214,6 +214,12 @@ pub struct VcError {
     pub job_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// Retry-After supplied by an upstream provider, in milliseconds.
+    ///
+    /// This is structured metadata rather than part of the human message so
+    /// callers can honor it without parsing logs or provider response text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
 }
 
 impl VcError {
@@ -225,6 +231,7 @@ impl VcError {
             detail: None,
             job_id: None,
             request_id: None,
+            retry_after_ms: None,
         }
     }
 
@@ -245,6 +252,11 @@ impl VcError {
 
     pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
         self.request_id = Some(request_id.into());
+        self
+    }
+
+    pub fn with_retry_after_ms(mut self, retry_after_ms: u64) -> Self {
+        self.retry_after_ms = Some(retry_after_ms);
         self
     }
 }

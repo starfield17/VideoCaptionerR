@@ -44,8 +44,12 @@ impl FakeLlmProvider {
                 tools: false,
                 seed: false,
                 vision: false,
+                returns_usage: true,
+                supports_model_list: false,
                 max_context_tokens: Some(8192),
+                max_output_tokens: Some(2048),
                 manual_override: false,
+                structured_mode: videocaptionerr_llm::StructuredMode::JsonObject,
             },
             calls: AtomicU32::new(0),
         }
@@ -148,6 +152,8 @@ mod tests {
             temperature: None,
             max_tokens: None,
             response_format_json: None,
+            seed: None,
+            structured_mode: None,
         };
         assert_eq!(
             p.chat(&req).await.unwrap_err().code,

@@ -2085,7 +2085,11 @@ name = "videocaptionerr-llm"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "blake3",
+ "chrono",
  "pretty_assertions",
+ "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
@@ -2093,6 +2097,7 @@ dependencies = [
  "tokio",
  "tracing",
  "ulid",
+ "unicode-normalization",
  "videocaptionerr-contracts",
 ]
 
