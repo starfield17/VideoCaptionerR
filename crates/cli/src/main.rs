@@ -7,8 +7,9 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 use videocaptionerr_contracts::error::ErrorCode;
 use videocaptionerr_contracts::event::ExitCode;
+use videocaptionerr_core::{run_transcribe, ExportFormat, TranscribeRequest};
 use videocaptionerr_store::instance_lock::LockOwner;
-use videocaptionerr_store::{AppPaths, InstanceLock};
+use videocaptionerr_store::{AppPaths, InstanceLock, Store};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -33,12 +34,25 @@ struct Cli {
 enum Commands {
     /// Show version and workspace health.
     Doctor,
-    /// Transcribe media to subtitles (ASR only). Implemented from M2.
+    /// Transcribe media to subtitles (ASR only).
     Transcribe {
         #[arg(required = true)]
         files: Vec<PathBuf>,
         #[arg(long)]
         profile: Option<String>,
+        /// ASR helper engine: fake (default for smoke) or whisper-cpp.
+        #[arg(long, default_value = "fake")]
+        engine: String,
+        /// Explicit model path (required for non-fake engines; never auto-selected).
+        #[arg(long)]
+        model: Option<PathBuf>,
+        /// Override helper binary path.
+        #[arg(long, env = "VIDEOCAPTIONERR_HELPER")]
+        helper: Option<PathBuf>,
+        #[arg(long)]
+        language: Option<String>,
+        #[arg(long, default_value = "srt")]
+        format: String,
     },
     /// Full process: ASR + split + correct + translate. Implemented from M3/M5.
     Process {
@@ -118,22 +132,76 @@ fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             println!("videocaptionerr {}", env!("CARGO_PKG_VERSION"));
             println!("home: {}", paths.home.display());
             println!("db: {}", paths.db_path.display());
-            let store =
-                videocaptionerr_store::Store::open(&paths.db_path).map_err(|e| e.to_string())?;
+            let store = Store::open(&paths.db_path).map_err(|e| e.to_string())?;
             println!("store: ok ({})", store.path().display());
             println!("ffmpeg: {}", which("ffmpeg"));
             println!("ffprobe: {}", which("ffprobe"));
+            let helper = videocaptionerr_asr::resolve_helper_binary();
+            println!(
+                "helper: {}",
+                if helper.exists() {
+                    helper.display().to_string()
+                } else {
+                    "not found".into()
+                }
+            );
             Ok(ExitCode::Success)
         }
-        Commands::Transcribe { .. } | Commands::Process { .. } => {
+        Commands::Transcribe {
+            files,
+            profile: _,
+            engine,
+            model,
+            helper,
+            language,
+            format,
+        } => {
             let _lock = InstanceLock::try_acquire(&paths.instance_lock_path(), LockOwner::Cli)
                 .map_err(|e| e.to_string())?;
-            eprintln!("not implemented yet (milestone M2/M3/M5)");
+            let export_format = ExportFormat::parse(&format)
+                .ok_or_else(|| format!("unsupported format '{format}' (expected srt|vtt|ass)"))?;
+
+            let rt = tokio::runtime::Runtime::new()?;
+            let mut store = Store::open(&paths.db_path).map_err(|e| e.to_string())?;
+            let mut any_fail = false;
+            for file in files {
+                let req = TranscribeRequest {
+                    input: file.clone(),
+                    model_path: model.clone(),
+                    engine: engine.clone(),
+                    helper_path: helper.clone(),
+                    language: language.clone(),
+                    export_format,
+                };
+                match rt.block_on(run_transcribe(&paths, &mut store, &req)) {
+                    Ok(res) => {
+                        println!(
+                            "job {} done: {} cues -> {}",
+                            res.job_id,
+                            res.cue_count,
+                            res.export_path.display()
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("transcribe {}: {e}", file.display());
+                        any_fail = true;
+                    }
+                }
+            }
+            if any_fail {
+                Ok(ExitCode::AsrFailure)
+            } else {
+                Ok(ExitCode::Success)
+            }
+        }
+        Commands::Process { .. } => {
+            let _lock = InstanceLock::try_acquire(&paths.instance_lock_path(), LockOwner::Cli)
+                .map_err(|e| e.to_string())?;
+            eprintln!("not implemented yet (milestone M3/M5)");
             Ok(ExitCode::InvalidArgs)
         }
         Commands::Jobs { action } => {
-            let store =
-                videocaptionerr_store::Store::open(&paths.db_path).map_err(|e| e.to_string())?;
+            let store = Store::open(&paths.db_path).map_err(|e| e.to_string())?;
             match action {
                 JobsCmd::List => {
                     let mut stmt = store
@@ -198,8 +266,11 @@ fn map_error_code(err: &dyn std::error::Error) -> ExitCode {
     let msg = err.to_string();
     if msg.contains(ErrorCode::InstanceBusy.as_str()) {
         ExitCode::DependencyUnavailable
+    } else if msg.contains(ErrorCode::AsrFailed.as_str())
+        || msg.contains(ErrorCode::WorkerCrashed.as_str())
+    {
+        ExitCode::AsrFailure
     } else {
-        // Default until richer error typing is threaded through the CLI adapter.
         ExitCode::InvalidArgs
     }
 }

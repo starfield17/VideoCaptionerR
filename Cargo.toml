@@ -8,6 +8,7 @@ members = [
     "crates/store",
     "crates/cli",
     "crates/test-support",
+    "crates/whisper-helper",
     "tools/xtask",
 ]
 default-members = [

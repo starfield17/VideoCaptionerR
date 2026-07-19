@@ -5,6 +5,7 @@
 pub mod config;
 pub mod constants;
 pub mod media;
+pub mod pipeline;
 pub mod split;
 pub mod subtitle;
 pub mod text_joiner;
@@ -15,6 +16,7 @@ pub use media::{
     extract_audio_wav, media_hash_file, pcm_hash_file, probe_media, select_audio_stream,
     ExtractOptions,
 };
+pub use pipeline::{run_transcribe, TranscribeRequest, TranscribeResult};
 pub use split::{rule_split, RuleSplitConfig};
 pub use subtitle::{
     import_srt, import_vtt, preflight_export, write_ass, write_srt, write_vtt, ConflictPolicy,

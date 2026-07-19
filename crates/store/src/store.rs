@@ -130,6 +130,33 @@ impl Store {
             .map_err(|e| VcError::new(ErrorCode::Internal, format!("get job: {e}")))
     }
 
+    pub fn mark_job_done(
+        &self,
+        id: &str,
+        source_hash: &str,
+        pcm_hash: &str,
+        selected_stream_index: i64,
+        language: Option<&str>,
+    ) -> VcResult<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "UPDATE jobs SET status='done', source_hash=?1, pcm_hash=?2,
+                 selected_stream_index=?3, language=?4, updated_at=?5, finished_at=?5
+                 WHERE id=?6",
+                params![
+                    source_hash,
+                    pcm_hash,
+                    selected_stream_index,
+                    language,
+                    now,
+                    id
+                ],
+            )
+            .map_err(|e| VcError::new(ErrorCode::Internal, format!("mark job done: {e}")))?;
+        Ok(())
+    }
+
     /// Insert artifact metadata and mark committed in one transaction with a work unit update.
     pub fn commit_artifact_and_unit(
         &mut self,
