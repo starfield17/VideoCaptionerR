@@ -236,14 +236,28 @@ async fn multi_job_batch_opens_session_once_via_resolver() {
 #[cfg(feature = "required-adapters")]
 mod required {
     use super::*;
+    use crate::python_env::{ensure_managed_env, EngineFamily, ManagedEnvConfig};
 
     #[tokio::test]
     async fn required_faster_whisper_env_must_exist() {
-        let resolver = FamilyAsrRuntimeResolver::new(
-            resolve_helper_binary(),
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../python/runtimes"),
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-envs"),
+        let envs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/test-envs");
+        let runtimes = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../python/runtimes");
+        // Hard-fail path: provisioning must succeed or the test fails.
+        // Never use #[ignore] or soft return.
+        let env = ensure_managed_env(&ManagedEnvConfig {
+            family: EngineFamily::FasterWhisper,
+            envs_root: envs.clone(),
+            runtimes_root: runtimes.clone(),
+            uv_path: std::env::var_os("VIDEOCAPTIONERR_UV").map(PathBuf::from),
+        })
+        .expect("required faster-whisper managed env must be provisionable (install uv + network)");
+        assert!(
+            env.python_bin().is_file(),
+            "managed python missing at {}",
+            env.python_bin().display()
         );
+
+        let resolver = FamilyAsrRuntimeResolver::new(resolve_helper_binary(), runtimes, envs);
         let spec = AsrRuntimeSpec {
             engine_family: "faster-whisper".into(),
             model_id: "tiny".into(),
@@ -252,14 +266,16 @@ mod required {
             device: "cpu".into(),
             compute_type: "int8".into(),
         };
-        // Must not soft-skip: either resolves or hard-errors.
-        let result = resolver.resolve(&spec).await;
-        assert!(
-            result.is_ok() || result.is_err(),
-            "required adapter path must not skip"
-        );
-        // If uv/network unavailable this fails the test intentionally when feature is on
-        // and the env cannot be provisioned — that is the gate.
-        result.expect("required faster-whisper adapter must be provisionable");
+        resolver
+            .resolve(&spec)
+            .await
+            .expect("required faster-whisper adapter must resolve");
+    }
+
+    #[test]
+    fn required_feature_is_not_a_soft_skip_gate() {
+        // Compiling this module under --features required-adapters is the gate.
+        // If someone replaces tests with return/ignore, this constant documents intent.
+        assert!(cfg!(feature = "required-adapters"));
     }
 }
