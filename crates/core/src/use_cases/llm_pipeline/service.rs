@@ -9,9 +9,11 @@ use videocaptionerr_domain::{CueTextUpdate, LlmResultBinding, LlmTextField, Tran
 use crate::application_error::{AppResult, ApplicationError};
 use crate::constants::{CORRECTION_SIMILARITY, CORRECTION_TRANSLATION_RETRIES, SPLIT_RETRIES};
 use crate::ports::{
-    IdGenerator, LlmGateway, LlmMessage, LlmRequest, LlmRequestMetadata, LlmRequestRecorder,
-    LlmRole, LlmStage,
+    ArtifactSource, ExpectedVersion, IdGenerator, LlmGateway, LlmMessage, LlmRequest,
+    LlmRequestMetadata, LlmRequestRecorder, LlmRole, LlmStage, OutboxEvent, PreparedArtifact,
+    StageCommitRequest, Versioned,
 };
+use videocaptionerr_domain::{ArtifactRef, WorkUnit, WorkUnitStatus};
 
 use super::packing::{estimate_batch_tokens, pack_batches, pack_one_batch};
 use super::plan::{effective_structured_output, empty_plan, make_plan};
@@ -33,6 +35,32 @@ impl LlmPipeline {
             gateway,
             recorder,
             ids,
+            work_units: None,
+            stage_commits: None,
+        }
+    }
+
+    pub fn with_work_units(
+        mut self,
+        work_units: Arc<dyn crate::ports::WorkUnitRepository>,
+    ) -> Self {
+        self.work_units = Some(work_units);
+        self
+    }
+
+    pub fn with_stage_commits(
+        mut self,
+        stage_commits: Arc<dyn crate::ports::StageCommitRepository>,
+    ) -> Self {
+        self.stage_commits = Some(stage_commits);
+        self
+    }
+
+    fn stage_kind(stage: LlmStage) -> videocaptionerr_domain::StageKind {
+        match stage {
+            LlmStage::Split => videocaptionerr_domain::StageKind::Split,
+            LlmStage::Correct => videocaptionerr_domain::StageKind::Correct,
+            LlmStage::Translate => videocaptionerr_domain::StageKind::Translate,
         }
     }
 
@@ -125,17 +153,31 @@ impl LlmPipeline {
             })
             .collect::<Vec<_>>();
         let batches = pack_batches(&inputs, &[], &request, context_limit, output_limit)?;
-        let plan = self.ensure_plan(&request, &batches, context_limit, output_limit)?;
+        let plan = self
+            .ensure_plan(&request, &batches, context_limit, output_limit)
+            .await?;
+        let batches = if request.durable.is_some()
+            && super::durable::load_plan(&request.durable.as_ref().unwrap().job_dir, request.stage)?
+                .is_some_and(|p| p.plan_hash == plan.plan_hash)
+        {
+            self.batches_from_plan(&plan, transcript)?
+        } else {
+            batches
+        };
         let mut formatted = BTreeMap::new();
         let mut degraded = Vec::new();
         for batch in &batches {
-            if let Some(items) = self.load_durable_batch(&request, &plan, batch.index)? {
+            if let Some(items) = self
+                .load_durable_batch(&request, &plan, batch.index)
+                .await?
+            {
                 formatted.extend(items);
                 continue;
             }
             self.execute_split_batch(&request, batch, &mut formatted, &mut degraded)
                 .await?;
-            self.persist_durable_batch(&request, &plan, batch, transcript, &formatted)?;
+            self.persist_durable_batch(&request, &plan, batch, transcript, &formatted)
+                .await?;
         }
 
         let mut ranges = Vec::new();
@@ -278,11 +320,24 @@ impl LlmPipeline {
             })
             .collect::<Vec<_>>();
         let batches = pack_batches(&inputs, &[], &request, context_limit, output_limit)?;
-        let plan = self.ensure_plan(&request, &batches, context_limit, output_limit)?;
+        let plan = self
+            .ensure_plan(&request, &batches, context_limit, output_limit)
+            .await?;
+        let batches = if request.durable.is_some()
+            && super::durable::load_plan(&request.durable.as_ref().unwrap().job_dir, request.stage)?
+                .is_some_and(|p| p.plan_hash == plan.plan_hash)
+        {
+            self.batches_from_plan(&plan, transcript)?
+        } else {
+            batches
+        };
         let mut values = BTreeMap::new();
         let mut degraded = Vec::new();
         for batch in &batches {
-            if let Some(items) = self.load_durable_batch(&request, &plan, batch.index)? {
+            if let Some(items) = self
+                .load_durable_batch(&request, &plan, batch.index)
+                .await?
+            {
                 values.extend(items);
                 continue;
             }
@@ -295,7 +350,8 @@ impl LlmPipeline {
                 &mut degraded,
             )
             .await?;
-            self.persist_durable_batch(&request, &plan, batch, transcript, &values)?;
+            self.persist_durable_batch(&request, &plan, batch, transcript, &values)
+                .await?;
         }
         let updates = values
             .into_iter()
@@ -588,7 +644,7 @@ impl LlmPipeline {
         })
     }
 
-    fn ensure_plan(
+    async fn ensure_plan(
         &self,
         request: &LlmPipelineRequest,
         batches: &[BatchInput],
@@ -600,8 +656,9 @@ impl LlmPipeline {
                 if let Some(existing) = super::durable::load_plan(&ctx.job_dir, request.stage)? {
                     if existing.prompt_bundle_hash == request.prompt.content_hash
                         && existing.model == request.model
-                        && existing.entries.len() == batches.len()
                     {
+                        // Restart: never re-pack when a matching plan is durable.
+                        self.ensure_work_units(request, &existing).await?;
                         return Ok(existing);
                     }
                 }
@@ -612,10 +669,105 @@ impl LlmPipeline {
             // Plan must be durable before the first network call.
             super::durable::persist_plan(ctx, &plan)?;
         }
+        self.ensure_work_units(request, &plan).await?;
         Ok(plan)
     }
 
-    fn load_durable_batch(
+    /// Reconstruct batch inputs from a durable plan so restart does not re-pack.
+    fn batches_from_plan(
+        &self,
+        plan: &LlmPlan,
+        transcript: &Transcript,
+    ) -> AppResult<Vec<BatchInput>> {
+        let mut batches = Vec::with_capacity(plan.entries.len());
+        for entry in &plan.entries {
+            let output = entry
+                .output_cue_ids
+                .iter()
+                .map(|id| {
+                    transcript
+                        .cues
+                        .iter()
+                        .find(|c| c.id == *id)
+                        .map(|c| CueInput {
+                            id: c.id,
+                            text: c.text.clone(),
+                        })
+                        .ok_or_else(|| {
+                            ApplicationError::Invalid(format!(
+                                "durable plan references missing cue {id}"
+                            ))
+                        })
+                })
+                .collect::<AppResult<Vec<_>>>()?;
+            let context = entry
+                .context_cue_ids
+                .iter()
+                .filter_map(|id| {
+                    transcript
+                        .cues
+                        .iter()
+                        .find(|c| c.id == *id)
+                        .map(|c| CueInput {
+                            id: c.id,
+                            text: c.translation.clone().unwrap_or_else(|| c.text.clone()),
+                        })
+                })
+                .collect();
+            batches.push(BatchInput {
+                index: entry.batch_index,
+                output,
+                context,
+            });
+        }
+        Ok(batches)
+    }
+
+    async fn ensure_work_units(
+        &self,
+        request: &LlmPipelineRequest,
+        plan: &LlmPlan,
+    ) -> AppResult<()> {
+        let (Some(ctx), Some(work_units)) = (&request.durable, &self.work_units) else {
+            return Ok(());
+        };
+        let stage = Self::stage_kind(request.stage);
+        for entry in &plan.entries {
+            let cue_revs: Vec<(u32, u64)> = entry
+                .expected_text_revisions
+                .iter()
+                .map(|(k, v)| (*k, *v))
+                .collect();
+            let input_hash = super::durable::work_unit_input_hash(plan, entry, &cue_revs);
+            let existing = work_units
+                .find_work_unit(
+                    &ctx.job_id,
+                    stage,
+                    "llm_batch",
+                    entry.batch_index,
+                    &input_hash,
+                )
+                .await?;
+            if existing.is_some() {
+                continue;
+            }
+            let unit = WorkUnit::new(
+                self.ids.next_id(),
+                ctx.job_id.clone(),
+                stage,
+                "llm_batch",
+                entry.batch_index,
+                input_hash,
+            )?;
+            let mut versioned = Versioned::new(unit);
+            work_units
+                .save_work_unit(&mut versioned, ExpectedVersion::New)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn load_durable_batch(
         &self,
         request: &LlmPipelineRequest,
         plan: &LlmPlan,
@@ -641,10 +793,17 @@ impl LlmPipeline {
                 "durable LLM batch result transcript revision is stale",
             )));
         }
+        // Corrupt/empty file body is already rejected by load; verify items non-empty for Done.
+        if result.items.is_empty() {
+            return Err(ApplicationError::Adapter(VcError::new(
+                ErrorCode::ArtifactCorrupt,
+                format!("LLM batch {batch_index} result artifact has no items"),
+            )));
+        }
         Ok(Some(result.items))
     }
 
-    fn persist_durable_batch(
+    async fn persist_durable_batch(
         &self,
         request: &LlmPipelineRequest,
         plan: &LlmPlan,
@@ -665,18 +824,108 @@ impl LlmPipeline {
                 cue_revisions.insert(cue.id, c.text_revision);
             }
         }
-        let artifact = super::durable::LlmBatchResultArtifact {
+        // Stale CAS: reject if any expected cue revision no longer matches.
+        if let Some(entry) = plan.entries.iter().find(|e| e.batch_index == batch.index) {
+            for (cue_id, expected) in &entry.expected_text_revisions {
+                let actual = transcript
+                    .cues
+                    .iter()
+                    .find(|c| c.id == *cue_id)
+                    .map(|c| c.text_revision)
+                    .unwrap_or(0);
+                if actual != *expected {
+                    return Err(ApplicationError::Adapter(VcError::new(
+                        ErrorCode::StaleResult,
+                        format!("cue {cue_id} text revision {actual} != plan expected {expected}"),
+                    )));
+                }
+            }
+        }
+        let artifact_payload = super::durable::LlmBatchResultArtifact {
             schema_version: 1,
             plan_id: plan.plan_id.clone(),
             plan_hash: plan.plan_hash.clone(),
             batch_index: batch.index,
             stage: request.stage,
-            items,
+            items: items.clone(),
             transcript_revision: plan.transcript_revision,
             input_artifact_id: plan.input_artifact_id.clone(),
-            cue_revisions,
+            cue_revisions: cue_revisions.clone(),
         };
-        super::durable::persist_batch_result(ctx, &artifact)
+        super::durable::persist_batch_result(ctx, &artifact_payload)?;
+
+        // Prefer atomic StageCommit when WorkUnit control plane is wired.
+        if let (Some(work_units), Some(stage_commits)) = (&self.work_units, &self.stage_commits) {
+            let stage = Self::stage_kind(request.stage);
+            let entry = plan
+                .entries
+                .iter()
+                .find(|e| e.batch_index == batch.index)
+                .ok_or_else(|| {
+                    ApplicationError::Invalid(format!(
+                        "plan missing entry for batch {}",
+                        batch.index
+                    ))
+                })?;
+            let cue_revs: Vec<(u32, u64)> = cue_revisions.iter().map(|(k, v)| (*k, *v)).collect();
+            let input_hash = super::durable::work_unit_input_hash(plan, entry, &cue_revs);
+            let unit = work_units
+                .find_work_unit(&ctx.job_id, stage, "llm_batch", batch.index, &input_hash)
+                .await?
+                .ok_or_else(|| {
+                    ApplicationError::Invalid(format!(
+                        "llm_batch WorkUnit for batch {} not found",
+                        batch.index
+                    ))
+                })?;
+            if unit.status() == WorkUnitStatus::Done {
+                return Ok(());
+            }
+            let path = super::durable::batch_result_path(&ctx.job_dir, request.stage, batch.index);
+            let bytes = serde_json::to_vec_pretty(&artifact_payload).map_err(|e| {
+                ApplicationError::Adapter(VcError::new(
+                    ErrorCode::ArtifactCommitFailed,
+                    format!("encode llm batch for commit: {e}"),
+                ))
+            })?;
+            let artifact = ArtifactRef {
+                id: self.ids.next_id(),
+                stage,
+                path: path.to_string_lossy().into_owned(),
+                content_hash: format!("blake3:{}", blake3::hash(&bytes).to_hex()),
+                schema_version: 1,
+                producer_fingerprint: format!("llm-{}", request.stage.as_str()),
+            };
+            let mut completed = unit.clone();
+            completed.complete(artifact.clone())?;
+            let prepared = PreparedArtifact {
+                job_id: ctx.job_id.clone(),
+                artifact: artifact.clone(),
+                source: ArtifactSource::ExistingFile { path },
+            };
+            stage_commits
+                .commit_stage(StageCommitRequest {
+                    job: None,
+                    work_unit: Some((completed, ExpectedVersion::Exact(unit.version))),
+                    artifact: Some(prepared),
+                    event: Some(OutboxEvent {
+                        aggregate_type: "work_unit".into(),
+                        aggregate_id: unit.id().to_string(),
+                        event_type: "llm_batch.done".into(),
+                        payload_json: serde_json::json!({
+                            "job_id": ctx.job_id.to_string(),
+                            "stage": request.stage.as_str(),
+                            "batch_index": batch.index,
+                            "artifact_id": artifact.id.to_string(),
+                        })
+                        .to_string(),
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                    }),
+                })
+                .await?;
+            let _ = work_units;
+        }
+        Ok(())
     }
 
     async fn request_json<T, F>(

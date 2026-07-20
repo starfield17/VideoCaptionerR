@@ -110,4 +110,8 @@ pub struct LlmPipeline {
     pub(crate) gateway: Arc<dyn LlmGateway>,
     pub(crate) recorder: Arc<dyn LlmRequestRecorder>,
     pub(crate) ids: Arc<dyn IdGenerator>,
+    /// Optional durable WorkUnit control plane (llm_batch units).
+    pub(crate) work_units: Option<Arc<dyn crate::ports::WorkUnitRepository>>,
+    /// Optional atomic stage/work-unit commits for batch results.
+    pub(crate) stage_commits: Option<Arc<dyn crate::ports::StageCommitRepository>>,
 }

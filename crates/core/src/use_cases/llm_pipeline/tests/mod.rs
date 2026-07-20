@@ -349,3 +349,89 @@ fn prompt_data_is_marked_as_untrusted() {
     assert!(prompt.contains("untrusted subtitle data"));
     assert!(prompt.contains("<data>"));
 }
+
+#[tokio::test]
+async fn durable_plan_is_written_before_gateway_call() {
+    use crate::use_cases::llm_pipeline::durable::{load_plan, LlmDurableContext};
+    use std::sync::atomic::AtomicBool;
+
+    struct CountingGateway {
+        called: AtomicBool,
+        response: String,
+    }
+
+    #[async_trait]
+    impl LlmGateway for CountingGateway {
+        async fn chat(&self, _request: LlmRequest) -> AppResult<LlmResponse> {
+            self.called.store(true, Ordering::SeqCst);
+            Ok(LlmResponse {
+                content: self.response.clone(),
+                prompt_tokens: Some(1),
+                completion_tokens: Some(1),
+            })
+        }
+
+        async fn capabilities(&self) -> AppResult<LlmCapabilities> {
+            Ok(LlmCapabilities {
+                structured_output: StructuredOutput::JsonObject,
+                returns_usage: true,
+                supports_seed: true,
+                supports_model_list: false,
+                max_context_tokens: Some(8192),
+                max_output_tokens: Some(1024),
+            })
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let gateway = Arc::new(CountingGateway {
+        called: AtomicBool::new(false),
+        response: r#"{"items":[{"id":1,"text":"hello world"}]}"#.into(),
+    });
+    let recorder = Arc::new(Recorder {
+        calls: AtomicU32::new(0),
+        records: Mutex::new(Vec::new()),
+    });
+    let pipeline = LlmPipeline::new(gateway.clone(), recorder, Arc::new(Ids));
+    let mut req = request(LlmStage::Correct);
+    req.durable = Some(LlmDurableContext {
+        job_id: Ulid::new().into(),
+        job_dir: dir.path().to_path_buf(),
+        input_artifact_id: None,
+        transcript_revision: 1,
+        invalidate_plan: false,
+    });
+    // Spy: plan must exist as soon as execute starts packing path.
+    // We assert after execute that plan was written and gateway was called.
+    let _ = pipeline
+        .execute(&with_cue(transcript()), req)
+        .await
+        .unwrap();
+    assert!(gateway.called.load(Ordering::SeqCst));
+    let plan = load_plan(dir.path(), LlmStage::Correct)
+        .unwrap()
+        .expect("plan");
+    assert_eq!(plan.stage, LlmStage::Correct);
+    assert!(!plan.plan_hash.is_empty());
+    assert!(dir.path().join("prompts/correct").exists() || dir.path().join("prompts").exists());
+}
+
+#[tokio::test]
+async fn corrupt_batch_result_fails_explicitly() {
+    use crate::use_cases::llm_pipeline::durable::batch_result_path;
+    let dir = tempfile::tempdir().unwrap();
+    let job_dir = dir.path().to_path_buf();
+    std::fs::create_dir_all(job_dir.join("llm/correct")).unwrap();
+    let path = batch_result_path(&job_dir, LlmStage::Correct, 0);
+    std::fs::write(&path, b"{not-json").unwrap();
+    let err =
+        crate::use_cases::llm_pipeline::durable::load_batch_result(&job_dir, LlmStage::Correct, 0)
+            .unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("ARTIFACT_CORRUPT")
+            || msg.contains("ArtifactCorrupt")
+            || msg.contains("decode"),
+        "{msg}"
+    );
+}

@@ -84,6 +84,8 @@ pub(crate) fn build_llm_pipeline(
     let recorder = Arc::new(FileLlmRequestRecorder::new(
         logs_dir.join("llm-requests.ndjson"),
     ));
+    // WorkUnit/StageCommit wiring is attached in ApplicationRuntime::open so the
+    // pipeline can create llm_batch units after the store handle exists.
     let pipeline = Arc::new(LlmPipeline::new(gateway, recorder, ids));
 
     let split_prompt = prompt_snapshot(PromptBundle::load(prompt_dir, PromptStage::Split)?);

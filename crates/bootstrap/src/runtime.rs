@@ -137,10 +137,18 @@ impl ApplicationRuntime {
             subtitles,
             events.clone(),
             ids,
-            stage_commits,
+            stage_commits.clone(),
         )
         .with_snapshots(snapshots.clone());
         if let Some(pipeline) = llm_pipeline {
+            // Attach control-plane ports so each LlmPlan entry becomes an llm_batch WorkUnit.
+            let pipeline = match Arc::try_unwrap(pipeline) {
+                Ok(p) => Arc::new(
+                    p.with_work_units(work_units.clone())
+                        .with_stage_commits(stage_commits.clone()),
+                ),
+                Err(shared) => shared,
+            };
             transcribe_service = transcribe_service.with_llm_pipeline(pipeline);
         }
         transcribe_service = transcribe_service.with_chunking(
