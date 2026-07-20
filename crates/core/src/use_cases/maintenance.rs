@@ -62,7 +62,8 @@ impl RetryFailedWorkUnits {
             .work_units
             .retry_failed(&command.job_id, command.from_stage)
             .await?;
-        self.jobs.save_job(&job).await?;
+        let expected = job.expected_version();
+        self.jobs.save_job(&mut job, expected).await?;
         Ok(RetryFailedWorkUnitsResponse {
             job_id: command.job_id,
             from_stage: command.from_stage,
@@ -104,6 +105,7 @@ impl WorkUnitScheduler {
                 command.lease_ms,
             )
             .await
+            .map(|unit| unit.map(|unit| unit.value))
     }
 
     pub async fn recover_expired(&self) -> AppResult<u32> {

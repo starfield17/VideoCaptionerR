@@ -10,9 +10,11 @@ use chrono::{DateTime, Utc};
 use videocaptionerr_contracts::artifact::ArtifactKind;
 use videocaptionerr_contracts::error::{ErrorCode, VcError};
 use videocaptionerr_core::application_error::{AppResult, ApplicationError};
+use videocaptionerr_core::execution_snapshot::JobExecutionSnapshot;
 use videocaptionerr_core::ports::{
     ArtifactCommit, ArtifactStore, BatchRepository, CapabilityProbeRecord, CapabilityProbeStore,
-    ChunkPlanCommit, ChunkPlanStore, JobRepository, TranscriptCommit, WorkUnitRepository,
+    ChunkPlanCommit, ChunkPlanStore, ExpectedVersion, JobRepository, SnapshotRepository,
+    TranscriptCommit, Versioned, WorkUnitRepository,
 };
 use videocaptionerr_domain::{ArtifactRef, Batch, BatchId, Job, JobId, StageKind, WorkUnit};
 
@@ -22,24 +24,26 @@ use crate::StoreHandle;
 
 #[async_trait]
 impl JobRepository for StoreHandle {
-    async fn load_job(&self, id: &JobId) -> AppResult<Option<Job>> {
-        let json = self
+    async fn load_job(&self, id: &JobId) -> AppResult<Option<Versioned<Job>>> {
+        let row = self
             .load_job_aggregate(id.as_str())
             .await
             .map_err(ApplicationError::Adapter)?;
-        json.map(|body| {
-            serde_json::from_str(&body).map_err(|error| {
-                ApplicationError::Adapter(VcError::new(
-                    ErrorCode::ArtifactCorrupt,
-                    format!("decode Job aggregate: {error}"),
-                ))
-            })
+        row.map(|(body, version)| {
+            serde_json::from_str(&body)
+                .map_err(|error| {
+                    ApplicationError::Adapter(VcError::new(
+                        ErrorCode::ArtifactCorrupt,
+                        format!("decode Job aggregate: {error}"),
+                    ))
+                })
+                .map(|value| Versioned::with_version(value, version))
         })
         .transpose()
     }
 
-    async fn save_job(&self, job: &Job) -> AppResult<()> {
-        let json = serde_json::to_string(job).map_err(|error| {
+    async fn save_job(&self, job: &mut Versioned<Job>, expected: ExpectedVersion) -> AppResult<()> {
+        let json = serde_json::to_string(&job.value).map_err(|error| {
             ApplicationError::Adapter(VcError::new(
                 ErrorCode::ArtifactCommitFailed,
                 format!("encode Job aggregate: {error}"),
@@ -50,10 +54,16 @@ impl JobRepository for StoreHandle {
             job.batch_id().map(|id| id.as_str()),
             job.status().as_str(),
             job.source_path(),
+            job.profile_revision().as_str(),
+            job.execution_snapshot_id().map(|id| id.as_str()),
             &json,
+            expected,
         )
         .await
         .map_err(ApplicationError::Adapter)
+        .map(|version| {
+            job.version = version;
+        })
     }
 
     async fn delete_job(&self, id: &JobId) -> AppResult<()> {
@@ -62,19 +72,21 @@ impl JobRepository for StoreHandle {
             .map_err(ApplicationError::Adapter)
     }
 
-    async fn list_jobs(&self) -> AppResult<Vec<Job>> {
+    async fn list_jobs(&self) -> AppResult<Vec<Versioned<Job>>> {
         let rows = self
             .list_job_aggregates()
             .await
             .map_err(ApplicationError::Adapter)?;
         rows.into_iter()
-            .map(|body| {
-                serde_json::from_str(&body).map_err(|error| {
-                    ApplicationError::Adapter(VcError::new(
-                        ErrorCode::ArtifactCorrupt,
-                        format!("decode Job aggregate: {error}"),
-                    ))
-                })
+            .map(|(body, version)| {
+                serde_json::from_str(&body)
+                    .map_err(|error| {
+                        ApplicationError::Adapter(VcError::new(
+                            ErrorCode::ArtifactCorrupt,
+                            format!("decode Job aggregate: {error}"),
+                        ))
+                    })
+                    .map(|value| Versioned::with_version(value, version))
             })
             .collect()
     }
@@ -82,24 +94,30 @@ impl JobRepository for StoreHandle {
 
 #[async_trait]
 impl BatchRepository for StoreHandle {
-    async fn load_batch(&self, id: &BatchId) -> AppResult<Option<Batch>> {
-        let json = self
+    async fn load_batch(&self, id: &BatchId) -> AppResult<Option<Versioned<Batch>>> {
+        let row = self
             .load_batch_aggregate(id.as_str())
             .await
             .map_err(ApplicationError::Adapter)?;
-        json.map(|body| {
-            serde_json::from_str(&body).map_err(|error| {
-                ApplicationError::Adapter(VcError::new(
-                    ErrorCode::ArtifactCorrupt,
-                    format!("decode Batch aggregate: {error}"),
-                ))
-            })
+        row.map(|(body, version)| {
+            serde_json::from_str(&body)
+                .map_err(|error| {
+                    ApplicationError::Adapter(VcError::new(
+                        ErrorCode::ArtifactCorrupt,
+                        format!("decode Batch aggregate: {error}"),
+                    ))
+                })
+                .map(|value| Versioned::with_version(value, version))
         })
         .transpose()
     }
 
-    async fn save_batch(&self, batch: &Batch) -> AppResult<()> {
-        let json = serde_json::to_string(batch).map_err(|error| {
+    async fn save_batch(
+        &self,
+        batch: &mut Versioned<Batch>,
+        expected: ExpectedVersion,
+    ) -> AppResult<()> {
+        let json = serde_json::to_string(&batch.value).map_err(|error| {
             ApplicationError::Adapter(VcError::new(
                 ErrorCode::ArtifactCommitFailed,
                 format!("encode Batch aggregate: {error}"),
@@ -111,9 +129,58 @@ impl BatchRepository for StoreHandle {
             &batch.execution_profile().asr_model,
             &batch.execution_profile().device,
             &json,
+            expected,
         )
         .await
         .map_err(ApplicationError::Adapter)
+        .map(|version| {
+            batch.version = version;
+        })
+    }
+}
+
+#[async_trait]
+impl SnapshotRepository for StoreHandle {
+    async fn load_execution_snapshot(
+        &self,
+        id: &videocaptionerr_domain::UlidStr,
+    ) -> AppResult<Option<JobExecutionSnapshot>> {
+        let json = self
+            .load_execution_snapshot(id.as_str())
+            .await
+            .map_err(ApplicationError::Adapter)?;
+        json.map(|body| {
+            serde_json::from_str(&body).map_err(|error| {
+                ApplicationError::Adapter(VcError::new(
+                    ErrorCode::ArtifactCorrupt,
+                    format!("decode execution snapshot: {error}"),
+                ))
+            })
+        })
+        .transpose()
+    }
+
+    async fn save_execution_snapshot(&self, snapshot: &JobExecutionSnapshot) -> AppResult<()> {
+        self.save_execution_snapshot(snapshot.clone())
+            .await
+            .map_err(ApplicationError::Adapter)
+    }
+
+    async fn load_snapshots_for_batch(&self, id: &BatchId) -> AppResult<Vec<JobExecutionSnapshot>> {
+        let rows = self
+            .load_snapshots_for_batch(id.as_str())
+            .await
+            .map_err(ApplicationError::Adapter)?;
+        rows.into_iter()
+            .map(|body| {
+                serde_json::from_str(&body).map_err(|error| {
+                    ApplicationError::Adapter(VcError::new(
+                        ErrorCode::ArtifactCorrupt,
+                        format!("decode batch execution snapshot: {error}"),
+                    ))
+                })
+            })
+            .collect()
     }
 }
 
@@ -122,18 +189,20 @@ impl WorkUnitRepository for StoreHandle {
     async fn load_work_unit(
         &self,
         id: &videocaptionerr_domain::WorkUnitId,
-    ) -> AppResult<Option<WorkUnit>> {
-        let json = self
+    ) -> AppResult<Option<Versioned<WorkUnit>>> {
+        let row = self
             .load_work_unit_aggregate(id.as_str())
             .await
             .map_err(ApplicationError::Adapter)?;
-        json.map(|body| {
-            serde_json::from_str(&body).map_err(|error| {
-                ApplicationError::Adapter(VcError::new(
-                    ErrorCode::ArtifactCorrupt,
-                    format!("decode WorkUnit aggregate: {error}"),
-                ))
-            })
+        row.map(|(body, version)| {
+            serde_json::from_str(&body)
+                .map_err(|error| {
+                    ApplicationError::Adapter(VcError::new(
+                        ErrorCode::ArtifactCorrupt,
+                        format!("decode WorkUnit aggregate: {error}"),
+                    ))
+                })
+                .map(|value| Versioned::with_version(value, version))
         })
         .transpose()
     }
@@ -145,8 +214,8 @@ impl WorkUnitRepository for StoreHandle {
         unit_kind: &str,
         unit_index: u32,
         input_hash: &str,
-    ) -> AppResult<Option<WorkUnit>> {
-        let json = self
+    ) -> AppResult<Option<Versioned<WorkUnit>>> {
+        let row = self
             .find_work_unit_aggregate(
                 job_id.as_str(),
                 stage_name(stage),
@@ -156,19 +225,25 @@ impl WorkUnitRepository for StoreHandle {
             )
             .await
             .map_err(ApplicationError::Adapter)?;
-        json.map(|body| {
-            serde_json::from_str(&body).map_err(|error| {
-                ApplicationError::Adapter(VcError::new(
-                    ErrorCode::ArtifactCorrupt,
-                    format!("decode WorkUnit aggregate: {error}"),
-                ))
-            })
+        row.map(|(body, version)| {
+            serde_json::from_str(&body)
+                .map_err(|error| {
+                    ApplicationError::Adapter(VcError::new(
+                        ErrorCode::ArtifactCorrupt,
+                        format!("decode WorkUnit aggregate: {error}"),
+                    ))
+                })
+                .map(|value| Versioned::with_version(value, version))
         })
         .transpose()
     }
 
-    async fn save_work_unit(&self, unit: &WorkUnit) -> AppResult<()> {
-        let json = serde_json::to_string(unit).map_err(|error| {
+    async fn save_work_unit(
+        &self,
+        unit: &mut Versioned<WorkUnit>,
+        expected: ExpectedVersion,
+    ) -> AppResult<()> {
+        let json = serde_json::to_string(&unit.value).map_err(|error| {
             ApplicationError::Adapter(VcError::new(
                 ErrorCode::ArtifactCommitFailed,
                 format!("encode WorkUnit aggregate: {error}"),
@@ -184,33 +259,39 @@ impl WorkUnitRepository for StoreHandle {
                 )
             })
             .unwrap_or((None, None));
-        self.save_work_unit_aggregate(WorkUnitRecord {
-            id: unit.id().to_string(),
-            job_id: unit.job_id().to_string(),
-            stage: stage_name(unit.stage()).into(),
-            unit_kind: unit.unit_kind().into(),
-            unit_index: unit.unit_index(),
-            input_hash: unit.input_hash().into(),
-            status: unit.status().as_str().into(),
-            attempt: unit.attempt(),
-            lease_owner: lease_owner.map(str::to_owned),
-            lease_expires_at,
-            artifact_id: unit.artifact().map(|artifact| artifact.id.to_string()),
-            aggregate_json: json,
-        })
+        self.save_work_unit_aggregate(
+            WorkUnitRecord {
+                id: unit.id().to_string(),
+                job_id: unit.job_id().to_string(),
+                stage: stage_name(unit.stage()).into(),
+                unit_kind: unit.unit_kind().into(),
+                unit_index: unit.unit_index(),
+                input_hash: unit.input_hash().into(),
+                status: unit.status().as_str().into(),
+                attempt: unit.attempt(),
+                lease_owner: lease_owner.map(str::to_owned),
+                lease_expires_at,
+                artifact_id: unit.artifact().map(|artifact| artifact.id.to_string()),
+                aggregate_json: json,
+            },
+            expected,
+        )
         .await
         .map_err(ApplicationError::Adapter)
+        .map(|version| {
+            unit.version = version;
+        })
     }
 
     async fn recover_expired(&self, now_ms: u64) -> AppResult<u32> {
         let now = DateTime::<Utc>::from_timestamp_millis(now_ms as i64).ok_or_else(|| {
             ApplicationError::Invalid("recovery timestamp is outside chrono range".into())
         })?;
-        let bodies = self
+        let rows = self
             .list_expired_work_unit_aggregates(&now.to_rfc3339())
             .await
             .map_err(ApplicationError::Adapter)?;
-        for body in &bodies {
+        for (body, version) in &rows {
             let mut unit: WorkUnit = serde_json::from_str(body).map_err(|error| {
                 ApplicationError::Adapter(VcError::new(
                     ErrorCode::ArtifactCorrupt,
@@ -219,9 +300,11 @@ impl WorkUnitRepository for StoreHandle {
             })?;
             unit.recover_expired(now_ms)
                 .map_err(ApplicationError::Domain)?;
-            self.save_work_unit(&unit).await?;
+            let mut versioned = Versioned::with_version(unit, *version);
+            let expected = versioned.expected_version();
+            self.save_work_unit(&mut versioned, expected).await?;
         }
-        u32::try_from(bodies.len()).map_err(|_| {
+        u32::try_from(rows.len()).map_err(|_| {
             ApplicationError::Adapter(VcError::new(
                 ErrorCode::Internal,
                 "expired work-unit count exceeds u32",
@@ -246,7 +329,7 @@ impl WorkUnitRepository for StoreHandle {
         owner: &str,
         now_ms: u64,
         lease_ms: u64,
-    ) -> AppResult<Option<WorkUnit>> {
+    ) -> AppResult<Option<Versioned<WorkUnit>>> {
         let now = DateTime::<Utc>::from_timestamp_millis(now_ms as i64).ok_or_else(|| {
             ApplicationError::Invalid("lease timestamp is outside chrono range".into())
         })?;
@@ -257,7 +340,7 @@ impl WorkUnitRepository for StoreHandle {
             DateTime::<Utc>::from_timestamp_millis(expires_ms as i64).ok_or_else(|| {
                 ApplicationError::Invalid("lease expiry is outside chrono range".into())
             })?;
-        let json = self
+        let row = self
             .lease_next_ready_aggregate(LeaseRequest {
                 job_id: job_id.to_string(),
                 stage: stage_name(stage).to_string(),
@@ -269,13 +352,15 @@ impl WorkUnitRepository for StoreHandle {
             })
             .await
             .map_err(ApplicationError::Adapter)?;
-        json.map(|body| {
-            serde_json::from_str(&body).map_err(|error| {
-                ApplicationError::Adapter(VcError::new(
-                    ErrorCode::ArtifactCorrupt,
-                    format!("decode leased WorkUnit: {error}"),
-                ))
-            })
+        row.map(|(body, version)| {
+            serde_json::from_str(&body)
+                .map_err(|error| {
+                    ApplicationError::Adapter(VcError::new(
+                        ErrorCode::ArtifactCorrupt,
+                        format!("decode leased WorkUnit: {error}"),
+                    ))
+                })
+                .map(|value| Versioned::with_version(value, version))
         })
         .transpose()
     }
@@ -500,11 +585,19 @@ impl StatusString for videocaptionerr_domain::WorkUnitStatus {
 mod tests {
     use super::*;
     use rusqlite::Connection;
+    use ulid::Ulid;
+    use videocaptionerr_contracts::error::ErrorCode;
+    use videocaptionerr_core::execution_snapshot::{
+        AsrExecutionSnapshot, AudioStreamSelection, JobExecutionSnapshot, OutputPlanSnapshot,
+        SourceStatSnapshot, JOB_EXECUTION_SNAPSHOT_SCHEMA_VERSION,
+    };
     use videocaptionerr_core::ports::{
-        ArtifactStore, JobRepository, TranscriptCommit, WorkUnitRepository,
+        ArtifactStore, BatchRepository, ExpectedVersion, JobRepository, SnapshotRepository,
+        TranscriptCommit, Versioned, WorkUnitRepository,
     };
     use videocaptionerr_domain::{
-        EngineFingerprint, JobStatus, StageStatus, Transcript, WorkUnitStatus,
+        Batch, BatchExecutionProfile, EngineFingerprint, JobId, JobStatus, StageStatus, Transcript,
+        WorkUnit, WorkUnitStatus,
     };
 
     fn complete_job(job: &mut Job, asr_artifact: ArtifactRef) {
@@ -536,6 +629,227 @@ mod tests {
         job.finish().unwrap();
     }
 
+    async fn save_new_job(store: &StoreHandle, job: Job) -> Versioned<Job> {
+        let mut versioned = Versioned::new(job);
+        <StoreHandle as JobRepository>::save_job(store, &mut versioned, ExpectedVersion::New)
+            .await
+            .unwrap();
+        versioned
+    }
+
+    async fn save_new_work_unit(store: &StoreHandle, unit: WorkUnit) -> Versioned<WorkUnit> {
+        let mut versioned = Versioned::new(unit);
+        <StoreHandle as WorkUnitRepository>::save_work_unit(
+            store,
+            &mut versioned,
+            ExpectedVersion::New,
+        )
+        .await
+        .unwrap();
+        versioned
+    }
+
+    async fn save_new_batch(store: &StoreHandle, batch: Batch) -> Versioned<Batch> {
+        let mut versioned = Versioned::new(batch);
+        <StoreHandle as BatchRepository>::save_batch(store, &mut versioned, ExpectedVersion::New)
+            .await
+            .unwrap();
+        versioned
+    }
+
+    fn snapshot(job_id: JobId, batch_id: videocaptionerr_domain::BatchId) -> JobExecutionSnapshot {
+        JobExecutionSnapshot {
+            snapshot_id: Ulid::new().into(),
+            schema_version: JOB_EXECUTION_SNAPSHOT_SCHEMA_VERSION,
+            created_at: "2026-07-20T00:00:00Z".into(),
+            job_id,
+            batch_id,
+            canonical_source_path: "/media/input.mp4".into(),
+            source_stat: SourceStatSnapshot {
+                size: 123,
+                modified_at_ms: Some(1_725_000_000_000),
+            },
+            job_dir: "/jobs/job-1".into(),
+            profile_revision: Ulid::new().into(),
+            asr: AsrExecutionSnapshot {
+                engine: "fake".into(),
+                model_locator: "fake:default".into(),
+                model_id: Some("fake".into()),
+                model_digest: None,
+                device: "cpu".into(),
+                compute_type: "default".into(),
+            },
+            audio_stream: AudioStreamSelection::Auto,
+            source_language: Some("en".into()),
+            target_language: Some("zh".into()),
+            output: OutputPlanSnapshot {
+                path: "/exports/input.zh.srt".into(),
+                format: "srt".into(),
+                layout: "source".into(),
+                conflict_policy: "rename".into(),
+                fallback_to_source: true,
+            },
+            llm: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_snapshot_survives_store_reopen_and_is_immutable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("snapshot.db");
+        let job_id: JobId = Ulid::new().into();
+        let batch_id: videocaptionerr_domain::BatchId = Ulid::new().into();
+        let snapshot = snapshot(job_id, batch_id);
+        let store = StoreHandle::open(&db_path).unwrap();
+
+        <StoreHandle as SnapshotRepository>::save_execution_snapshot(&store, &snapshot)
+            .await
+            .unwrap();
+        let mut job = Versioned::new(Job::new_with_snapshot(
+            snapshot.job_id.clone(),
+            None,
+            snapshot.snapshot_id.clone(),
+            snapshot.profile_revision.clone(),
+            "/media/stale-input.mp4",
+        ));
+        <StoreHandle as JobRepository>::save_job(&store, &mut job, ExpectedVersion::New)
+            .await
+            .unwrap();
+        let connection = Connection::open(&db_path).unwrap();
+        let projection: (String, String, String, String) = connection
+            .query_row(
+                "SELECT source_path, job_dir, profile_revision, execution_snapshot_id
+                 FROM jobs WHERE id = ?1",
+                [snapshot.job_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(projection.0, snapshot.canonical_source_path);
+        assert_eq!(projection.1, snapshot.job_dir);
+        assert_eq!(projection.2, snapshot.profile_revision.to_string());
+        assert_eq!(projection.3, snapshot.snapshot_id.to_string());
+
+        let reopened = StoreHandle::open(&db_path).unwrap();
+        let loaded = <StoreHandle as SnapshotRepository>::load_execution_snapshot(
+            &reopened,
+            &snapshot.snapshot_id,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(loaded, snapshot);
+
+        let mut changed = snapshot.clone();
+        changed.job_dir = "/jobs/changed".into();
+        let error =
+            <StoreHandle as SnapshotRepository>::save_execution_snapshot(&reopened, &changed)
+                .await
+                .unwrap_err()
+                .into_vc_error();
+        assert_eq!(error.code, ErrorCode::StaleResult);
+    }
+
+    #[tokio::test]
+    async fn concurrent_job_batch_and_work_unit_saves_reject_stale_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StoreHandle::open(&dir.path().join("cas.db")).unwrap();
+
+        let job_id: JobId = Ulid::new().into();
+        let mut job_first = save_new_job(
+            &store,
+            Job::new(job_id.clone(), None, Ulid::new().into(), "/media/input.wav"),
+        )
+        .await;
+        let mut job_second = <StoreHandle as JobRepository>::load_job(&store, &job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        job_first.start().unwrap();
+        <StoreHandle as JobRepository>::save_job(&store, &mut job_first, ExpectedVersion::Exact(1))
+            .await
+            .unwrap();
+        let error = <StoreHandle as JobRepository>::save_job(
+            &store,
+            &mut job_second,
+            ExpectedVersion::Exact(1),
+        )
+        .await
+        .unwrap_err()
+        .into_vc_error();
+        assert_eq!(error.code, ErrorCode::StaleResult);
+
+        let batch_id: videocaptionerr_domain::BatchId = Ulid::new().into();
+        let batch = Batch::new(
+            batch_id.clone(),
+            vec![Ulid::new().into()],
+            BatchExecutionProfile {
+                asr_engine: "fake".into(),
+                asr_model: "fake".into(),
+                device: "cpu".into(),
+                compute_type: "default".into(),
+            },
+        )
+        .unwrap();
+        let mut batch_first = save_new_batch(&store, batch).await;
+        let mut batch_second = <StoreHandle as BatchRepository>::load_batch(&store, &batch_id)
+            .await
+            .unwrap()
+            .unwrap();
+        batch_first.start().unwrap();
+        <StoreHandle as BatchRepository>::save_batch(
+            &store,
+            &mut batch_first,
+            ExpectedVersion::Exact(1),
+        )
+        .await
+        .unwrap();
+        let error = <StoreHandle as BatchRepository>::save_batch(
+            &store,
+            &mut batch_second,
+            ExpectedVersion::Exact(1),
+        )
+        .await
+        .unwrap_err()
+        .into_vc_error();
+        assert_eq!(error.code, ErrorCode::StaleResult);
+
+        let mut unit_first = save_new_work_unit(
+            &store,
+            WorkUnit::new(
+                Ulid::new().into(),
+                job_id,
+                videocaptionerr_domain::StageKind::Asr,
+                "chunk",
+                0,
+                "input-hash",
+            )
+            .unwrap(),
+        )
+        .await;
+        let mut unit_second =
+            <StoreHandle as WorkUnitRepository>::load_work_unit(&store, unit_first.id())
+                .await
+                .unwrap()
+                .unwrap();
+        unit_first.lease_for("first", 1_000, 2_000).unwrap();
+        <StoreHandle as WorkUnitRepository>::save_work_unit(
+            &store,
+            &mut unit_first,
+            ExpectedVersion::Exact(1),
+        )
+        .await
+        .unwrap();
+        let error = <StoreHandle as WorkUnitRepository>::save_work_unit(
+            &store,
+            &mut unit_second,
+            ExpectedVersion::Exact(1),
+        )
+        .await
+        .unwrap_err()
+        .into_vc_error();
+        assert_eq!(error.code, ErrorCode::StaleResult);
+    }
+
     #[tokio::test]
     async fn transcript_commit_completes_leased_chunk_and_terminal_job_has_no_running_units() {
         let dir = tempfile::tempdir().unwrap();
@@ -543,27 +857,33 @@ mod tests {
         let store = StoreHandle::open(&db_path).unwrap();
         let artifact_store = SqliteArtifactStore::new(store.clone());
         let job_id: JobId = ulid::Ulid::new().into();
-        let mut job = Job::new(
-            job_id.clone(),
-            None,
-            ulid::Ulid::new().into(),
-            "/media/input.wav",
-        );
-        <StoreHandle as JobRepository>::save_job(&store, &job)
-            .await
-            .unwrap();
-
-        let mut unit = WorkUnit::new(
-            ulid::Ulid::new().into(),
-            job_id.clone(),
-            StageKind::Asr,
-            "asr_chunk",
-            0,
-            "chunk-input-hash",
+        let mut job = save_new_job(
+            &store,
+            Job::new(
+                job_id.clone(),
+                None,
+                ulid::Ulid::new().into(),
+                "/media/input.wav",
+            ),
         )
-        .unwrap();
+        .await;
+
+        let mut unit = save_new_work_unit(
+            &store,
+            WorkUnit::new(
+                ulid::Ulid::new().into(),
+                job_id.clone(),
+                StageKind::Asr,
+                "asr_chunk",
+                0,
+                "chunk-input-hash",
+            )
+            .unwrap(),
+        )
+        .await;
         unit.lease_for("asr:test", 0, 1_000).unwrap();
-        <StoreHandle as WorkUnitRepository>::save_work_unit(&store, &unit)
+        let expected = unit.expected_version();
+        <StoreHandle as WorkUnitRepository>::save_work_unit(&store, &mut unit, expected)
             .await
             .unwrap();
 
@@ -592,7 +912,8 @@ mod tests {
         assert_eq!(completed_unit.artifact(), Some(&artifact));
 
         complete_job(&mut job, artifact);
-        <StoreHandle as JobRepository>::save_job(&store, &job)
+        let expected = job.expected_version();
+        <StoreHandle as JobRepository>::save_job(&store, &mut job, expected)
             .await
             .unwrap();
         let persisted_job = <StoreHandle as JobRepository>::load_job(&store, &job_id)
@@ -623,27 +944,33 @@ mod tests {
         let store = StoreHandle::open(&dir.path().join("repository.db")).unwrap();
         let artifact_store = SqliteArtifactStore::new(store.clone());
         let job_id: JobId = ulid::Ulid::new().into();
-        let job = Job::new(
-            job_id.clone(),
-            None,
-            ulid::Ulid::new().into(),
-            "/media/input.wav",
-        );
-        <StoreHandle as JobRepository>::save_job(&store, &job)
-            .await
-            .unwrap();
-
-        let mut unit = WorkUnit::new(
-            ulid::Ulid::new().into(),
-            job_id.clone(),
-            StageKind::Asr,
-            "asr_chunk",
-            0,
-            "chunk-input-hash",
+        let _job = save_new_job(
+            &store,
+            Job::new(
+                job_id.clone(),
+                None,
+                ulid::Ulid::new().into(),
+                "/media/input.wav",
+            ),
         )
-        .unwrap();
+        .await;
+
+        let mut unit = save_new_work_unit(
+            &store,
+            WorkUnit::new(
+                ulid::Ulid::new().into(),
+                job_id.clone(),
+                StageKind::Asr,
+                "asr_chunk",
+                0,
+                "chunk-input-hash",
+            )
+            .unwrap(),
+        )
+        .await;
         unit.lease_for("asr:test", 0, 1_000).unwrap();
-        <StoreHandle as WorkUnitRepository>::save_work_unit(&store, &unit)
+        let expected = unit.expected_version();
+        <StoreHandle as WorkUnitRepository>::save_work_unit(&store, &mut unit, expected)
             .await
             .unwrap();
 
@@ -687,28 +1014,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = StoreHandle::open(&dir.path().join("repository.db")).unwrap();
         let job_id: JobId = ulid::Ulid::new().into();
-        let job = Job::new(
-            job_id.clone(),
-            None,
-            ulid::Ulid::new().into(),
-            "/media/input.wav",
-        );
-        <StoreHandle as JobRepository>::save_job(&store, &job)
-            .await
-            .unwrap();
+        let _job = save_new_job(
+            &store,
+            Job::new(
+                job_id.clone(),
+                None,
+                ulid::Ulid::new().into(),
+                "/media/input.wav",
+            ),
+        )
+        .await;
 
         let unit_id = ulid::Ulid::new().into();
-        let mut unit = WorkUnit::new(
-            unit_id,
-            job_id.clone(),
-            StageKind::Asr,
-            "chunk",
-            0,
-            "input-hash",
+        let mut unit = save_new_work_unit(
+            &store,
+            WorkUnit::new(
+                unit_id,
+                job_id.clone(),
+                StageKind::Asr,
+                "chunk",
+                0,
+                "input-hash",
+            )
+            .unwrap(),
         )
-        .unwrap();
+        .await;
         unit.lease_for("test", 0, 1_000).unwrap();
-        <StoreHandle as WorkUnitRepository>::save_work_unit(&store, &unit)
+        let expected = unit.expected_version();
+        <StoreHandle as WorkUnitRepository>::save_work_unit(&store, &mut unit, expected)
             .await
             .unwrap();
         assert_eq!(
@@ -744,27 +1077,29 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = StoreHandle::open(&dir.path().join("scheduler.db")).unwrap();
         let job_id: JobId = ulid::Ulid::new().into();
-        let job = Job::new(
-            job_id.clone(),
-            None,
-            ulid::Ulid::new().into(),
-            "/media/input.wav",
-        );
-        <StoreHandle as JobRepository>::save_job(&store, &job)
-            .await
-            .unwrap();
-        let mut unit = WorkUnit::new(
-            ulid::Ulid::new().into(),
-            job_id.clone(),
-            StageKind::Asr,
-            "chunk",
-            0,
-            "pcm-hash",
+        let _job = save_new_job(
+            &store,
+            Job::new(
+                job_id.clone(),
+                None,
+                ulid::Ulid::new().into(),
+                "/media/input.wav",
+            ),
         )
-        .unwrap();
-        <StoreHandle as WorkUnitRepository>::save_work_unit(&store, &unit)
-            .await
-            .unwrap();
+        .await;
+        let _unit = save_new_work_unit(
+            &store,
+            WorkUnit::new(
+                ulid::Ulid::new().into(),
+                job_id.clone(),
+                StageKind::Asr,
+                "chunk",
+                0,
+                "pcm-hash",
+            )
+            .unwrap(),
+        )
+        .await;
 
         let leased = <StoreHandle as WorkUnitRepository>::lease_next_ready(
             &store,
@@ -780,9 +1115,10 @@ mod tests {
         assert_eq!(leased.status(), WorkUnitStatus::Running);
         assert_eq!(leased.lease().unwrap().owner, "scheduler-1");
 
-        unit = leased;
+        let mut unit = leased;
         unit.fail("ASR_FAILED").unwrap();
-        <StoreHandle as WorkUnitRepository>::save_work_unit(&store, &unit)
+        let expected = unit.expected_version();
+        <StoreHandle as WorkUnitRepository>::save_work_unit(&store, &mut unit, expected)
             .await
             .unwrap();
         assert_eq!(

@@ -4,13 +4,14 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, ErrorCode as RusqliteErrorCode, OptionalExtension};
 use tokio::sync::oneshot;
 use ulid::Ulid;
 use videocaptionerr_contracts::artifact::{ArtifactKind, ArtifactMeta};
 use videocaptionerr_contracts::error::{ErrorCode, VcError, VcResult};
 use videocaptionerr_contracts::ids::UlidStr;
-use videocaptionerr_core::ports::CapabilityProbeRecord;
+use videocaptionerr_core::execution_snapshot::JobExecutionSnapshot;
+use videocaptionerr_core::ports::{CapabilityProbeRecord, ExpectedVersion};
 
 use crate::migrate::migrate;
 
@@ -101,27 +102,34 @@ impl StoreHandle {
         Ok(Self { commands })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn save_job_aggregate(
         &self,
         id: &str,
         batch_id: Option<&str>,
         status: &str,
         source_path: &str,
+        profile_revision: &str,
+        execution_snapshot_id: Option<&str>,
         aggregate_json: &str,
-    ) -> VcResult<()> {
+        expected: ExpectedVersion,
+    ) -> VcResult<u64> {
         let (reply, result) = response_channel();
         self.send(StoreCommand::SaveJobAggregate {
             id: id.into(),
             batch_id: batch_id.map(str::to_owned),
             status: status.into(),
             source_path: source_path.into(),
+            profile_revision: profile_revision.into(),
+            execution_snapshot_id: execution_snapshot_id.map(str::to_owned),
             aggregate_json: aggregate_json.into(),
+            expected,
             reply,
         })?;
         await_response(result).await
     }
 
-    pub(crate) async fn load_job_aggregate(&self, id: &str) -> VcResult<Option<String>> {
+    pub(crate) async fn load_job_aggregate(&self, id: &str) -> VcResult<Option<(String, u64)>> {
         let (reply, result) = response_channel();
         self.send(StoreCommand::LoadJobAggregate {
             id: id.into(),
@@ -130,7 +138,7 @@ impl StoreHandle {
         await_response(result).await
     }
 
-    pub(crate) async fn list_job_aggregates(&self) -> VcResult<Vec<String>> {
+    pub(crate) async fn list_job_aggregates(&self) -> VcResult<Vec<(String, u64)>> {
         let (reply, result) = response_channel();
         self.send(StoreCommand::ListJobAggregates { reply })?;
         await_response(result).await
@@ -152,7 +160,8 @@ impl StoreHandle {
         asr_model: &str,
         device: &str,
         aggregate_json: &str,
-    ) -> VcResult<()> {
+        expected: ExpectedVersion,
+    ) -> VcResult<u64> {
         let (reply, result) = response_channel();
         self.send(StoreCommand::SaveBatchAggregate {
             id: id.into(),
@@ -160,12 +169,13 @@ impl StoreHandle {
             asr_model: asr_model.into(),
             device: device.into(),
             aggregate_json: aggregate_json.into(),
+            expected,
             reply,
         })?;
         await_response(result).await
     }
 
-    pub(crate) async fn load_batch_aggregate(&self, id: &str) -> VcResult<Option<String>> {
+    pub(crate) async fn load_batch_aggregate(&self, id: &str) -> VcResult<Option<(String, u64)>> {
         let (reply, result) = response_channel();
         self.send(StoreCommand::LoadBatchAggregate {
             id: id.into(),
@@ -174,13 +184,24 @@ impl StoreHandle {
         await_response(result).await
     }
 
-    pub(crate) async fn save_work_unit_aggregate(&self, record: WorkUnitRecord) -> VcResult<()> {
+    pub(crate) async fn save_work_unit_aggregate(
+        &self,
+        record: WorkUnitRecord,
+        expected: ExpectedVersion,
+    ) -> VcResult<u64> {
         let (reply, result) = response_channel();
-        self.send(StoreCommand::SaveWorkUnitAggregate { record, reply })?;
+        self.send(StoreCommand::SaveWorkUnitAggregate {
+            record,
+            expected,
+            reply,
+        })?;
         await_response(result).await
     }
 
-    pub(crate) async fn load_work_unit_aggregate(&self, id: &str) -> VcResult<Option<String>> {
+    pub(crate) async fn load_work_unit_aggregate(
+        &self,
+        id: &str,
+    ) -> VcResult<Option<(String, u64)>> {
         let (reply, result) = response_channel();
         self.send(StoreCommand::LoadWorkUnitAggregate {
             id: id.into(),
@@ -196,7 +217,7 @@ impl StoreHandle {
         unit_kind: &str,
         unit_index: u32,
         input_hash: &str,
-    ) -> VcResult<Option<String>> {
+    ) -> VcResult<Option<(String, u64)>> {
         let (reply, result) = response_channel();
         self.send(StoreCommand::FindWorkUnitAggregate {
             job_id: job_id.into(),
@@ -212,7 +233,7 @@ impl StoreHandle {
     pub(crate) async fn list_expired_work_unit_aggregates(
         &self,
         now_rfc3339: &str,
-    ) -> VcResult<Vec<String>> {
+    ) -> VcResult<Vec<(String, u64)>> {
         let (reply, result) = response_channel();
         self.send(StoreCommand::ListExpiredWorkUnitAggregates {
             now_rfc3339: now_rfc3339.into(),
@@ -224,7 +245,7 @@ impl StoreHandle {
     pub(crate) async fn lease_next_ready_aggregate(
         &self,
         request: LeaseRequest,
-    ) -> VcResult<Option<String>> {
+    ) -> VcResult<Option<(String, u64)>> {
         let (reply, result) = response_channel();
         self.send(StoreCommand::LeaseNextReady { request, reply })?;
         await_response(result).await
@@ -325,6 +346,33 @@ impl StoreHandle {
         await_response(result).await
     }
 
+    pub(crate) async fn save_execution_snapshot(
+        &self,
+        snapshot: JobExecutionSnapshot,
+    ) -> VcResult<()> {
+        let (reply, result) = response_channel();
+        self.send(StoreCommand::SaveExecutionSnapshot { snapshot, reply })?;
+        await_response(result).await
+    }
+
+    pub(crate) async fn load_execution_snapshot(&self, id: &str) -> VcResult<Option<String>> {
+        let (reply, result) = response_channel();
+        self.send(StoreCommand::LoadExecutionSnapshot {
+            id: id.into(),
+            reply,
+        })?;
+        await_response(result).await
+    }
+
+    pub(crate) async fn load_snapshots_for_batch(&self, id: &str) -> VcResult<Vec<String>> {
+        let (reply, result) = response_channel();
+        self.send(StoreCommand::LoadSnapshotsForBatch {
+            batch_id: id.into(),
+            reply,
+        })?;
+        await_response(result).await
+    }
+
     fn send(&self, command: StoreCommand) -> VcResult<()> {
         self.commands.send(command).map_err(|_| {
             VcError::new(
@@ -336,6 +384,25 @@ impl StoreHandle {
 }
 
 type StoreResponse<T> = oneshot::Sender<VcResult<T>>;
+
+fn is_constraint(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(details, _)
+            if details.code == RusqliteErrorCode::ConstraintViolation
+    )
+}
+
+fn stale_result(entity: &str, id: &str, expected: ExpectedVersion) -> VcError {
+    let expected = match expected {
+        ExpectedVersion::New => "new".to_owned(),
+        ExpectedVersion::Exact(version) => version.to_string(),
+    };
+    VcError::new(
+        ErrorCode::StaleResult,
+        format!("stale {entity} aggregate {id}; expected version {expected}"),
+    )
+}
 
 fn response_channel<T>() -> (StoreResponse<T>, oneshot::Receiver<VcResult<T>>) {
     oneshot::channel()
@@ -356,15 +423,18 @@ enum StoreCommand {
         batch_id: Option<String>,
         status: String,
         source_path: String,
+        profile_revision: String,
+        execution_snapshot_id: Option<String>,
         aggregate_json: String,
-        reply: StoreResponse<()>,
+        expected: ExpectedVersion,
+        reply: StoreResponse<u64>,
     },
     LoadJobAggregate {
         id: String,
-        reply: StoreResponse<Option<String>>,
+        reply: StoreResponse<Option<(String, u64)>>,
     },
     ListJobAggregates {
-        reply: StoreResponse<Vec<String>>,
+        reply: StoreResponse<Vec<(String, u64)>>,
     },
     DeleteJob {
         id: String,
@@ -376,19 +446,21 @@ enum StoreCommand {
         asr_model: String,
         device: String,
         aggregate_json: String,
-        reply: StoreResponse<()>,
+        expected: ExpectedVersion,
+        reply: StoreResponse<u64>,
     },
     LoadBatchAggregate {
         id: String,
-        reply: StoreResponse<Option<String>>,
+        reply: StoreResponse<Option<(String, u64)>>,
     },
     SaveWorkUnitAggregate {
         record: WorkUnitRecord,
-        reply: StoreResponse<()>,
+        expected: ExpectedVersion,
+        reply: StoreResponse<u64>,
     },
     LoadWorkUnitAggregate {
         id: String,
-        reply: StoreResponse<Option<String>>,
+        reply: StoreResponse<Option<(String, u64)>>,
     },
     FindWorkUnitAggregate {
         job_id: String,
@@ -396,15 +468,15 @@ enum StoreCommand {
         unit_kind: String,
         unit_index: u32,
         input_hash: String,
-        reply: StoreResponse<Option<String>>,
+        reply: StoreResponse<Option<(String, u64)>>,
     },
     ListExpiredWorkUnitAggregates {
         now_rfc3339: String,
-        reply: StoreResponse<Vec<String>>,
+        reply: StoreResponse<Vec<(String, u64)>>,
     },
     LeaseNextReady {
         request: LeaseRequest,
-        reply: StoreResponse<Option<String>>,
+        reply: StoreResponse<Option<(String, u64)>>,
     },
     RetryFailed {
         job_id: String,
@@ -430,6 +502,18 @@ enum StoreCommand {
         meta: ArtifactMeta,
         work_unit_id: Option<String>,
         reply: StoreResponse<()>,
+    },
+    SaveExecutionSnapshot {
+        snapshot: JobExecutionSnapshot,
+        reply: StoreResponse<()>,
+    },
+    LoadExecutionSnapshot {
+        id: String,
+        reply: StoreResponse<Option<String>>,
+    },
+    LoadSnapshotsForBatch {
+        batch_id: String,
+        reply: StoreResponse<Vec<String>>,
     },
 }
 
@@ -462,7 +546,10 @@ impl StoreCommand {
                 batch_id,
                 status,
                 source_path,
+                profile_revision,
+                execution_snapshot_id,
                 aggregate_json,
+                expected,
                 reply,
             } => {
                 let result = store.save_job_aggregate(
@@ -470,7 +557,10 @@ impl StoreCommand {
                     batch_id.as_deref(),
                     &status,
                     &source_path,
+                    &profile_revision,
+                    execution_snapshot_id.as_deref(),
                     &aggregate_json,
+                    expected,
                 );
                 let _ = reply.send(result);
             }
@@ -489,17 +579,28 @@ impl StoreCommand {
                 asr_model,
                 device,
                 aggregate_json,
+                expected,
                 reply,
             } => {
-                let result =
-                    store.save_batch_aggregate(&id, &status, &asr_model, &device, &aggregate_json);
+                let result = store.save_batch_aggregate(
+                    &id,
+                    &status,
+                    &asr_model,
+                    &device,
+                    &aggregate_json,
+                    expected,
+                );
                 let _ = reply.send(result);
             }
             Self::LoadBatchAggregate { id, reply } => {
                 let _ = reply.send(store.load_batch_aggregate(&id));
             }
-            Self::SaveWorkUnitAggregate { record, reply } => {
-                let result = store.save_work_unit_aggregate(&record);
+            Self::SaveWorkUnitAggregate {
+                record,
+                expected,
+                reply,
+            } => {
+                let result = store.save_work_unit_aggregate(&record, expected);
                 let _ = reply.send(result);
             }
             Self::LoadWorkUnitAggregate { id, reply } => {
@@ -564,6 +665,15 @@ impl StoreCommand {
             } => {
                 let _ = reply.send(store.commit_artifact_and_unit(&meta, work_unit_id.as_deref()));
             }
+            Self::SaveExecutionSnapshot { snapshot, reply } => {
+                let _ = reply.send(store.save_execution_snapshot(&snapshot));
+            }
+            Self::LoadExecutionSnapshot { id, reply } => {
+                let _ = reply.send(store.load_execution_snapshot(&id));
+            }
+            Self::LoadSnapshotsForBatch { batch_id, reply } => {
+                let _ = reply.send(store.load_snapshots_for_batch(&batch_id));
+            }
         }
     }
 }
@@ -598,31 +708,132 @@ impl Store {
         &self.path
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn save_job_aggregate(
         &self,
         id: &str,
         batch_id: Option<&str>,
         status: &str,
         source_path: &str,
+        profile_revision: &str,
+        execution_snapshot_id: Option<&str>,
         aggregate_json: &str,
-    ) -> VcResult<()> {
+        expected: ExpectedVersion,
+    ) -> VcResult<u64> {
         let now = chrono::Utc::now().to_rfc3339();
-        self.conn
-            .execute(
-                "INSERT INTO jobs (
-                    id, batch_id, status, source_path, job_dir, aggregate_json,
-                    created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
-                 ON CONFLICT(id) DO UPDATE SET
-                    batch_id = excluded.batch_id,
-                    status = excluded.status,
-                    source_path = excluded.source_path,
-                    aggregate_json = excluded.aggregate_json,
-                    updated_at = excluded.updated_at",
-                params![id, batch_id, status, source_path, "", aggregate_json, now],
-            )
-            .map_err(|e| VcError::new(ErrorCode::Internal, format!("save job aggregate: {e}")))?;
-        Ok(())
+        let projection = execution_snapshot_id
+            .map(|snapshot_id| {
+                self.conn
+                    .query_row(
+                        "SELECT canonical_source_path, job_dir, profile_revision
+                         FROM execution_snapshots WHERE snapshot_id = ?1",
+                        [snapshot_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(|error| {
+                        VcError::new(
+                            ErrorCode::Internal,
+                            format!("load execution snapshot projection: {error}"),
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        VcError::new(
+                            ErrorCode::InvalidArgument,
+                            format!("execution snapshot {snapshot_id} not found"),
+                        )
+                    })
+            })
+            .transpose()?;
+        let source_path = projection
+            .as_ref()
+            .map(|value| value.0.as_str())
+            .unwrap_or(source_path);
+        let job_dir = projection
+            .as_ref()
+            .map(|value| value.1.as_str())
+            .unwrap_or("");
+        let profile_revision = projection
+            .as_ref()
+            .map(|value| value.2.as_str())
+            .unwrap_or(profile_revision);
+
+        match expected {
+            ExpectedVersion::New => {
+                self.conn
+                    .execute(
+                        "INSERT INTO jobs (
+                            id, batch_id, status, source_path, job_dir, profile_revision,
+                            execution_snapshot_id, aggregate_json, aggregate_version,
+                            created_at, updated_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?9)",
+                        params![
+                            id,
+                            batch_id,
+                            status,
+                            source_path,
+                            job_dir,
+                            profile_revision,
+                            execution_snapshot_id,
+                            aggregate_json,
+                            now
+                        ],
+                    )
+                    .map_err(|error| {
+                        if is_constraint(&error) {
+                            stale_result("Job", id, expected)
+                        } else {
+                            VcError::new(
+                                ErrorCode::Internal,
+                                format!("insert job aggregate: {error}"),
+                            )
+                        }
+                    })?;
+                Ok(1)
+            }
+            ExpectedVersion::Exact(version) => {
+                let changed = self
+                    .conn
+                    .execute(
+                        "UPDATE jobs SET
+                            batch_id = ?1, status = ?2, source_path = ?3, job_dir = ?4,
+                            profile_revision = ?5, execution_snapshot_id = ?6,
+                            aggregate_json = ?7, aggregate_version = aggregate_version + 1,
+                            updated_at = ?8
+                         WHERE id = ?9 AND aggregate_version = ?10",
+                        params![
+                            batch_id,
+                            status,
+                            source_path,
+                            job_dir,
+                            profile_revision,
+                            execution_snapshot_id,
+                            aggregate_json,
+                            now,
+                            id,
+                            version as i64
+                        ],
+                    )
+                    .map_err(|error| {
+                        VcError::new(
+                            ErrorCode::Internal,
+                            format!("update job aggregate: {error}"),
+                        )
+                    })?;
+                if changed != 1 {
+                    return Err(stale_result("Job", id, expected));
+                }
+                version.checked_add(1).ok_or_else(|| {
+                    VcError::new(ErrorCode::Internal, "Job aggregate version overflow")
+                })
+            }
+        }
     }
 
     pub(crate) fn save_batch_aggregate(
@@ -632,81 +843,160 @@ impl Store {
         asr_model: &str,
         device: &str,
         aggregate_json: &str,
-    ) -> VcResult<()> {
+        expected: ExpectedVersion,
+    ) -> VcResult<u64> {
         let now = chrono::Utc::now().to_rfc3339();
-        self.conn
-            .execute(
-                "INSERT INTO batches (
-                    id, status, asr_model_id, asr_device, aggregate_json,
-                    created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
-                 ON CONFLICT(id) DO UPDATE SET
-                    status = excluded.status,
-                    asr_model_id = excluded.asr_model_id,
-                    asr_device = excluded.asr_device,
-                    aggregate_json = excluded.aggregate_json,
-                    updated_at = excluded.updated_at",
-                params![id, status, asr_model, device, aggregate_json, now],
-            )
-            .map_err(|e| VcError::new(ErrorCode::Internal, format!("save batch aggregate: {e}")))?;
-        Ok(())
+        match expected {
+            ExpectedVersion::New => {
+                self.conn
+                    .execute(
+                        "INSERT INTO batches (
+                            id, status, asr_model_id, asr_device, aggregate_json,
+                            aggregate_version, created_at, updated_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?6)",
+                        params![id, status, asr_model, device, aggregate_json, now],
+                    )
+                    .map_err(|error| {
+                        if is_constraint(&error) {
+                            stale_result("Batch", id, expected)
+                        } else {
+                            VcError::new(
+                                ErrorCode::Internal,
+                                format!("insert batch aggregate: {error}"),
+                            )
+                        }
+                    })?;
+                Ok(1)
+            }
+            ExpectedVersion::Exact(version) => {
+                let changed = self
+                    .conn
+                    .execute(
+                        "UPDATE batches SET
+                            status = ?1, asr_model_id = ?2, asr_device = ?3,
+                            aggregate_json = ?4, aggregate_version = aggregate_version + 1,
+                            updated_at = ?5
+                         WHERE id = ?6 AND aggregate_version = ?7",
+                        params![
+                            status,
+                            asr_model,
+                            device,
+                            aggregate_json,
+                            now,
+                            id,
+                            version as i64
+                        ],
+                    )
+                    .map_err(|error| {
+                        VcError::new(
+                            ErrorCode::Internal,
+                            format!("update batch aggregate: {error}"),
+                        )
+                    })?;
+                if changed != 1 {
+                    return Err(stale_result("Batch", id, expected));
+                }
+                version.checked_add(1).ok_or_else(|| {
+                    VcError::new(ErrorCode::Internal, "Batch aggregate version overflow")
+                })
+            }
+        }
     }
 
-    pub(crate) fn save_work_unit_aggregate(&self, record: &WorkUnitRecord) -> VcResult<()> {
-        self.conn
-            .execute(
-                "INSERT INTO work_units (
-                    id, job_id, stage, unit_kind, unit_index, input_hash, status, attempt,
-                    artifact_id, lease_owner, lease_expires_at, aggregate_json
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-                 ON CONFLICT(id) DO UPDATE SET
-                    job_id = excluded.job_id,
-                    stage = excluded.stage,
-                    unit_kind = excluded.unit_kind,
-                    unit_index = excluded.unit_index,
-                    input_hash = excluded.input_hash,
-                    status = excluded.status,
-                    attempt = excluded.attempt,
-                    artifact_id = excluded.artifact_id,
-                    lease_owner = excluded.lease_owner,
-                    lease_expires_at = excluded.lease_expires_at,
-                    aggregate_json = excluded.aggregate_json",
-                params![
-                    record.id,
-                    record.job_id,
-                    record.stage,
-                    record.unit_kind,
-                    record.unit_index as i64,
-                    record.input_hash,
-                    record.status,
-                    record.attempt as i64,
-                    record.artifact_id,
-                    record.lease_owner,
-                    record.lease_expires_at,
-                    record.aggregate_json,
-                ],
-            )
-            .map_err(|e| VcError::new(ErrorCode::Internal, format!("save work unit: {e}")))?;
-        Ok(())
+    pub(crate) fn save_work_unit_aggregate(
+        &self,
+        record: &WorkUnitRecord,
+        expected: ExpectedVersion,
+    ) -> VcResult<u64> {
+        match expected {
+            ExpectedVersion::New => {
+                self.conn
+                    .execute(
+                        "INSERT INTO work_units (
+                            id, job_id, stage, unit_kind, unit_index, input_hash, status, attempt,
+                            artifact_id, lease_owner, lease_expires_at, aggregate_json,
+                            aggregate_version
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1)",
+                        params![
+                            record.id,
+                            record.job_id,
+                            record.stage,
+                            record.unit_kind,
+                            record.unit_index as i64,
+                            record.input_hash,
+                            record.status,
+                            record.attempt as i64,
+                            record.artifact_id,
+                            record.lease_owner,
+                            record.lease_expires_at,
+                            record.aggregate_json,
+                        ],
+                    )
+                    .map_err(|error| {
+                        if is_constraint(&error) {
+                            stale_result("WorkUnit", &record.id, expected)
+                        } else {
+                            VcError::new(ErrorCode::Internal, format!("insert work unit: {error}"))
+                        }
+                    })?;
+                Ok(1)
+            }
+            ExpectedVersion::Exact(version) => {
+                let changed = self
+                    .conn
+                    .execute(
+                        "UPDATE work_units SET
+                            job_id = ?1, stage = ?2, unit_kind = ?3, unit_index = ?4,
+                            input_hash = ?5, status = ?6, attempt = ?7, artifact_id = ?8,
+                            lease_owner = ?9, lease_expires_at = ?10, aggregate_json = ?11,
+                            aggregate_version = aggregate_version + 1
+                         WHERE id = ?12 AND aggregate_version = ?13",
+                        params![
+                            record.job_id,
+                            record.stage,
+                            record.unit_kind,
+                            record.unit_index as i64,
+                            record.input_hash,
+                            record.status,
+                            record.attempt as i64,
+                            record.artifact_id,
+                            record.lease_owner,
+                            record.lease_expires_at,
+                            record.aggregate_json,
+                            record.id,
+                            version as i64,
+                        ],
+                    )
+                    .map_err(|error| {
+                        VcError::new(ErrorCode::Internal, format!("update work unit: {error}"))
+                    })?;
+                if changed != 1 {
+                    return Err(stale_result("WorkUnit", &record.id, expected));
+                }
+                version.checked_add(1).ok_or_else(|| {
+                    VcError::new(ErrorCode::Internal, "WorkUnit aggregate version overflow")
+                })
+            }
+        }
     }
 
-    pub(crate) fn load_batch_aggregate(&self, id: &str) -> VcResult<Option<String>> {
+    pub(crate) fn load_batch_aggregate(&self, id: &str) -> VcResult<Option<(String, u64)>> {
         self.conn
             .query_row(
-                "SELECT aggregate_json FROM batches WHERE id = ?1",
+                "SELECT aggregate_json, aggregate_version FROM batches WHERE id = ?1",
                 [id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)),
             )
             .optional()
             .map_err(|e| VcError::new(ErrorCode::Internal, format!("load batch aggregate: {e}")))
     }
 
-    pub(crate) fn load_work_unit_aggregate(&self, id: &str) -> VcResult<Option<String>> {
+    pub(crate) fn load_work_unit_aggregate(&self, id: &str) -> VcResult<Option<(String, u64)>> {
         self.conn
             .query_row(
-                "SELECT aggregate_json FROM work_units WHERE id = ?1",
+                "SELECT aggregate_json, aggregate_version FROM work_units WHERE id = ?1",
                 [id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)),
             )
             .optional()
             .map_err(|e| VcError::new(ErrorCode::Internal, format!("load work unit: {e}")))
@@ -719,15 +1009,15 @@ impl Store {
         unit_kind: &str,
         unit_index: u32,
         input_hash: &str,
-    ) -> VcResult<Option<String>> {
+    ) -> VcResult<Option<(String, u64)>> {
         self.conn
             .query_row(
-                "SELECT aggregate_json FROM work_units
+                "SELECT aggregate_json, aggregate_version FROM work_units
                  WHERE job_id = ?1 AND stage = ?2 AND unit_kind = ?3
                    AND unit_index = ?4 AND input_hash = ?5
                  ORDER BY id LIMIT 1",
                 params![job_id, stage, unit_kind, unit_index as i64, input_hash],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)),
             )
             .optional()
             .map_err(|e| VcError::new(ErrorCode::Internal, format!("find work unit: {e}")))
@@ -736,11 +1026,11 @@ impl Store {
     pub(crate) fn list_expired_work_unit_aggregates(
         &self,
         now_rfc3339: &str,
-    ) -> VcResult<Vec<String>> {
+    ) -> VcResult<Vec<(String, u64)>> {
         let mut statement = self
             .conn
             .prepare(
-                "SELECT aggregate_json FROM work_units
+                "SELECT aggregate_json, aggregate_version FROM work_units
                  WHERE status = 'running'
                    AND lease_expires_at IS NOT NULL
                    AND lease_expires_at < ?1
@@ -751,34 +1041,38 @@ impl Store {
                 VcError::new(ErrorCode::Internal, format!("prepare expired units: {e}"))
             })?;
         let rows = statement
-            .query_map([now_rfc3339], |row| row.get::<_, String>(0))
+            .query_map([now_rfc3339], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })
             .map_err(|e| VcError::new(ErrorCode::Internal, format!("query expired units: {e}")))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| VcError::new(ErrorCode::Internal, format!("read expired units: {e}")))
     }
 
-    pub(crate) fn load_job_aggregate(&self, id: &str) -> VcResult<Option<String>> {
+    pub(crate) fn load_job_aggregate(&self, id: &str) -> VcResult<Option<(String, u64)>> {
         self.conn
             .query_row(
-                "SELECT aggregate_json FROM jobs WHERE id = ?1",
+                "SELECT aggregate_json, aggregate_version FROM jobs WHERE id = ?1",
                 [id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)),
             )
             .optional()
             .map_err(|e| VcError::new(ErrorCode::Internal, format!("load job aggregate: {e}")))
     }
 
-    pub(crate) fn list_job_aggregates(&self) -> VcResult<Vec<String>> {
+    pub(crate) fn list_job_aggregates(&self) -> VcResult<Vec<(String, u64)>> {
         let mut statement = self
             .conn
             .prepare(
-                "SELECT aggregate_json FROM jobs
+                "SELECT aggregate_json, aggregate_version FROM jobs
                  WHERE aggregate_json IS NOT NULL
                  ORDER BY created_at, id",
             )
             .map_err(|e| VcError::new(ErrorCode::Internal, format!("list job aggregates: {e}")))?;
         let rows = statement
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })
             .map_err(|e| VcError::new(ErrorCode::Internal, format!("query job aggregates: {e}")))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| VcError::new(ErrorCode::Internal, format!("read job aggregates: {e}")))
@@ -791,22 +1085,185 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn save_execution_snapshot(&self, snapshot: &JobExecutionSnapshot) -> VcResult<()> {
+        snapshot
+            .validate()
+            .map_err(|error| VcError::new(ErrorCode::InvalidArgument, error))?;
+        let snapshot_json = serde_json::to_string(snapshot).map_err(|error| {
+            VcError::new(
+                ErrorCode::ArtifactCommitFailed,
+                format!("encode execution snapshot: {error}"),
+            )
+        })?;
+        let llm_json = snapshot
+            .llm
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| {
+                VcError::new(
+                    ErrorCode::ArtifactCommitFailed,
+                    format!("encode LLM execution snapshot: {error}"),
+                )
+            })?;
+        let stream_selection = serde_json::to_string(&snapshot.audio_stream).map_err(|error| {
+            VcError::new(
+                ErrorCode::ArtifactCommitFailed,
+                format!("encode audio stream selection: {error}"),
+            )
+        })?;
+        let existing: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT snapshot_json FROM execution_snapshots WHERE snapshot_id = ?1",
+                [&snapshot.snapshot_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| {
+                VcError::new(
+                    ErrorCode::Internal,
+                    format!("load existing execution snapshot: {error}"),
+                )
+            })?;
+        if let Some(existing) = existing {
+            if existing == snapshot_json {
+                return Ok(());
+            }
+            return Err(VcError::new(
+                ErrorCode::StaleResult,
+                format!(
+                    "execution snapshot {} is immutable and already contains different data",
+                    snapshot.snapshot_id
+                ),
+            ));
+        }
+
+        self.conn
+            .execute(
+                "INSERT INTO execution_snapshots (
+                    snapshot_id, schema_version, job_id, batch_id, created_at,
+                    canonical_source_path, source_size, source_modified_at_ms, job_dir,
+                    profile_revision, asr_engine, model_locator, model_id, model_digest,
+                    device, compute_type, audio_stream_selection, source_language,
+                    target_language, output_path, output_format, output_layout,
+                    conflict_policy, fallback_to_source, llm_json, snapshot_json
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                    ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26
+                 )",
+                params![
+                    snapshot.snapshot_id.to_string(),
+                    snapshot.schema_version as i64,
+                    snapshot.job_id.to_string(),
+                    snapshot.batch_id.to_string(),
+                    snapshot.created_at,
+                    snapshot.canonical_source_path,
+                    snapshot.source_stat.size as i64,
+                    snapshot
+                        .source_stat
+                        .modified_at_ms
+                        .map(|value| value as i64),
+                    snapshot.job_dir,
+                    snapshot.profile_revision.to_string(),
+                    snapshot.asr.engine,
+                    snapshot.asr.model_locator,
+                    snapshot.asr.model_id,
+                    snapshot.asr.model_digest,
+                    snapshot.asr.device,
+                    snapshot.asr.compute_type,
+                    stream_selection,
+                    snapshot.source_language,
+                    snapshot.target_language,
+                    snapshot.output.path,
+                    snapshot.output.format,
+                    snapshot.output.layout,
+                    snapshot.output.conflict_policy,
+                    snapshot.output.fallback_to_source,
+                    llm_json,
+                    snapshot_json,
+                ],
+            )
+            .map_err(|error| {
+                if is_constraint(&error) {
+                    VcError::new(
+                        ErrorCode::StaleResult,
+                        format!("execution snapshot {} already exists", snapshot.snapshot_id),
+                    )
+                } else {
+                    VcError::new(
+                        ErrorCode::ArtifactCommitFailed,
+                        format!("save execution snapshot: {error}"),
+                    )
+                }
+            })?;
+        Ok(())
+    }
+
+    pub(crate) fn load_execution_snapshot(&self, id: &str) -> VcResult<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT snapshot_json FROM execution_snapshots WHERE snapshot_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| {
+                VcError::new(
+                    ErrorCode::Internal,
+                    format!("load execution snapshot: {error}"),
+                )
+            })
+    }
+
+    pub(crate) fn load_snapshots_for_batch(&self, batch_id: &str) -> VcResult<Vec<String>> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT snapshot_json FROM execution_snapshots
+                 WHERE batch_id = ?1 ORDER BY job_id",
+            )
+            .map_err(|error| {
+                VcError::new(
+                    ErrorCode::Internal,
+                    format!("prepare batch execution snapshots: {error}"),
+                )
+            })?;
+        let rows = statement
+            .query_map([batch_id], |row| row.get::<_, String>(0))
+            .map_err(|error| {
+                VcError::new(
+                    ErrorCode::Internal,
+                    format!("query batch execution snapshots: {error}"),
+                )
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+            VcError::new(
+                ErrorCode::Internal,
+                format!("read batch execution snapshots: {error}"),
+            )
+        })
+    }
+
     /// Atomically claim the oldest pending unit and persist its domain lease.
-    pub(crate) fn lease_next_ready(&mut self, request: &LeaseRequest) -> VcResult<Option<String>> {
+    pub(crate) fn lease_next_ready(
+        &mut self,
+        request: &LeaseRequest,
+    ) -> VcResult<Option<(String, u64)>> {
         let tx = self.conn.unchecked_transaction().map_err(|error| {
             VcError::new(
                 ErrorCode::Internal,
                 format!("begin lease transaction: {error}"),
             )
         })?;
-        let selected: Option<(String, String)> = tx
+        let selected: Option<(String, String, u64)> = tx
             .query_row(
-                "SELECT id, aggregate_json FROM work_units
+                "SELECT id, aggregate_json, aggregate_version FROM work_units
                  WHERE job_id = ?1 AND stage = ?2 AND status = 'pending'
                    AND aggregate_json IS NOT NULL
                  ORDER BY unit_index, id LIMIT 1",
                 params![request.job_id, request.stage],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? as u64)),
             )
             .optional()
             .map_err(|error| {
@@ -815,7 +1272,7 @@ impl Store {
                     format!("select ready work unit: {error}"),
                 )
             })?;
-        let Some((id, aggregate_json)) = selected else {
+        let Some((id, aggregate_json, version)) = selected else {
             tx.commit().map_err(|error| {
                 VcError::new(
                     ErrorCode::Internal,
@@ -844,14 +1301,16 @@ impl Store {
             .execute(
                 "UPDATE work_units SET status = 'running', attempt = ?1,
                  lease_owner = ?2, lease_expires_at = ?3, started_at = ?4,
-                 aggregate_json = ?5 WHERE id = ?6 AND status = 'pending'",
+                 aggregate_json = ?5, aggregate_version = aggregate_version + 1
+                 WHERE id = ?6 AND status = 'pending' AND aggregate_version = ?7",
                 params![
                     unit.attempt() as i64,
                     request.owner,
                     request.expires_rfc3339,
                     request.now_rfc3339,
                     updated_json,
-                    id
+                    id,
+                    version as i64,
                 ],
             )
             .map_err(|error| {
@@ -872,7 +1331,7 @@ impl Store {
                 format!("commit work unit lease: {error}"),
             )
         })?;
-        Ok(Some(updated_json))
+        Ok(Some((updated_json, version.saturating_add(1))))
     }
 
     /// Retry failed work units from the requested stage onward. Domain
@@ -935,7 +1394,8 @@ impl Store {
                 "UPDATE work_units SET status = 'pending', attempt = ?1,
                  error_code = NULL, error_json = NULL, artifact_id = NULL,
                  lease_owner = NULL, lease_expires_at = NULL, started_at = NULL,
-                 finished_at = NULL, aggregate_json = ?2 WHERE id = ?3",
+                 finished_at = NULL, aggregate_json = ?2,
+                 aggregate_version = aggregate_version + 1 WHERE id = ?3",
                 params![unit.attempt() as i64, updated_json, id],
             )
             .map_err(|error| {
@@ -1161,7 +1621,8 @@ impl Store {
                 let changed = tx
                     .execute(
                         "UPDATE work_units SET status = ?1, artifact_id = ?2, finished_at = ?3,
-                         lease_owner = NULL, lease_expires_at = NULL
+                         lease_owner = NULL, lease_expires_at = NULL,
+                         aggregate_version = aggregate_version + 1
                          WHERE id = ?4 AND status = 'running'",
                         params![WorkUnitStatus::Done.as_str(), meta.id, now, unit_id],
                     )
@@ -1231,7 +1692,8 @@ impl Store {
             let changed = tx
                 .execute(
                     "UPDATE work_units SET status = ?1, artifact_id = ?2, finished_at = ?3,
-                     lease_owner = NULL, lease_expires_at = NULL, aggregate_json = ?5
+                     lease_owner = NULL, lease_expires_at = NULL, aggregate_json = ?5,
+                     aggregate_version = aggregate_version + 1
                      WHERE id = ?4 AND status = 'running'",
                     params![
                         WorkUnitStatus::Done.as_str(),
@@ -1465,20 +1927,23 @@ mod tests {
         unit.lease_for("test-owner", 1_000, 2_000).unwrap();
         let lease = unit.lease().unwrap();
         store
-            .save_work_unit_aggregate(&WorkUnitRecord {
-                id: unit.id().to_string(),
-                job_id: unit.job_id().to_string(),
-                stage: "asr".into(),
-                unit_kind: unit.unit_kind().into(),
-                unit_index: unit.unit_index(),
-                input_hash: unit.input_hash().into(),
-                status: "running".into(),
-                attempt: unit.attempt(),
-                lease_owner: Some(lease.owner.clone()),
-                lease_expires_at: Some("1970-01-01T00:00:02Z".into()),
-                artifact_id: None,
-                aggregate_json: serde_json::to_string(&unit).unwrap(),
-            })
+            .save_work_unit_aggregate(
+                &WorkUnitRecord {
+                    id: unit.id().to_string(),
+                    job_id: unit.job_id().to_string(),
+                    stage: "asr".into(),
+                    unit_kind: unit.unit_kind().into(),
+                    unit_index: unit.unit_index(),
+                    input_hash: unit.input_hash().into(),
+                    status: "running".into(),
+                    attempt: unit.attempt(),
+                    lease_owner: Some(lease.owner.clone()),
+                    lease_expires_at: Some("1970-01-01T00:00:02Z".into()),
+                    artifact_id: None,
+                    aggregate_json: serde_json::to_string(&unit).unwrap(),
+                },
+                ExpectedVersion::New,
+            )
             .unwrap();
 
         let artifact_path = dir.path().join("chunk.json");
@@ -1495,7 +1960,7 @@ mod tests {
             .commit_artifact_and_unit(&meta, Some(unit_id.as_str()))
             .unwrap();
 
-        let aggregate_json = store
+        let (aggregate_json, _version) = store
             .load_work_unit_aggregate(unit_id.as_str())
             .unwrap()
             .unwrap();
@@ -1566,27 +2031,110 @@ mod tests {
         assert_eq!(attempt, 2);
     }
 
+    #[test]
+    fn v4_database_migrates_to_execution_snapshots_and_aggregate_versions() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("v4.db");
+        let connection = Connection::open(&db).unwrap();
+        for migration in crate::migrate::MIGRATIONS.iter().take(4) {
+            connection.execute_batch(migration.sql).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO schema_migrations (version, name, checksum, applied_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        migration.version,
+                        migration.name,
+                        migration.checksum(),
+                        "2026-07-20T00:00:00Z"
+                    ],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        let store = Store::open(&db).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 5);
+
+        let columns = |table: &str| {
+            let mut statement = store
+                .conn
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert!(columns("jobs")
+            .iter()
+            .any(|column| column == "aggregate_version"));
+        assert!(columns("jobs")
+            .iter()
+            .any(|column| column == "execution_snapshot_id"));
+        assert!(columns("batches")
+            .iter()
+            .any(|column| column == "aggregate_version"));
+        assert!(columns("work_units")
+            .iter()
+            .any(|column| column == "aggregate_version"));
+
+        let snapshot_table: String = store
+            .conn
+            .query_row(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table' AND name = 'execution_snapshots'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(snapshot_table, "execution_snapshots");
+    }
+
     #[tokio::test]
     async fn store_handle_uses_typed_actor_commands() {
         let dir = tempdir().unwrap();
         let handle = StoreHandle::open(&dir.path().join("actor.db")).unwrap();
 
         handle
-            .save_job_aggregate("job1", None, "pending", "/media/a.wav", "{\"id\":1}")
+            .save_job_aggregate(
+                "job1",
+                None,
+                "pending",
+                "/media/a.wav",
+                "",
+                None,
+                "{\"id\":1}",
+                ExpectedVersion::New,
+            )
             .await
             .unwrap();
         handle
-            .save_batch_aggregate("batch1", "pending", "fake", "cpu", "{\"id\":1}")
+            .save_batch_aggregate(
+                "batch1",
+                "pending",
+                "fake",
+                "cpu",
+                "{\"id\":1}",
+                ExpectedVersion::New,
+            )
             .await
             .unwrap();
 
         assert_eq!(
             handle.load_job_aggregate("job1").await.unwrap(),
-            Some("{\"id\":1}".into())
+            Some(("{\"id\":1}".into(), 1))
         );
         assert_eq!(
             handle.load_batch_aggregate("batch1").await.unwrap(),
-            Some("{\"id\":1}".into())
+            Some(("{\"id\":1}".into(), 1))
         );
         assert_eq!(handle.list_job_aggregates().await.unwrap().len(), 1);
 

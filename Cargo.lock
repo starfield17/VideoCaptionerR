@@ -1873,6 +1873,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "toml",
  "ulid",
  "videocaptionerr-contracts",
  "videocaptionerr-domain",

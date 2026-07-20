@@ -20,9 +20,9 @@ use crate::chunking::{
 use crate::ports::{
     ArtifactCommit, ArtifactInput, ArtifactStore, AsrSession, AsrTranscribeRequest,
     AudioAnalysisRequest, CacheRepository, ChunkPlanCommit, ChunkPlanStore, Clock, EventPublisher,
-    ExtractAudioRangeRequest, IdGenerator, JobRepository, LlmStage, MediaGateway,
+    ExpectedVersion, ExtractAudioRangeRequest, IdGenerator, JobRepository, LlmStage, MediaGateway,
     ProbeMediaRequest, PromptSnapshot, StructuredOutput, SubtitleExportRequest, SubtitleGateway,
-    TranscriptCommit, WorkUnitRepository,
+    TranscriptCommit, Versioned, WorkUnitRepository,
 };
 
 #[derive(Debug, Clone)]
@@ -65,6 +65,7 @@ impl LlmProcessOptions {
 pub struct TranscribeJobCommand {
     pub job_id: JobId,
     pub batch_id: Option<BatchId>,
+    pub execution_snapshot_id: UlidStr,
     pub profile_revision: UlidStr,
     pub input: PathBuf,
     pub job_dir: PathBuf,
@@ -145,9 +146,27 @@ impl TranscribeJob {
         command: TranscribeJobCommand,
         session: &mut dyn AsrSession,
     ) -> AppResult<TranscribeJobResponse> {
-        let mut job = match self.jobs.load_job(&command.job_id).await? {
+        let (mut job, new_job) = match self.jobs.load_job(&command.job_id).await? {
             Some(existing) if existing.status() == videocaptionerr_domain::JobStatus::Pending => {
-                existing
+                if existing.execution_snapshot_id() != Some(&command.execution_snapshot_id) {
+                    return Err(ApplicationError::Invalid(format!(
+                        "Job {} is bound to a different execution snapshot",
+                        command.job_id
+                    )));
+                }
+                if existing.batch_id() != command.batch_id.as_ref() {
+                    return Err(ApplicationError::Invalid(format!(
+                        "Job {} belongs to a different Batch",
+                        command.job_id
+                    )));
+                }
+                if existing.source_path() != command.input.to_string_lossy() {
+                    return Err(ApplicationError::Invalid(format!(
+                        "Job {} source identity does not match its execution snapshot",
+                        command.job_id
+                    )));
+                }
+                (existing, false)
             }
             Some(existing) => {
                 return Err(ApplicationError::Invalid(format!(
@@ -156,16 +175,25 @@ impl TranscribeJob {
                     existing.status()
                 )))
             }
-            None => Job::new(
-                command.job_id.clone(),
-                command.batch_id.clone(),
-                command.profile_revision.clone(),
-                command.input.to_string_lossy(),
+            None => (
+                Versioned::new(Job::new_with_snapshot(
+                    command.job_id.clone(),
+                    command.batch_id.clone(),
+                    command.execution_snapshot_id.clone(),
+                    command.profile_revision.clone(),
+                    command.input.to_string_lossy(),
+                )),
+                true,
             ),
         };
-        self.jobs.save_job(&job).await?;
+        let expected = if new_job {
+            ExpectedVersion::New
+        } else {
+            job.expected_version()
+        };
+        self.jobs.save_job(&mut job, expected).await?;
         job.start()?;
-        self.jobs.save_job(&job).await?;
+        self.save_job(&mut job).await?;
 
         let mut current_stage = None;
         let result: AppResult<TranscribeJobResponse> = async {
@@ -202,7 +230,7 @@ impl TranscribeJob {
             if probe_pending {
                 let probe_artifact = self.commit_input(&command.job_id, probed.artifact).await?;
                 job.complete_stage(StageKind::Probe, probe_artifact, false)?;
-                self.jobs.save_job(&job).await?;
+                self.save_job(&mut job).await?;
             }
 
             let extract_pending = stage_is_pending(&job, StageKind::ExtractAudio);
@@ -224,7 +252,7 @@ impl TranscribeJob {
                     .commit_input(&command.job_id, extracted.artifact)
                     .await?;
                 job.complete_stage(StageKind::ExtractAudio, extract_artifact, false)?;
-                self.jobs.save_job(&job).await?;
+                self.save_job(&mut job).await?;
             }
 
             let asr_pending = stage_is_pending(&job, StageKind::Asr);
@@ -263,7 +291,7 @@ impl TranscribeJob {
                     })
                     .await?;
                 job.complete_stage(StageKind::Asr, asr_artifact, false)?;
-                self.jobs.save_job(&job).await?;
+                self.save_job(&mut job).await?;
                 transcript
             } else {
                 let artifact = stage_artifact(&job, StageKind::Asr)?;
@@ -309,7 +337,7 @@ impl TranscribeJob {
                     })
                     .await?;
                 job.complete_stage(StageKind::Split, artifact, degraded)?;
-                self.jobs.save_job(&job).await?;
+                self.save_job(&mut job).await?;
                 transcript
             } else {
                 let artifact = stage_artifact(&job, StageKind::Split)?;
@@ -345,7 +373,7 @@ impl TranscribeJob {
                         })
                         .await?;
                     job.complete_stage(StageKind::Correct, artifact, degraded)?;
-                    self.jobs.save_job(&job).await?;
+                    self.save_job(&mut job).await?;
                 } else {
                     let artifact = stage_artifact(&job, StageKind::Correct)?;
                     final_transcript = self.artifacts.load_transcript(&artifact).await?;
@@ -372,7 +400,7 @@ impl TranscribeJob {
                         })
                         .await?;
                     job.complete_stage(StageKind::Translate, artifact, degraded)?;
-                    self.jobs.save_job(&job).await?;
+                    self.save_job(&mut job).await?;
                 } else {
                     let artifact = stage_artifact(&job, StageKind::Translate)?;
                     final_transcript = self.artifacts.load_transcript(&artifact).await?;
@@ -387,7 +415,7 @@ impl TranscribeJob {
                     job.skip_stage(StageKind::Translate)?;
                 }
             }
-            self.jobs.save_job(&job).await?;
+            self.save_job(&mut job).await?;
 
             let export_path = if stage_is_pending(&job, StageKind::Export) {
                 job.start_stage(StageKind::Export)?;
@@ -420,10 +448,10 @@ impl TranscribeJob {
                 PathBuf::from(artifact.path)
             };
             job.finish()?;
-            self.jobs.save_job(&job).await?;
+            self.save_job(&mut job).await?;
 
             Ok(TranscribeJobResponse {
-                job: job.clone(),
+                job: job.value.clone(),
                 transcript: final_transcript,
                 export_path,
             })
@@ -438,10 +466,15 @@ impl TranscribeJob {
             } else if !job.status().is_terminal() {
                 let _ = job.cancel();
             }
-            let _ = self.jobs.save_job(&job).await;
+            let _ = self.save_job(&mut job).await;
             return Err(error);
         }
         result
+    }
+
+    async fn save_job(&self, job: &mut Versioned<Job>) -> AppResult<()> {
+        let expected = job.expected_version();
+        self.jobs.save_job(job, expected).await
     }
 
     async fn commit_input(&self, job_id: &JobId, input: ArtifactInput) -> AppResult<ArtifactRef> {
@@ -558,8 +591,12 @@ impl TranscribeJob {
                         chunk.index,
                         key.clone(),
                     )?;
-                    ports.work_units.save_work_unit(&unit).await?;
-                    unit
+                    let mut versioned = Versioned::new(unit);
+                    ports
+                        .work_units
+                        .save_work_unit(&mut versioned, ExpectedVersion::New)
+                        .await?;
+                    versioned
                 }
             };
             chunk_units.push((chunk, key, unit));
@@ -664,7 +701,8 @@ impl TranscribeJob {
                 Err(error) => {
                     let vc_error = error.into_vc_error();
                     let _ = leased.fail(vc_error.code.as_str());
-                    let _ = ports.work_units.save_work_unit(&leased).await;
+                    let expected = leased.expected_version();
+                    let _ = ports.work_units.save_work_unit(&mut leased, expected).await;
                     return Err(ApplicationError::Adapter(vc_error));
                 }
             }
@@ -783,9 +821,9 @@ mod tests {
     use crate::application_error::AppResult;
     use crate::ports::{
         ArtifactStore, AsrDescriptor, AudioAnalysis, AudioExtraction, AudioRangeExtraction,
-        CacheGcResult, CacheRepository, ChunkPlanCommit, ChunkPlanStore, Clock, ExportedSubtitle,
-        ExtractAudioRangeRequest, ExtractAudioRequest, NormalizedAsrResult, ProbedMedia,
-        SubtitleFormat, SubtitleLayout, WorkUnitRepository,
+        CacheGcResult, CacheRepository, ChunkPlanCommit, ChunkPlanStore, Clock, ExpectedVersion,
+        ExportedSubtitle, ExtractAudioRangeRequest, ExtractAudioRequest, NormalizedAsrResult,
+        ProbedMedia, SubtitleFormat, SubtitleLayout, Versioned, WorkUnitRepository,
     };
 
     struct FakeIds;
@@ -811,12 +849,23 @@ mod tests {
 
     #[async_trait]
     impl JobRepository for FakeJobs {
-        async fn load_job(&self, _id: &JobId) -> AppResult<Option<Job>> {
-            Ok(self.saved.lock().unwrap().last().cloned())
+        async fn load_job(&self, _id: &JobId) -> AppResult<Option<Versioned<Job>>> {
+            Ok(self
+                .saved
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .map(|job| Versioned::with_version(job, 1)))
         }
 
-        async fn save_job(&self, job: &Job) -> AppResult<()> {
-            self.saved.lock().unwrap().push(job.clone());
+        async fn save_job(
+            &self,
+            job: &mut Versioned<Job>,
+            _expected: ExpectedVersion,
+        ) -> AppResult<()> {
+            self.saved.lock().unwrap().push(job.value.clone());
+            job.version = job.version.saturating_add(1).max(1);
             Ok(())
         }
 
@@ -824,8 +873,15 @@ mod tests {
             Ok(())
         }
 
-        async fn list_jobs(&self) -> AppResult<Vec<Job>> {
-            Ok(self.saved.lock().unwrap().clone())
+        async fn list_jobs(&self) -> AppResult<Vec<Versioned<Job>>> {
+            Ok(self
+                .saved
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .map(|job| Versioned::with_version(job, 1))
+                .collect())
         }
     }
 
@@ -1084,14 +1140,15 @@ mod tests {
         async fn load_work_unit(
             &self,
             id: &videocaptionerr_domain::WorkUnitId,
-        ) -> AppResult<Option<WorkUnit>> {
+        ) -> AppResult<Option<Versioned<WorkUnit>>> {
             Ok(self
                 .values
                 .lock()
                 .unwrap()
                 .iter()
                 .find(|unit| unit.id() == id)
-                .cloned())
+                .cloned()
+                .map(|unit| Versioned::with_version(unit, 1)))
         }
 
         async fn find_work_unit(
@@ -1101,7 +1158,7 @@ mod tests {
             unit_kind: &str,
             unit_index: u32,
             input_hash: &str,
-        ) -> AppResult<Option<WorkUnit>> {
+        ) -> AppResult<Option<Versioned<WorkUnit>>> {
             Ok(self
                 .values
                 .lock()
@@ -1114,19 +1171,25 @@ mod tests {
                         && unit.unit_index() == unit_index
                         && unit.input_hash() == input_hash
                 })
-                .cloned())
+                .cloned()
+                .map(|unit| Versioned::with_version(unit, 1)))
         }
 
-        async fn save_work_unit(&self, unit: &WorkUnit) -> AppResult<()> {
+        async fn save_work_unit(
+            &self,
+            unit: &mut Versioned<WorkUnit>,
+            _expected: ExpectedVersion,
+        ) -> AppResult<()> {
             let mut values = self.values.lock().unwrap();
             if let Some(existing) = values
                 .iter_mut()
                 .find(|existing| existing.id() == unit.id())
             {
-                *existing = unit.clone();
+                *existing = unit.value.clone();
             } else {
-                values.push(unit.clone());
+                values.push(unit.value.clone());
             }
+            unit.version = unit.version.saturating_add(1).max(1);
             Ok(())
         }
 
@@ -1163,7 +1226,7 @@ mod tests {
             owner: &str,
             now_ms: u64,
             lease_ms: u64,
-        ) -> AppResult<Option<WorkUnit>> {
+        ) -> AppResult<Option<Versioned<WorkUnit>>> {
             let mut values = self.values.lock().unwrap();
             let Some(index) = values.iter().position(|unit| {
                 unit.job_id() == job_id
@@ -1175,7 +1238,7 @@ mod tests {
             let unit = &mut values[index];
             unit.lease_for(owner, now_ms, now_ms + lease_ms)
                 .map_err(ApplicationError::Domain)?;
-            Ok(Some(unit.clone()))
+            Ok(Some(Versioned::with_version(unit.clone(), 1)))
         }
 
         async fn retry_failed(
@@ -1473,6 +1536,7 @@ mod tests {
         TranscribeJobCommand {
             job_id: UlidStr::from(Ulid::new()),
             batch_id: None,
+            execution_snapshot_id: UlidStr::from(Ulid::new()),
             profile_revision: UlidStr::from(Ulid::new()),
             input: dir.join("input.wav"),
             job_dir: dir.join("job"),
@@ -1522,6 +1586,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_job_rejects_a_different_execution_snapshot() {
+        let dir = tempdir().unwrap();
+        let (use_case, jobs) = use_case();
+        let mut command = command(dir.path());
+        jobs.saved.lock().unwrap().push(Job::new_with_snapshot(
+            command.job_id.clone(),
+            command.batch_id.clone(),
+            command.execution_snapshot_id.clone(),
+            command.profile_revision.clone(),
+            command.input.to_string_lossy(),
+        ));
+        command.execution_snapshot_id = Ulid::new().into();
+
+        let mut asr = session(Some(transcript()), false);
+        let error = use_case.execute(command, &mut asr).await.unwrap_err();
+
+        assert_eq!(error.into_vc_error().code, ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
     async fn retry_after_export_failure_reuses_completed_transcript_stages() {
         let dir = tempdir().unwrap();
         let (use_case, jobs, export_failure) = use_case_with_export_failure();
@@ -1560,10 +1644,17 @@ mod tests {
 
         let mut retry_job = failed_job.clone();
         retry_job.prepare_retry(None).unwrap();
-        jobs.save_job(&retry_job).await.unwrap();
+        let mut retry_job = Versioned::with_version(retry_job, 1);
+        jobs.save_job(&mut retry_job, ExpectedVersion::Exact(1))
+            .await
+            .unwrap();
 
         let mut retry_command = command(dir.path());
         retry_command.job_id = failed_job.id().clone();
+        retry_command.execution_snapshot_id = failed_job
+            .execution_snapshot_id()
+            .cloned()
+            .expect("retry fixture must have an execution snapshot");
         retry_command.profile_revision = failed_job.profile_revision().clone();
         let mut retry_session = session(None, true);
         let result = use_case

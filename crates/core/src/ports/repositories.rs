@@ -4,24 +4,69 @@ use videocaptionerr_domain::{
 };
 
 use crate::application_error::AppResult;
+use crate::execution_snapshot::JobExecutionSnapshot;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Versioned<T> {
+    pub value: T,
+    pub version: u64,
+}
+
+impl<T> Versioned<T> {
+    pub fn new(value: T) -> Self {
+        Self { value, version: 0 }
+    }
+
+    pub fn with_version(value: T, version: u64) -> Self {
+        Self { value, version }
+    }
+
+    pub fn expected_version(&self) -> ExpectedVersion {
+        ExpectedVersion::Exact(self.version)
+    }
+}
+
+impl<T> std::ops::Deref for Versioned<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl<T> std::ops::DerefMut for Versioned<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.value
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpectedVersion {
+    New,
+    Exact(u64),
+}
 
 #[async_trait]
 pub trait BatchRepository: Send + Sync {
-    async fn load_batch(&self, id: &BatchId) -> AppResult<Option<Batch>>;
-    async fn save_batch(&self, batch: &Batch) -> AppResult<()>;
+    async fn load_batch(&self, id: &BatchId) -> AppResult<Option<Versioned<Batch>>>;
+    async fn save_batch(
+        &self,
+        batch: &mut Versioned<Batch>,
+        expected: ExpectedVersion,
+    ) -> AppResult<()>;
 }
 
 #[async_trait]
 pub trait JobRepository: Send + Sync {
-    async fn load_job(&self, id: &JobId) -> AppResult<Option<Job>>;
-    async fn save_job(&self, job: &Job) -> AppResult<()>;
+    async fn load_job(&self, id: &JobId) -> AppResult<Option<Versioned<Job>>>;
+    async fn save_job(&self, job: &mut Versioned<Job>, expected: ExpectedVersion) -> AppResult<()>;
     async fn delete_job(&self, id: &JobId) -> AppResult<()>;
-    async fn list_jobs(&self) -> AppResult<Vec<Job>>;
+    async fn list_jobs(&self) -> AppResult<Vec<Versioned<Job>>>;
 }
 
 #[async_trait]
 pub trait WorkUnitRepository: Send + Sync {
-    async fn load_work_unit(&self, id: &WorkUnitId) -> AppResult<Option<WorkUnit>>;
+    async fn load_work_unit(&self, id: &WorkUnitId) -> AppResult<Option<Versioned<WorkUnit>>>;
     async fn find_work_unit(
         &self,
         job_id: &JobId,
@@ -29,8 +74,12 @@ pub trait WorkUnitRepository: Send + Sync {
         unit_kind: &str,
         unit_index: u32,
         input_hash: &str,
-    ) -> AppResult<Option<WorkUnit>>;
-    async fn save_work_unit(&self, unit: &WorkUnit) -> AppResult<()>;
+    ) -> AppResult<Option<Versioned<WorkUnit>>>;
+    async fn save_work_unit(
+        &self,
+        unit: &mut Versioned<WorkUnit>,
+        expected: ExpectedVersion,
+    ) -> AppResult<()>;
     async fn recover_expired(&self, now_ms: u64) -> AppResult<u32>;
     async fn count_retryable(
         &self,
@@ -44,8 +93,18 @@ pub trait WorkUnitRepository: Send + Sync {
         owner: &str,
         now_ms: u64,
         lease_ms: u64,
-    ) -> AppResult<Option<WorkUnit>>;
+    ) -> AppResult<Option<Versioned<WorkUnit>>>;
     async fn retry_failed(&self, job_id: &JobId, from_stage: Option<StageKind>) -> AppResult<u32>;
+}
+
+#[async_trait]
+pub trait SnapshotRepository: Send + Sync {
+    async fn load_execution_snapshot(
+        &self,
+        id: &videocaptionerr_domain::UlidStr,
+    ) -> AppResult<Option<JobExecutionSnapshot>>;
+    async fn save_execution_snapshot(&self, snapshot: &JobExecutionSnapshot) -> AppResult<()>;
+    async fn load_snapshots_for_batch(&self, id: &BatchId) -> AppResult<Vec<JobExecutionSnapshot>>;
 }
 
 pub fn validate_loaded<T>(value: Option<T>, name: &str) -> DomainResult<T> {

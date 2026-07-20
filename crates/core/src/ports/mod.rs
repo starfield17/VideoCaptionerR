@@ -28,7 +28,10 @@ pub use media::{
     AudioAnalysis, AudioAnalysisRequest, AudioExtraction, AudioRangeExtraction,
     ExtractAudioRangeRequest, ExtractAudioRequest, MediaGateway, ProbeMediaRequest, ProbedMedia,
 };
-pub use repositories::{BatchRepository, JobRepository, WorkUnitRepository};
+pub use repositories::{
+    BatchRepository, ExpectedVersion, JobRepository, SnapshotRepository, Versioned,
+    WorkUnitRepository,
+};
 pub use subtitle::{
     ExportedSubtitle, SubtitleExportRequest, SubtitleFormat, SubtitleGateway, SubtitleLayout,
 };

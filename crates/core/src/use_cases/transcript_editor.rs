@@ -8,7 +8,7 @@ use videocaptionerr_domain::{
 };
 
 use crate::application_error::{AppResult, ApplicationError};
-use crate::ports::{ArtifactStore, IdGenerator, JobRepository, TranscriptCommit};
+use crate::ports::{ArtifactStore, IdGenerator, JobRepository, TranscriptCommit, Versioned};
 
 #[derive(Debug, Clone)]
 pub struct EditTranscriptCommand {
@@ -80,14 +80,15 @@ impl TranscriptEditor {
             })
             .await?;
         job.record_transcript_revision(stage, artifact)?;
-        self.jobs.save_job(&job).await?;
+        let expected = job.expected_version();
+        self.jobs.save_job(&mut job, expected).await?;
         Ok(EditTranscriptResponse {
             transcript: updated,
             stage,
         })
     }
 
-    async fn load_job(&self, job_id: &JobId) -> AppResult<Job> {
+    async fn load_job(&self, job_id: &JobId) -> AppResult<Versioned<Job>> {
         self.jobs
             .load_job(job_id)
             .await?

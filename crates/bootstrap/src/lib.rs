@@ -13,11 +13,16 @@ use videocaptionerr_asr::{resolve_helper_binary, WorkerAsrRuntime};
 use videocaptionerr_contracts::error::{ErrorCode, VcError, VcResult};
 use videocaptionerr_core::application_error::ApplicationError;
 use videocaptionerr_core::chunking::ChunkPlan;
+use videocaptionerr_core::execution_snapshot::{
+    AsrExecutionSnapshot, AudioStreamSelection, JobExecutionSnapshot, LlmExecutionSnapshot,
+    OutputPlanSnapshot, SourceStatSnapshot, JOB_EXECUTION_SNAPSHOT_SCHEMA_VERSION,
+};
 use videocaptionerr_core::ports::{
     ArtifactStore, AsrRuntime, BatchRepository, CacheRepository, CapabilityProbeRecord,
-    CapabilityProbeStore, ChunkPlanStore, Clock, EventPublisher, IdGenerator, JobRepository,
-    LlmStage, MediaGateway, PromptSnapshot, StructuredOutput, SubtitleExportRequest,
-    SubtitleFormat, SubtitleGateway, SubtitleLayout, WorkUnitRepository,
+    CapabilityProbeStore, ChunkPlanStore, Clock, EventPublisher, ExpectedVersion, IdGenerator,
+    JobRepository, LlmStage, MediaGateway, PromptSnapshot, SnapshotRepository, StructuredOutput,
+    SubtitleExportRequest, SubtitleFormat, SubtitleGateway, SubtitleLayout, Versioned,
+    WorkUnitRepository,
 };
 use videocaptionerr_core::use_cases::{
     CacheGc, EditTranscriptCommand, EditTranscriptResponse, LlmPipeline, LlmProcessOptions,
@@ -165,6 +170,8 @@ pub struct ApplicationRuntime {
     model_path: Option<PathBuf>,
     helper_path: PathBuf,
     jobs: Arc<dyn JobRepository>,
+    batches: Arc<dyn BatchRepository>,
+    snapshots: Arc<dyn SnapshotRepository>,
     run_batch: Arc<RunBatch>,
     retry_failed: Arc<RetryFailedWorkUnits>,
     cache_gc: Arc<CacheGc>,
@@ -237,6 +244,7 @@ impl ApplicationRuntime {
         let jobs: Arc<dyn JobRepository> = Arc::new(store.clone());
         let batches: Arc<dyn BatchRepository> = Arc::new(store.clone());
         let work_units: Arc<dyn WorkUnitRepository> = Arc::new(store.clone());
+        let snapshots: Arc<dyn SnapshotRepository> = Arc::new(store.clone());
         let capability_probes: Arc<dyn CapabilityProbeStore> = Arc::new(store.clone());
         let cached_capabilities = load_cached_capabilities(&store, &app_config)?;
         let artifact_adapter = Arc::new(SqliteArtifactStore::new(store));
@@ -286,7 +294,7 @@ impl ApplicationRuntime {
         );
         let transcribe = Arc::new(transcribe_service);
         let run_batch = Arc::new(RunBatch::new(
-            batches,
+            batches.clone(),
             jobs.clone(),
             asr,
             transcribe,
@@ -302,6 +310,8 @@ impl ApplicationRuntime {
             model_path: config.model_path,
             helper_path,
             jobs,
+            batches,
+            snapshots,
             run_batch,
             retry_failed,
             cache_gc,
@@ -356,6 +366,7 @@ impl ApplicationRuntime {
         self.jobs
             .list_jobs()
             .await
+            .map(|jobs| jobs.into_iter().map(|job| job.value).collect())
             .map_err(ApplicationError::into_vc_error)
     }
 
@@ -692,7 +703,7 @@ impl ApplicationRuntime {
             .unwrap_or_else(|| format!("{}:default", self.engine));
         let profile = BatchExecutionProfile {
             asr_engine: self.engine.clone(),
-            asr_model: model,
+            asr_model: model.clone(),
             device: "cpu".into(),
             compute_type: "default".into(),
         };
@@ -701,11 +712,19 @@ impl ApplicationRuntime {
             "{stem}.{target_lang?}.{layout}.{format}",
             ConflictPolicy::Rename,
         );
+        let model_digest = self
+            .model_path
+            .as_deref()
+            .filter(|path| path.is_file())
+            .map(videocaptionerr_store::blake3_file)
+            .transpose()?;
         let mut job_ids = Vec::with_capacity(options.files.len());
         let mut commands = Vec::with_capacity(options.files.len());
         for file in options.files {
             let input = canonical_input(&file)?;
+            let source_stat = source_stat_snapshot(&input)?;
             let job_id: JobId = Ulid::new().into();
+            let execution_snapshot_id: UlidStr = Ulid::new().into();
             let stem = input
                 .file_stem()
                 .and_then(|value| value.to_str())
@@ -720,10 +739,45 @@ impl ApplicationRuntime {
                 options.layout.into_platform(),
                 format.into_platform(),
             )?;
+            let snapshot = JobExecutionSnapshot {
+                snapshot_id: execution_snapshot_id.clone(),
+                schema_version: JOB_EXECUTION_SNAPSHOT_SCHEMA_VERSION,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                job_id: job_id.clone(),
+                batch_id: batch_id.clone(),
+                canonical_source_path: input.to_string_lossy().into_owned(),
+                source_stat,
+                job_dir: job_dir.to_string_lossy().into_owned(),
+                profile_revision: profile_revision.clone(),
+                asr: AsrExecutionSnapshot {
+                    engine: self.engine.clone(),
+                    model_locator: model.clone(),
+                    model_id: Some(model.clone()),
+                    model_digest: model_digest.clone(),
+                    device: profile.device.clone(),
+                    compute_type: profile.compute_type.clone(),
+                },
+                audio_stream: AudioStreamSelection::Auto,
+                source_language: options.language.clone(),
+                target_language: options.target_language.clone(),
+                output: OutputPlanSnapshot {
+                    path: planned.path.to_string_lossy().into_owned(),
+                    format: subtitle_format_name(format).into(),
+                    layout: subtitle_layout_name(options.layout).into(),
+                    conflict_policy: ConflictPolicy::Rename.as_str().into(),
+                    fallback_to_source: options.layout == SubtitleLayout::TranslationOnly,
+                },
+                llm: llm.as_ref().map(llm_snapshot),
+            };
+            self.snapshots
+                .save_execution_snapshot(&snapshot)
+                .await
+                .map_err(ApplicationError::into_vc_error)?;
             job_ids.push(job_id.clone());
             commands.push(TranscribeJobCommand {
                 job_id,
                 batch_id: Some(batch_id.clone()),
+                execution_snapshot_id,
                 profile_revision: profile_revision.clone(),
                 input,
                 job_dir,
@@ -739,9 +793,27 @@ impl ApplicationRuntime {
         }
 
         let batch = Batch::new(batch_id, job_ids, profile).map_err(VcError::from)?;
+        for command in &commands {
+            let mut job = Versioned::new(Job::new_with_snapshot(
+                command.job_id.clone(),
+                command.batch_id.clone(),
+                command.execution_snapshot_id.clone(),
+                command.profile_revision.clone(),
+                command.input.to_string_lossy(),
+            ));
+            self.jobs
+                .save_job(&mut job, ExpectedVersion::New)
+                .await
+                .map_err(ApplicationError::into_vc_error)?;
+        }
+        let mut persisted_batch = Versioned::new(batch.clone());
+        self.batches
+            .save_batch(&mut persisted_batch, ExpectedVersion::New)
+            .await
+            .map_err(ApplicationError::into_vc_error)?;
         self.run_batch
             .execute(RunBatchCommand {
-                batch,
+                batch: persisted_batch.value,
                 jobs: commands,
             })
             .await
@@ -1066,6 +1138,57 @@ fn canonical_input(path: &Path) -> VcResult<PathBuf> {
             format!("input not found {}: {error}", path.display()),
         )
     })
+}
+
+fn source_stat_snapshot(path: &Path) -> VcResult<SourceStatSnapshot> {
+    let metadata = std::fs::metadata(path).map_err(|error| {
+        VcError::new(
+            ErrorCode::InputNotFound,
+            format!("read input metadata {}: {error}", path.display()),
+        )
+    })?;
+    let modified_at_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|value| u64::try_from(value.as_millis()).ok());
+    Ok(SourceStatSnapshot {
+        size: metadata.len(),
+        modified_at_ms,
+    })
+}
+
+fn llm_snapshot(options: &LlmProcessOptions) -> LlmExecutionSnapshot {
+    LlmExecutionSnapshot {
+        provider_profile_revision: options.provider_profile_revision.clone(),
+        model: options.model.clone(),
+        max_context_tokens: options.max_context_tokens,
+        max_output_tokens: options.max_output_tokens,
+        chars_per_token: options.chars_per_token,
+        structured_output: options.structured_output,
+        seed: options.seed,
+        target_language: options.target_language.clone(),
+        split_prompt: options.split_prompt.clone(),
+        correct_prompt: options.correct_prompt.clone(),
+        translate_prompt: options.translate_prompt.clone(),
+    }
+}
+
+fn subtitle_format_name(format: SubtitleFormat) -> &'static str {
+    match format {
+        SubtitleFormat::Srt => "srt",
+        SubtitleFormat::Vtt => "vtt",
+        SubtitleFormat::Ass => "ass",
+    }
+}
+
+fn subtitle_layout_name(layout: SubtitleLayout) -> &'static str {
+    match layout {
+        SubtitleLayout::SourceOnly => "source_only",
+        SubtitleLayout::TranslationOnly => "translation_only",
+        SubtitleLayout::BilingualSourceFirst => "bilingual_source_first",
+        SubtitleLayout::BilingualTranslationFirst => "bilingual_translation_first",
+    }
 }
 
 fn find_on_path(command: &str) -> Option<PathBuf> {

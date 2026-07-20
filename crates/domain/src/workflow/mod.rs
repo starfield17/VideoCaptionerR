@@ -330,6 +330,8 @@ pub struct StageState {
 pub struct Job {
     id: JobId,
     batch_id: Option<BatchId>,
+    #[serde(default)]
+    execution_snapshot_id: Option<UlidStr>,
     profile_revision: UlidStr,
     source_path: String,
     stages: Vec<StageState>,
@@ -365,6 +367,7 @@ impl Job {
         Self {
             id,
             batch_id,
+            execution_snapshot_id: None,
             profile_revision,
             source_path: source_path.into(),
             stages: kinds
@@ -379,12 +382,28 @@ impl Job {
         }
     }
 
+    pub fn new_with_snapshot(
+        id: JobId,
+        batch_id: Option<BatchId>,
+        execution_snapshot_id: UlidStr,
+        profile_revision: UlidStr,
+        source_path: impl Into<String>,
+    ) -> Self {
+        let mut job = Self::new(id, batch_id, profile_revision, source_path);
+        job.execution_snapshot_id = Some(execution_snapshot_id);
+        job
+    }
+
     pub fn id(&self) -> &JobId {
         &self.id
     }
 
     pub fn batch_id(&self) -> Option<&BatchId> {
         self.batch_id.as_ref()
+    }
+
+    pub fn execution_snapshot_id(&self) -> Option<&UlidStr> {
+        self.execution_snapshot_id.as_ref()
     }
 
     pub fn profile_revision(&self) -> &UlidStr {

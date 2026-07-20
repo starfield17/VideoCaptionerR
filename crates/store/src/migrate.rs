@@ -187,6 +187,52 @@ ALTER TABLE batches ADD COLUMN aggregate_json TEXT;
 ALTER TABLE work_units ADD COLUMN aggregate_json TEXT;
 "#,
     },
+    Migration {
+        version: 5,
+        name: "execution_snapshots_and_aggregate_versions",
+        sql: r#"
+ALTER TABLE jobs ADD COLUMN aggregate_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE batches ADD COLUMN aggregate_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE work_units ADD COLUMN aggregate_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN execution_snapshot_id TEXT;
+
+CREATE TABLE IF NOT EXISTS execution_snapshots (
+  snapshot_id TEXT PRIMARY KEY,
+  schema_version INTEGER NOT NULL,
+  job_id TEXT NOT NULL,
+  batch_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  canonical_source_path TEXT NOT NULL,
+  source_size INTEGER NOT NULL,
+  source_modified_at_ms INTEGER,
+  job_dir TEXT NOT NULL,
+  profile_revision TEXT NOT NULL,
+  asr_engine TEXT NOT NULL,
+  model_locator TEXT NOT NULL,
+  model_id TEXT,
+  model_digest TEXT,
+  device TEXT NOT NULL,
+  compute_type TEXT NOT NULL,
+  audio_stream_selection TEXT NOT NULL,
+  source_language TEXT,
+  target_language TEXT,
+  output_path TEXT NOT NULL,
+  output_format TEXT NOT NULL,
+  output_layout TEXT NOT NULL,
+  conflict_policy TEXT NOT NULL,
+  fallback_to_source INTEGER NOT NULL,
+  llm_json TEXT,
+  snapshot_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_execution_snapshot
+  ON jobs(execution_snapshot_id);
+CREATE INDEX IF NOT EXISTS idx_execution_snapshots_job
+  ON execution_snapshots(job_id);
+CREATE INDEX IF NOT EXISTS idx_execution_snapshots_batch
+  ON execution_snapshots(batch_id);
+"#,
+    },
 ];
 
 /// Apply pending migrations. Verifies checksums of already-applied versions.

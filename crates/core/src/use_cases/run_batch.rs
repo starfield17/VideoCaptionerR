@@ -6,7 +6,7 @@ use videocaptionerr_contracts::error::VcError;
 use videocaptionerr_domain::{Batch, BatchStatus, JobStatus, JobTerminalStatus};
 
 use crate::application_error::{AppResult, ApplicationError};
-use crate::ports::{AsrRuntime, BatchRepository, EventPublisher, JobRepository};
+use crate::ports::{AsrRuntime, BatchRepository, EventPublisher, JobRepository, Versioned};
 use crate::use_cases::{TranscribeJob, TranscribeJobCommand, TranscribeJobResponse};
 
 pub struct RunBatchCommand {
@@ -52,8 +52,32 @@ impl RunBatch {
     }
 
     pub async fn execute(&self, command: RunBatchCommand) -> AppResult<RunBatchResponse> {
-        let mut batch = command.batch;
-        validate_commands(&batch, &command.jobs)?;
+        let requested_batch = command.batch;
+        validate_commands(&requested_batch, &command.jobs)?;
+        let mut batch = self
+            .batches
+            .load_batch(requested_batch.id())
+            .await?
+            .ok_or_else(|| {
+                ApplicationError::Invalid(format!(
+                    "Batch {} must be persisted before execution",
+                    requested_batch.id()
+                ))
+            })?;
+        if batch.value != requested_batch {
+            return Err(ApplicationError::Invalid(format!(
+                "Batch {} does not match its persisted identity",
+                requested_batch.id()
+            )));
+        }
+        for command in &command.jobs {
+            self.jobs.load_job(&command.job_id).await?.ok_or_else(|| {
+                ApplicationError::Invalid(format!(
+                    "Job {} must be persisted before Batch execution",
+                    command.job_id
+                ))
+            })?;
+        }
 
         // Opening the session is deliberately outside the per-Job loop. The
         // worker/model stays alive until the Batch reaches a terminal state.
@@ -62,7 +86,8 @@ impl RunBatch {
             let _ = session.close().await;
             return Err(ApplicationError::Domain(error));
         }
-        if let Err(error) = self.batches.save_batch(&batch).await {
+        let expected = batch.expected_version();
+        if let Err(error) = self.batches.save_batch(&mut batch, expected).await {
             let _ = session.close().await;
             return Err(error);
         }
@@ -80,7 +105,7 @@ impl RunBatch {
 
     async fn execute_with_session(
         &self,
-        mut batch: Batch,
+        mut batch: Versioned<Batch>,
         commands: Vec<TranscribeJobCommand>,
         session: &mut dyn crate::ports::AsrSession,
     ) -> AppResult<RunBatchResponse> {
@@ -94,7 +119,7 @@ impl RunBatch {
                 Ok(response) => {
                     let terminal = terminal_status(response.job.status());
                     batch.record_job_terminal(&job_id, terminal)?;
-                    self.batches.save_batch(&batch).await?;
+                    self.save_batch(&mut batch).await?;
                     responses.push(response);
                 }
                 Err(error) => {
@@ -112,7 +137,7 @@ impl RunBatch {
                         .map(|job| terminal_status(job.status()))
                         .unwrap_or(JobTerminalStatus::Failed);
                     batch.record_job_terminal(&job_id, terminal)?;
-                    self.batches.save_batch(&batch).await?;
+                    self.save_batch(&mut batch).await?;
                 }
             }
         }
@@ -123,15 +148,20 @@ impl RunBatch {
             BatchStatus::Failed
         };
         let event = batch.finish(final_status)?;
-        self.batches.save_batch(&batch).await?;
+        self.save_batch(&mut batch).await?;
         self.events.publish(event).await?;
 
         Ok(RunBatchResponse {
-            batch,
+            batch: batch.value,
             jobs: responses,
             failed_job_ids,
             failures,
         })
+    }
+
+    async fn save_batch(&self, batch: &mut Versioned<Batch>) -> AppResult<()> {
+        let expected = batch.expected_version();
+        self.batches.save_batch(batch, expected).await
     }
 }
 
@@ -186,9 +216,9 @@ mod tests {
     use crate::application_error::AppResult;
     use crate::ports::{
         ArtifactCommit, ArtifactInput, ArtifactStore, AsrDescriptor, AsrSession,
-        AsrTranscribeRequest, AudioExtraction, EventPublisher, ExportedSubtitle,
+        AsrTranscribeRequest, AudioExtraction, EventPublisher, ExpectedVersion, ExportedSubtitle,
         ExtractAudioRequest, IdGenerator, JobRepository, MediaGateway, NormalizedAsrResult,
-        ProbeMediaRequest, ProbedMedia, SubtitleExportRequest, SubtitleGateway,
+        ProbeMediaRequest, ProbedMedia, SubtitleExportRequest, SubtitleGateway, Versioned,
     };
 
     struct Ids;
@@ -214,15 +244,26 @@ mod tests {
 
     #[async_trait]
     impl JobRepository for Jobs {
-        async fn load_job(&self, id: &JobId) -> AppResult<Option<Job>> {
-            Ok(self.values.lock().unwrap().get(id.as_str()).cloned())
+        async fn load_job(&self, id: &JobId) -> AppResult<Option<Versioned<Job>>> {
+            Ok(self
+                .values
+                .lock()
+                .unwrap()
+                .get(id.as_str())
+                .cloned()
+                .map(|job| Versioned::with_version(job, 1)))
         }
 
-        async fn save_job(&self, job: &Job) -> AppResult<()> {
+        async fn save_job(
+            &self,
+            job: &mut Versioned<Job>,
+            _expected: ExpectedVersion,
+        ) -> AppResult<()> {
             self.values
                 .lock()
                 .unwrap()
-                .insert(job.id().to_string(), job.clone());
+                .insert(job.id().to_string(), job.value.clone());
+            job.version = job.version.saturating_add(1).max(1);
             Ok(())
         }
 
@@ -230,8 +271,15 @@ mod tests {
             Ok(())
         }
 
-        async fn list_jobs(&self) -> AppResult<Vec<Job>> {
-            Ok(self.values.lock().unwrap().values().cloned().collect())
+        async fn list_jobs(&self) -> AppResult<Vec<Versioned<Job>>> {
+            Ok(self
+                .values
+                .lock()
+                .unwrap()
+                .values()
+                .cloned()
+                .map(|job| Versioned::with_version(job, 1))
+                .collect())
         }
     }
 
@@ -244,12 +292,23 @@ mod tests {
         async fn load_batch(
             &self,
             _id: &videocaptionerr_domain::BatchId,
-        ) -> AppResult<Option<Batch>> {
-            Ok(self.values.lock().unwrap().last().cloned())
+        ) -> AppResult<Option<Versioned<Batch>>> {
+            Ok(self
+                .values
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .map(|batch| Versioned::with_version(batch, 1)))
         }
 
-        async fn save_batch(&self, batch: &Batch) -> AppResult<()> {
-            self.values.lock().unwrap().push(batch.clone());
+        async fn save_batch(
+            &self,
+            batch: &mut Versioned<Batch>,
+            _expected: ExpectedVersion,
+        ) -> AppResult<()> {
+            self.values.lock().unwrap().push(batch.value.clone());
+            batch.version = batch.version.saturating_add(1).max(1);
             Ok(())
         }
     }
@@ -456,6 +515,7 @@ mod tests {
             job_id,
             batch_id: Some(batch_id.clone()),
             profile_revision: Ulid::new().into(),
+            execution_snapshot_id: Ulid::new().into(),
             input: dir.join("input.wav"),
             job_dir: dir.join("job"),
             language: Some("en".into()),
@@ -492,6 +552,28 @@ mod tests {
         ))
     }
 
+    fn seed_persisted_state(
+        jobs: &Arc<Jobs>,
+        batches: &Arc<Batches>,
+        batch: &Batch,
+        commands: &[TranscribeJobCommand],
+    ) {
+        batches.values.lock().unwrap().push(batch.clone());
+        let mut values = jobs.values.lock().unwrap();
+        for command in commands {
+            values.insert(
+                command.job_id.to_string(),
+                Job::new_with_snapshot(
+                    command.job_id.clone(),
+                    command.batch_id.clone(),
+                    command.execution_snapshot_id.clone(),
+                    command.profile_revision.clone(),
+                    command.input.to_string_lossy(),
+                ),
+            );
+        }
+    }
+
     #[tokio::test]
     async fn opens_and_closes_one_session_for_the_whole_batch() {
         let dir = tempfile::tempdir().unwrap();
@@ -499,12 +581,14 @@ mod tests {
             values: Mutex::new(HashMap::new()),
         });
         let (batch, commands) = make_batch(dir.path(), 2);
+        let batches = Arc::new(Batches {
+            values: Mutex::new(Vec::new()),
+        });
+        seed_persisted_state(&jobs, &batches, &batch, &commands);
         let opens = Arc::new(AtomicUsize::new(0));
         let closes = Arc::new(AtomicUsize::new(0));
         let runner = RunBatch::new(
-            Arc::new(Batches {
-                values: Mutex::new(Vec::new()),
-            }),
+            batches,
             jobs.clone(),
             Arc::new(Runtime {
                 opens: opens.clone(),
@@ -530,18 +614,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn does_not_open_asr_before_the_batch_is_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = Arc::new(Jobs {
+            values: Mutex::new(HashMap::new()),
+        });
+        let (batch, commands) = make_batch(dir.path(), 1);
+        let batches = Arc::new(Batches {
+            values: Mutex::new(Vec::new()),
+        });
+        let opens = Arc::new(AtomicUsize::new(0));
+        let runner = RunBatch::new(
+            batches,
+            jobs.clone(),
+            Arc::new(Runtime {
+                opens: opens.clone(),
+                closes: Arc::new(AtomicUsize::new(0)),
+                fail_first: false,
+            }),
+            use_case(jobs),
+            Arc::new(Events),
+        );
+
+        assert!(runner
+            .execute(RunBatchCommand {
+                batch,
+                jobs: commands,
+            })
+            .await
+            .is_err());
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn does_not_open_asr_when_a_batch_job_is_not_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = Arc::new(Jobs {
+            values: Mutex::new(HashMap::new()),
+        });
+        let (batch, commands) = make_batch(dir.path(), 1);
+        let batches = Arc::new(Batches {
+            values: Mutex::new(vec![batch.clone()]),
+        });
+        let opens = Arc::new(AtomicUsize::new(0));
+        let runner = RunBatch::new(
+            batches,
+            jobs.clone(),
+            Arc::new(Runtime {
+                opens: opens.clone(),
+                closes: Arc::new(AtomicUsize::new(0)),
+                fail_first: false,
+            }),
+            use_case(jobs),
+            Arc::new(Events),
+        );
+
+        assert!(runner
+            .execute(RunBatchCommand {
+                batch,
+                jobs: commands,
+            })
+            .await
+            .is_err());
+        assert_eq!(opens.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn failed_job_does_not_skip_later_job_or_session_close() {
         let dir = tempfile::tempdir().unwrap();
         let jobs = Arc::new(Jobs {
             values: Mutex::new(HashMap::new()),
         });
         let (batch, commands) = make_batch(dir.path(), 2);
+        let batches = Arc::new(Batches {
+            values: Mutex::new(Vec::new()),
+        });
+        seed_persisted_state(&jobs, &batches, &batch, &commands);
         let opens = Arc::new(AtomicUsize::new(0));
         let closes = Arc::new(AtomicUsize::new(0));
         let runner = RunBatch::new(
-            Arc::new(Batches {
-                values: Mutex::new(Vec::new()),
-            }),
+            batches,
             jobs.clone(),
             Arc::new(Runtime {
                 opens: opens.clone(),
