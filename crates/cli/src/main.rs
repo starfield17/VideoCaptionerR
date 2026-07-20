@@ -97,6 +97,18 @@ enum Commands {
         #[command(subcommand)]
         action: BatchCmd,
     },
+    /// Import SRT/VTT into a Job (no ASR).
+    ImportSubtitle {
+        file: PathBuf,
+        /// mono | source-above | translation-above
+        #[arg(long, default_value = "mono")]
+        layout: String,
+    },
+    /// Model install / verify (explicit only; never silent).
+    Models {
+        #[command(subcommand)]
+        action: ModelsCmd,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -140,6 +152,22 @@ enum BatchCmd {
     Pause { id: String },
     /// Resume a paused Batch.
     Resume { id: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum ModelsCmd {
+    /// Download and verify a model from the manifest by id.
+    Install {
+        model_id: String,
+        #[arg(long)]
+        dest: Option<PathBuf>,
+    },
+    /// Verify an on-disk model file against a SHA-256 hex digest.
+    Verify {
+        path: PathBuf,
+        #[arg(long)]
+        sha256: String,
+    },
 }
 
 fn main() -> StdExitCode {
@@ -512,6 +540,84 @@ fn run(cli: Cli) -> Result<ExitCode, VcError> {
                     } else {
                         println!("batch {id} resumed");
                     }
+                    Ok(ExitCode::Success)
+                }
+            }
+        }
+        Commands::ImportSubtitle { file, layout } => {
+            let runtime = ApplicationRuntime::open(RuntimeConfig {
+                home: cli.home,
+                engine: "fake".into(),
+                model_path: None,
+                helper_path: None,
+                prompt_dir: None,
+            })?;
+            let async_runtime = tokio::runtime::Runtime::new().map_err(|error| {
+                VcError::new(
+                    ErrorCode::Internal,
+                    format!("create Tokio runtime: {error}"),
+                )
+            })?;
+            let result =
+                async_runtime.block_on(runtime.import_subtitle(&file, Some(layout.as_str())))?;
+            emit_or_print(
+                cli.json,
+                CliEvent::JobListed,
+                Some(result.job_id.clone()),
+                serde_json::json!({
+                    "job_id": result.job_id,
+                    "cue_count": result.cue_count,
+                    "warnings": result.warnings,
+                    "transcript_path": result.transcript_path,
+                }),
+                format!(
+                    "imported {} cues into Job {} ({})",
+                    result.cue_count,
+                    result.job_id,
+                    result.transcript_path.display()
+                ),
+            )?;
+            Ok(ExitCode::Success)
+        }
+        Commands::Models { action } => {
+            let runtime = ApplicationRuntime::open(RuntimeConfig {
+                home: cli.home,
+                engine: "fake".into(),
+                model_path: None,
+                helper_path: None,
+                prompt_dir: None,
+            })?;
+            match action {
+                ModelsCmd::Install { model_id, dest } => {
+                    let async_runtime = tokio::runtime::Runtime::new().map_err(|error| {
+                        VcError::new(
+                            ErrorCode::Internal,
+                            format!("create Tokio runtime: {error}"),
+                        )
+                    })?;
+                    let result = async_runtime.block_on(runtime.install_model(&model_id, dest))?;
+                    emit_or_print(
+                        cli.json,
+                        CliEvent::JobListed,
+                        None,
+                        serde_json::json!({
+                            "model_id": result.model_id,
+                            "path": result.path,
+                            "sha256": result.sha256,
+                        }),
+                        format!("installed {} -> {}", result.model_id, result.path.display()),
+                    )?;
+                    Ok(ExitCode::Success)
+                }
+                ModelsCmd::Verify { path, sha256 } => {
+                    runtime.verify_model(&path, &sha256)?;
+                    emit_or_print(
+                        cli.json,
+                        CliEvent::JobListed,
+                        None,
+                        serde_json::json!({"path": path, "sha256": sha256, "ok": true}),
+                        format!("verified {}", path.display()),
+                    )?;
                     Ok(ExitCode::Success)
                 }
             }
