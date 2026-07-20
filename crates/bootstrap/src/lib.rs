@@ -520,8 +520,10 @@ impl ApplicationRuntime {
             model: result.model,
             probe_hash: result.probe_hash,
             capabilities: CapabilityView {
-                structured_mode: format!("{:?}", result.capabilities.effective_structured_mode())
-                    .to_ascii_lowercase(),
+                structured_mode: structured_mode_label(
+                    result.capabilities.effective_structured_mode(),
+                )
+                .into(),
                 returns_usage: result.capabilities.returns_usage,
                 seed: result.capabilities.seed,
                 supports_model_list: result.capabilities.supports_model_list,
@@ -1009,6 +1011,14 @@ fn parse_structured_mode(value: &str) -> Option<StructuredMode> {
     }
 }
 
+fn structured_mode_label(mode: StructuredMode) -> &'static str {
+    match mode {
+        StructuredMode::JsonSchema => "json_schema",
+        StructuredMode::JsonObject => "json_object",
+        StructuredMode::PromptOnly => "prompt_only",
+    }
+}
+
 fn prompt_snapshot(bundle: PromptBundle) -> PromptSnapshot {
     let stage = match bundle.stage {
         PromptStage::Split => LlmStage::Split,
@@ -1166,6 +1176,22 @@ mod tests {
             StructuredMode::JsonSchema
         );
         assert!(decoded.capabilities.manual_override);
+    }
+
+    #[test]
+    fn capability_view_uses_stable_structured_mode_labels() {
+        assert_eq!(
+            structured_mode_label(StructuredMode::JsonSchema),
+            "json_schema"
+        );
+        assert_eq!(
+            structured_mode_label(StructuredMode::JsonObject),
+            "json_object"
+        );
+        assert_eq!(
+            structured_mode_label(StructuredMode::PromptOnly),
+            "prompt_only"
+        );
     }
 
     #[tokio::test]

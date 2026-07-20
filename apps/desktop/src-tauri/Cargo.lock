@@ -4190,6 +4190,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "serde",
  "serde_json",
  "tokio",
  "ulid",
@@ -4235,16 +4236,10 @@ name = "videocaptionerr-desktop"
 version = "0.1.0"
 dependencies = [
  "serde",
- "serde_json",
  "tauri",
  "tauri-build",
- "tokio",
  "videocaptionerr-bootstrap",
  "videocaptionerr-contracts",
- "videocaptionerr-core",
- "videocaptionerr-domain",
- "videocaptionerr-llm",
- "videocaptionerr-platform",
 ]
 
 [[package]]

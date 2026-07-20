@@ -281,6 +281,12 @@ impl StoreHandle {
         model: &str,
         probe_hash: &str,
     ) -> VcResult<Option<String>> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(VcError::new(
+                ErrorCode::InvalidConfig,
+                "synchronous capability probe loading must run outside a Tokio runtime",
+            ));
+        }
         let (reply, result) = response_channel();
         self.send(StoreCommand::LoadCapabilityProbe {
             provider_profile_id: provider_profile_id.into(),
@@ -1430,6 +1436,92 @@ mod tests {
     }
 
     #[test]
+    fn artifact_commit_updates_domain_work_unit_and_control_columns_together() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("aggregate-commit.db");
+        let mut store = Store::open(&db).unwrap();
+        let job_id: videocaptionerr_domain::JobId = Ulid::new().into();
+        let unit_id: videocaptionerr_domain::WorkUnitId = Ulid::new().into();
+
+        store
+            .insert_job(
+                job_id.as_str(),
+                None,
+                "/media/a.mp4",
+                "/jobs/job1",
+                "running",
+            )
+            .unwrap();
+
+        let mut unit = videocaptionerr_domain::WorkUnit::new(
+            unit_id.clone(),
+            job_id.clone(),
+            videocaptionerr_domain::StageKind::Asr,
+            "chunk",
+            0,
+            "chunk-input-hash",
+        )
+        .unwrap();
+        unit.lease_for("test-owner", 1_000, 2_000).unwrap();
+        let lease = unit.lease().unwrap();
+        store
+            .save_work_unit_aggregate(&WorkUnitRecord {
+                id: unit.id().to_string(),
+                job_id: unit.job_id().to_string(),
+                stage: "asr".into(),
+                unit_kind: unit.unit_kind().into(),
+                unit_index: unit.unit_index(),
+                input_hash: unit.input_hash().into(),
+                status: "running".into(),
+                attempt: unit.attempt(),
+                lease_owner: Some(lease.owner.clone()),
+                lease_expires_at: Some("1970-01-01T00:00:02Z".into()),
+                artifact_id: None,
+                aggregate_json: serde_json::to_string(&unit).unwrap(),
+            })
+            .unwrap();
+
+        let artifact_path = dir.path().join("chunk.json");
+        let hash = atomic_write_bytes(&artifact_path, br#"{"chunk":0}"#).unwrap();
+        let meta = Store::new_artifact_meta(
+            job_id.as_str(),
+            "asr",
+            ArtifactKind::Transcript,
+            artifact_path.to_str().unwrap(),
+            &hash,
+            "test@0.1.0",
+        );
+        store
+            .commit_artifact_and_unit(&meta, Some(unit_id.as_str()))
+            .unwrap();
+
+        let aggregate_json = store
+            .load_work_unit_aggregate(unit_id.as_str())
+            .unwrap()
+            .unwrap();
+        let completed: videocaptionerr_domain::WorkUnit =
+            serde_json::from_str(&aggregate_json).unwrap();
+        assert_eq!(
+            completed.status(),
+            videocaptionerr_domain::WorkUnitStatus::Done
+        );
+        assert_eq!(completed.artifact().unwrap().id.as_str(), meta.id.as_str());
+        assert!(completed.lease().is_none());
+
+        let (status, artifact_id, persisted_json): (String, Option<String>, String) = store
+            .conn
+            .query_row(
+                "SELECT status, artifact_id, aggregate_json FROM work_units WHERE id = ?1",
+                [unit_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "done");
+        assert_eq!(artifact_id.as_deref(), Some(meta.id.as_str()));
+        assert_eq!(persisted_json, aggregate_json);
+    }
+
+    #[test]
     fn lease_recovery() {
         let dir = tempdir().unwrap();
         let db = dir.path().join("t.db");
@@ -1544,5 +1636,16 @@ mod tests {
                 .unwrap(),
             Some(r#"{"ok":true}"#.into())
         );
+    }
+
+    #[test]
+    fn synchronous_probe_load_rejects_runtime_thread_without_blocking() {
+        let dir = tempdir().unwrap();
+        let handle = StoreHandle::open(&dir.path().join("sync-probe-runtime.db")).unwrap();
+        let error = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async { handle.load_capability_probe_sync("primary", "model-a", "hash-a") })
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidConfig);
     }
 }
