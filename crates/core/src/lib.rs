@@ -11,6 +11,7 @@ pub mod ports;
 pub mod split;
 pub mod text_joiner;
 pub mod use_cases;
+pub mod vad;
 
 pub use application_error::{AppResult, ApplicationError};
 pub use artifacts::{
