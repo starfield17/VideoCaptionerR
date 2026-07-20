@@ -10,7 +10,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::ChildStdin;
 use tokio::sync::Mutex as AsyncMutex;
 use videocaptionerr_contracts::error::{ErrorCode, VcError, VcResult};
-use videocaptionerr_contracts::protocol::{ProtocolEnvelope, ProtocolMessageType, PROTOCOL_VERSION};
+use videocaptionerr_contracts::protocol::{
+    ProtocolEnvelope, ProtocolMessageType, PROTOCOL_VERSION,
+};
 
 /// Unix: kill process group. Windows: best-effort taskkill.
 pub fn kill_process_tree(pid: u32) {

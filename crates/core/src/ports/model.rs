@@ -15,8 +15,12 @@ use crate::ports::AsrRuntime;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ModelLocator {
-    File { path: String },
-    Directory { path: String },
+    File {
+        path: String,
+    },
+    Directory {
+        path: String,
+    },
     HuggingFaceSnapshot {
         repo_id: String,
         revision: String,

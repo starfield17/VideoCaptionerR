@@ -111,4 +111,3 @@ pub struct LlmPipeline {
     pub(crate) recorder: Arc<dyn LlmRequestRecorder>,
     pub(crate) ids: Arc<dyn IdGenerator>,
 }
-

@@ -3,17 +3,17 @@
 //! This module owns packing, validation, retries, binary isolation and stale
 //! result handling. Providers only transport an already-shaped request.
 
-mod types;
-mod plan;
+mod correct;
+pub mod durable;
+mod execute;
 mod packing;
-mod validation;
-mod split;
+mod plan;
 mod retry;
 mod service;
-mod execute;
-mod correct;
+mod split;
 mod translate;
-pub mod durable;
+mod types;
+mod validation;
 
 #[cfg(test)]
 mod tests;

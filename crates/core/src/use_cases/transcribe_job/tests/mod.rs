@@ -7,9 +7,7 @@ use async_trait::async_trait;
 use tempfile::tempdir;
 use ulid::Ulid;
 use videocaptionerr_contracts::media::{AudioStream, MediaProbe};
-use videocaptionerr_domain::{
-    BatchId, EngineFingerprint, Word, PROB_UNAVAILABLE, SCHEMA_VERSION,
-};
+use videocaptionerr_domain::{BatchId, EngineFingerprint, Word, PROB_UNAVAILABLE, SCHEMA_VERSION};
 
 use super::*;
 use crate::application_error::AppResult;
@@ -371,7 +369,11 @@ impl ArtifactStore for FakeArtifacts {
             return Ok(());
         }
         if self.documents.lock().unwrap().contains_key(&artifact.path)
-            || self.transcripts.lock().unwrap().contains_key(&artifact.path)
+            || self
+                .transcripts
+                .lock()
+                .unwrap()
+                .contains_key(&artifact.path)
             || artifact.stage == StageKind::Export
         {
             return Ok(());
@@ -1392,10 +1394,7 @@ async fn asr_retry_reruns_asr_and_later_stages_only() {
 
     let failed = jobs.saved.lock().unwrap().last().unwrap().clone();
     let mut retry_job = failed.clone();
-    assert_eq!(
-        retry_job.prepare_retry(None).unwrap(),
-        StageKind::Asr
-    );
+    assert_eq!(retry_job.prepare_retry(None).unwrap(), StageKind::Asr);
     let mut retry_job = Versioned::with_version(retry_job, 1);
     jobs.save_job(&mut retry_job, ExpectedVersion::Exact(1))
         .await
@@ -1440,10 +1439,7 @@ async fn source_changed_is_reported_when_size_differs_from_snapshot() {
             }
         }
 
-        async fn save_execution_snapshot(
-            &self,
-            _snapshot: &JobExecutionSnapshot,
-        ) -> AppResult<()> {
+        async fn save_execution_snapshot(&self, _snapshot: &JobExecutionSnapshot) -> AppResult<()> {
             Ok(())
         }
 

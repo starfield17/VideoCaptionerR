@@ -78,16 +78,16 @@ impl ArtifactStore for SqliteArtifactStore {
                 format!("read probe manifest {}: {error}", artifact.path),
             ))
         })?;
-        let manifest: videocaptionerr_core::ProbeManifest = serde_json::from_str(&body)
-            .map_err(|error| {
+        let manifest: videocaptionerr_core::ProbeManifest =
+            serde_json::from_str(&body).map_err(|error| {
                 ApplicationError::Adapter(VcError::new(
                     ErrorCode::ArtifactCorrupt,
                     format!("decode probe manifest {}: {error}", artifact.path),
                 ))
             })?;
-        manifest
-            .validate()
-            .map_err(|message| ApplicationError::Adapter(VcError::new(ErrorCode::ArtifactCorrupt, message)))?;
+        manifest.validate().map_err(|message| {
+            ApplicationError::Adapter(VcError::new(ErrorCode::ArtifactCorrupt, message))
+        })?;
         Ok(manifest)
     }
 
@@ -102,16 +102,16 @@ impl ArtifactStore for SqliteArtifactStore {
                 format!("read extract manifest {}: {error}", artifact.path),
             ))
         })?;
-        let manifest: videocaptionerr_core::ExtractManifest = serde_json::from_str(&body)
-            .map_err(|error| {
+        let manifest: videocaptionerr_core::ExtractManifest =
+            serde_json::from_str(&body).map_err(|error| {
                 ApplicationError::Adapter(VcError::new(
                     ErrorCode::ArtifactCorrupt,
                     format!("decode extract manifest {}: {error}", artifact.path),
                 ))
             })?;
-        manifest
-            .validate()
-            .map_err(|message| ApplicationError::Adapter(VcError::new(ErrorCode::ArtifactCorrupt, message)))?;
+        manifest.validate().map_err(|message| {
+            ApplicationError::Adapter(VcError::new(ErrorCode::ArtifactCorrupt, message))
+        })?;
         Ok(manifest)
     }
 

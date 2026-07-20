@@ -78,9 +78,7 @@ impl TranscribeJobCommand {
     /// Retry/resume paths must not re-read Prompt files, OutputPlanner state,
     /// or current Profile defaults.
     pub fn from_snapshot(snapshot: &JobExecutionSnapshot) -> AppResult<Self> {
-        snapshot
-            .validate()
-            .map_err(ApplicationError::Invalid)?;
+        snapshot.validate().map_err(ApplicationError::Invalid)?;
         let format = SubtitleFormat::parse(&snapshot.output.format).ok_or_else(|| {
             ApplicationError::Invalid(format!(
                 "execution snapshot has unsupported subtitle format '{}'",

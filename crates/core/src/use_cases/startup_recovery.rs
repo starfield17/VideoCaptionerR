@@ -231,10 +231,7 @@ mod tests {
             Ok(0)
         }
 
-        async fn list_for_job(
-            &self,
-            _job_id: &JobId,
-        ) -> AppResult<Vec<Versioned<WorkUnit>>> {
+        async fn list_for_job(&self, _job_id: &JobId) -> AppResult<Vec<Versioned<WorkUnit>>> {
             Ok(Vec::new())
         }
 

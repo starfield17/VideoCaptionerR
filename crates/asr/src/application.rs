@@ -171,8 +171,7 @@ impl AsrRuntime for WorkerAsrRuntime {
             &self.spec,
             &options_hash,
         );
-        let control: Arc<dyn AsrSessionControl> =
-            Arc::new(WorkerControlAdapter(client.control()));
+        let control: Arc<dyn AsrSessionControl> = Arc::new(WorkerControlAdapter(client.control()));
         Ok(Box::new(WorkerAsrSession {
             client,
             descriptor: application_descriptor,

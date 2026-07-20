@@ -92,8 +92,7 @@ impl ModelEntry {
             p == "*"
                 || p == std::env::consts::OS
                 || *p == current
-                || (p == "macos-aarch64"
-                    && cfg!(all(target_os = "macos", target_arch = "aarch64")))
+                || (p == "macos-aarch64" && cfg!(all(target_os = "macos", target_arch = "aarch64")))
         })
     }
 }
@@ -237,9 +236,9 @@ pub async fn download_model(entry: &ModelEntry, dest_dir: &Path) -> VcResult<Pat
         } else if let Some(expected) = &entry.expected_blake3 {
             let actual = blake3_file(&final_path)?;
             if actual.eq_ignore_ascii_case(expected)
-                || actual.trim_start_matches("blake3:").eq_ignore_ascii_case(
-                    expected.trim_start_matches("blake3:"),
-                )
+                || actual
+                    .trim_start_matches("blake3:")
+                    .eq_ignore_ascii_case(expected.trim_start_matches("blake3:"))
             {
                 return Ok(final_path);
             }

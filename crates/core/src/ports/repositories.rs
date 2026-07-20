@@ -100,7 +100,10 @@ pub struct RetryTransactionResult {
 
 #[async_trait]
 pub trait RetryTransactionRepository: Send + Sync {
-    async fn apply_retry(&self, request: RetryTransactionRequest) -> AppResult<RetryTransactionResult>;
+    async fn apply_retry(
+        &self,
+        request: RetryTransactionRequest,
+    ) -> AppResult<RetryTransactionResult>;
 }
 
 #[async_trait]

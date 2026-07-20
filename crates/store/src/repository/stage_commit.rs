@@ -14,7 +14,10 @@ impl StageCommitRepository for StoreHandle {
 
 #[async_trait]
 impl RetryTransactionRepository for StoreHandle {
-    async fn apply_retry(&self, request: RetryTransactionRequest) -> AppResult<RetryTransactionResult> {
+    async fn apply_retry(
+        &self,
+        request: RetryTransactionRequest,
+    ) -> AppResult<RetryTransactionResult> {
         StoreHandle::apply_retry(self, request)
             .await
             .map_err(ApplicationError::Adapter)

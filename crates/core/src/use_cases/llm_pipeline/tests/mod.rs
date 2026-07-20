@@ -1,6 +1,5 @@
 //! LLM pipeline unit tests (behavior preserved).
 
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -262,8 +261,7 @@ fn pipeline(content: &str) -> (LlmPipeline, Arc<Gateway>, Arc<Recorder>) {
 
 #[tokio::test]
 async fn correction_uses_domain_application_boundary_and_metadata_only_log() {
-    let (pipeline, gateway, recorder) =
-        pipeline(r#"{"items":[{"id":1,"text":"hello world!"}]}"#);
+    let (pipeline, gateway, recorder) = pipeline(r#"{"items":[{"id":1,"text":"hello world!"}]}"#);
     let out = pipeline
         .execute(&with_cue(transcript()), request(LlmStage::Correct))
         .await

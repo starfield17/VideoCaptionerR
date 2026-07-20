@@ -20,8 +20,13 @@ use crate::worker::resolve_helper_binary;
 fn locator_validation_rejects_empty_file() {
     assert!(ModelLocator::file("").validate().is_err());
     assert!(ModelLocator::directory("").validate().is_err());
-    assert!(ModelLocator::hugging_face("", "main", None).validate().is_err());
-    assert!(ModelLocator::file("/tmp").validate().is_ok() || ModelLocator::file("/tmp").validate().is_err());
+    assert!(ModelLocator::hugging_face("", "main", None)
+        .validate()
+        .is_err());
+    assert!(
+        ModelLocator::file("/tmp").validate().is_ok()
+            || ModelLocator::file("/tmp").validate().is_err()
+    );
 }
 
 #[test]
@@ -108,7 +113,9 @@ async fn digest_mismatch_is_rejected() {
     let spec = AsrRuntimeSpec {
         engine_family: "whisper-cpp".into(),
         model_id: "tiny".into(),
-        verified_digest: Some("blake3:0000000000000000000000000000000000000000000000000000000000000000".into()),
+        verified_digest: Some(
+            "blake3:0000000000000000000000000000000000000000000000000000000000000000".into(),
+        ),
         locator: ModelLocator::file(model.to_string_lossy()),
         device: "cpu".into(),
         compute_type: "default".into(),

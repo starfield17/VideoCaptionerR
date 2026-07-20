@@ -224,9 +224,7 @@ fn work_unit_auto_retries_twice_then_stops() {
 fn work_unit_deterministic_errors_are_not_auto_retried() {
     let mut unit = WorkUnit::new(id(), id(), StageKind::Asr, "chunk", 0, "pcm-hash").unwrap();
     unit.lease_for("owner", 0, 10).unwrap();
-    assert!(!unit
-        .fail_with_auto_retry("WORKER_PROTOCOL_ERROR")
-        .unwrap());
+    assert!(!unit.fail_with_auto_retry("WORKER_PROTOCOL_ERROR").unwrap());
     assert_eq!(unit.status(), WorkUnitStatus::Failed);
 }
 

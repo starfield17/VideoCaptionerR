@@ -57,7 +57,10 @@ pub(crate) fn split_ranges_for_formatted(
     Ok(ranges)
 }
 
-pub(crate) fn boundary_index(words: &[videocaptionerr_domain::Word], chars: usize) -> Result<usize, String> {
+pub(crate) fn boundary_index(
+    words: &[videocaptionerr_domain::Word],
+    chars: usize,
+) -> Result<usize, String> {
     for end in 1..words.len() {
         let text = videocaptionerr_domain::join_words(
             &words[..end]

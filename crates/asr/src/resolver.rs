@@ -9,9 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use videocaptionerr_contracts::error::{ErrorCode, VcError};
 use videocaptionerr_core::application_error::{AppResult, ApplicationError};
-use videocaptionerr_core::ports::{
-    AsrRuntime, AsrRuntimeResolver, AsrRuntimeSpec, ModelLocator,
-};
+use videocaptionerr_core::ports::{AsrRuntime, AsrRuntimeResolver, AsrRuntimeSpec, ModelLocator};
 
 use crate::application::WorkerAsrRuntime;
 use crate::python_env::{ensure_managed_env, EngineFamily, ManagedEnvConfig};
@@ -43,11 +41,7 @@ impl FamilyAsrRuntimeResolver {
 
     pub fn with_default_paths(home: &Path) -> Self {
         let runtimes = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../python/runtimes");
-        Self::new(
-            resolve_helper_binary(),
-            runtimes,
-            home.join("envs"),
-        )
+        Self::new(resolve_helper_binary(), runtimes, home.join("envs"))
     }
 
     pub fn with_uv_path(mut self, uv: impl Into<PathBuf>) -> Self {
@@ -72,10 +66,7 @@ impl FamilyAsrRuntimeResolver {
         }
     }
 
-    fn validate_locator_for_family(
-        family: EngineFamily,
-        locator: &ModelLocator,
-    ) -> AppResult<()> {
+    fn validate_locator_for_family(family: EngineFamily, locator: &ModelLocator) -> AppResult<()> {
         match (family, locator) {
             (EngineFamily::Fake, _) => Ok(()),
             (EngineFamily::WhisperCpp, ModelLocator::File { path }) => {

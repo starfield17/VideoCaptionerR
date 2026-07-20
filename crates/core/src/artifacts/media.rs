@@ -82,9 +82,7 @@ impl ExtractManifest {
                 self.schema_version
             ));
         }
-        if self.wav_path.is_empty()
-            || self.wav_content_hash.is_empty()
-            || self.pcm_hash.is_empty()
+        if self.wav_path.is_empty() || self.wav_content_hash.is_empty() || self.pcm_hash.is_empty()
         {
             return Err("extract manifest audio identity is incomplete".into());
         }

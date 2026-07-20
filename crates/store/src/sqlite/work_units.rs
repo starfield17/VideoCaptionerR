@@ -305,10 +305,7 @@ impl SqliteStore {
         Ok(retried)
     }
 
-    pub(crate) fn list_work_units_for_job(
-        &self,
-        job_id: &str,
-    ) -> VcResult<Vec<(String, u64)>> {
+    pub(crate) fn list_work_units_for_job(&self, job_id: &str) -> VcResult<Vec<(String, u64)>> {
         let mut statement = self
             .conn
             .prepare(

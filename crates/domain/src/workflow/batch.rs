@@ -217,7 +217,8 @@ impl Batch {
                 id: job_id.to_string(),
             });
         }
-        self.terminal_jobs.retain(|(candidate, _)| candidate != job_id);
+        self.terminal_jobs
+            .retain(|(candidate, _)| candidate != job_id);
         self.terminal_event_emitted = false;
         self.cancel_requested = false;
         if self.status.is_terminal() || self.status == BatchStatus::Running {

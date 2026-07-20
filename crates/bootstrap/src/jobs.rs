@@ -144,7 +144,7 @@ impl ApplicationRuntime {
             .map_err(ApplicationError::into_vc_error)?;
         Ok(RetryJobOutcome::Executed {
             plan: prepared.plan,
-            result,
+            result: Box::new(result),
         })
     }
 
@@ -185,7 +185,7 @@ pub enum RetryJobOutcome {
     DryRun(RetryPlan),
     Executed {
         plan: RetryPlan,
-        result: RunBatchResponse,
+        result: Box<RunBatchResponse>,
     },
 }
 

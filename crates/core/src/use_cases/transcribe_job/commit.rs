@@ -172,9 +172,10 @@ pub(super) fn stage_is_pending(job: &Job, kind: StageKind) -> bool {
 }
 
 pub(super) fn stage_is_done(job: &Job, kind: StageKind) -> bool {
-    job.stages().iter().find(|stage| stage.kind == kind).is_some_and(
-        |stage| matches!(stage.status, StageStatus::Done | StageStatus::DoneDegraded),
-    )
+    job.stages()
+        .iter()
+        .find(|stage| stage.kind == kind)
+        .is_some_and(|stage| matches!(stage.status, StageStatus::Done | StageStatus::DoneDegraded))
 }
 
 pub(super) fn stage_artifact(job: &Job, kind: StageKind) -> AppResult<ArtifactRef> {

@@ -124,8 +124,7 @@ async fn python_fake_worker_supports_heartbeat_and_control_cancel() {
         word_timestamps: true,
         ..Default::default()
     };
-    let task =
-        tokio::spawn(async move { client.transcribe(&wav, &opts, sink, Some(1000)).await });
+    let task = tokio::spawn(async move { client.transcribe(&wav, &opts, sink, Some(1000)).await });
     tokio::time::sleep(Duration::from_millis(100)).await;
     control.ping().await.unwrap();
     control.cancel_current().await.unwrap();

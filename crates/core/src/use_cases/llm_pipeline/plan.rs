@@ -1,16 +1,13 @@
 //! Plan construction.
+use super::packing::estimate_batch_tokens;
 use super::types::*;
-use super::packing::{estimate_batch_tokens, pack_batches};
-use crate::ports::{LlmStage, StructuredOutput};
+use crate::ports::StructuredOutput;
 
 pub(crate) fn empty_plan(request: &LlmPipelineRequest) -> LlmPlan {
     LlmPlan {
         schema_version: super::durable::LLM_PLAN_SCHEMA_VERSION,
         plan_id: String::new(),
-        job_id: request
-            .durable
-            .as_ref()
-            .map(|d| d.job_id.to_string()),
+        job_id: request.durable.as_ref().map(|d| d.job_id.to_string()),
         stage: request.stage,
         input_artifact_id: request
             .durable
@@ -89,10 +86,7 @@ pub(crate) fn make_plan(
             )
             .to_hex()
         ),
-        job_id: request
-            .durable
-            .as_ref()
-            .map(|d| d.job_id.to_string()),
+        job_id: request.durable.as_ref().map(|d| d.job_id.to_string()),
         stage: request.stage,
         input_artifact_id: request
             .durable

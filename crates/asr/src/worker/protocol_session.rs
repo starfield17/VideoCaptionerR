@@ -130,9 +130,8 @@ impl WorkerProtocolSession {
             match self.active_request_id {
                 Some(active) if active == request_id => {
                     if self.active_request_terminal {
-                        return self.fail(format!(
-                            "message after terminal for request {request_id}"
-                        ));
+                        return self
+                            .fail(format!("message after terminal for request {request_id}"));
                     }
                 }
                 Some(active) => {
@@ -156,10 +155,7 @@ impl WorkerProtocolSession {
                 | ProtocolMessageType::Error
                 | ProtocolMessageType::Cancelled
         ) {
-            return self.fail(format!(
-                "{} message requires request_id",
-                typed.as_str()
-            ));
+            return self.fail(format!("{} message requires request_id", typed.as_str()));
         }
 
         if typed.is_terminal() {
@@ -277,12 +273,7 @@ mod unit_tests {
             .unwrap();
         session.begin_request(7).unwrap();
         let error = session
-            .accept_envelope(env(
-                "s1",
-                Some(8),
-                1,
-                ProtocolMessageType::Segment,
-            ))
+            .accept_envelope(env("s1", Some(8), 1, ProtocolMessageType::Segment))
             .unwrap_err();
         assert!(error.message.contains("while request 7 is active"));
 
@@ -297,7 +288,10 @@ mod unit_tests {
         let error = session
             .accept_envelope(env("s1", Some(7), 2, ProtocolMessageType::Result))
             .unwrap_err();
-        assert!(error.message.contains("duplicate terminal") || error.message.contains("after terminal"));
+        assert!(
+            error.message.contains("duplicate terminal")
+                || error.message.contains("after terminal")
+        );
     }
 
     #[test]

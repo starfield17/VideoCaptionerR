@@ -29,12 +29,12 @@ pub(crate) use crate::chunking::{
     apply_chunk_offset, chunk_cache_key, retain_core_words, ChunkPlan, ChunkPlanOptions,
 };
 pub(crate) use crate::ports::{
-    ArtifactSource, ArtifactStore, AsrSession, AsrTranscribeRequest,
-    AudioAnalysisRequest, CacheRepository, ChunkPlanCommit, ChunkPlanStore, Clock, EventPublisher,
-    ExpectedVersion, ExtractAudioRangeRequest, IdGenerator, JobRepository, LlmStage, MediaGateway,
-    OutboxEvent, PreparedArtifact, ProbeMediaRequest, PromptSnapshot, SnapshotRepository,
-    StageCommitRepository, StageCommitRequest, StructuredOutput, SubtitleExportRequest,
-    SubtitleGateway, Versioned, WorkUnitRepository,
+    ArtifactSource, ArtifactStore, AsrSession, AsrTranscribeRequest, AudioAnalysisRequest,
+    CacheRepository, ChunkPlanCommit, ChunkPlanStore, Clock, EventPublisher, ExpectedVersion,
+    ExtractAudioRangeRequest, IdGenerator, JobRepository, LlmStage, MediaGateway, OutboxEvent,
+    PreparedArtifact, ProbeMediaRequest, PromptSnapshot, SnapshotRepository, StageCommitRepository,
+    StageCommitRequest, StructuredOutput, SubtitleExportRequest, SubtitleGateway, Versioned,
+    WorkUnitRepository,
 };
 
 pub struct TranscribeJob {

@@ -283,12 +283,8 @@ impl WorkerClient {
         if let Some(p) = model_path {
             payload["model_path"] = serde_json::json!(p.to_string_lossy());
         }
-        self.send(
-            Some(req),
-            ProtocolMessageType::LoadModel,
-            Some(payload),
-        )
-        .await?;
+        self.send(Some(req), ProtocolMessageType::LoadModel, Some(payload))
+            .await?;
         let env = self.read_envelope_timeout(LOAD_TIMEOUT).await;
         self.session.end_request();
         let env = env?;
@@ -494,7 +490,10 @@ impl WorkerClient {
                 Some(other) => {
                     return Err(VcError::new(
                         ErrorCode::WorkerProtocolError,
-                        format!("unexpected helper event during transcribe: {}", other.as_str()),
+                        format!(
+                            "unexpected helper event during transcribe: {}",
+                            other.as_str()
+                        ),
                     ));
                 }
                 None => {

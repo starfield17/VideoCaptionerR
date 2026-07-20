@@ -24,7 +24,8 @@ pub use asr::{
 };
 pub use cache::{CacheGcResult, CacheRepository};
 pub use events::{
-    ApplicationEvent, EventPublisher, LiveEventSink, OutboxEvent, OutboxRepository, StoredOutboxEvent,
+    ApplicationEvent, EventPublisher, LiveEventSink, OutboxEvent, OutboxRepository,
+    StoredOutboxEvent,
 };
 pub use llm::{
     CapabilityProbeRecord, CapabilityProbeStore, LlmCapabilities, LlmGateway, LlmMessage,
@@ -35,9 +36,7 @@ pub use media::{
     AudioAnalysis, AudioAnalysisRequest, AudioExtraction, AudioRangeExtraction,
     ExtractAudioRangeRequest, ExtractAudioRequest, MediaGateway, ProbeMediaRequest, ProbedMedia,
 };
-pub use model::{
-    asr_fingerprint, validate_spec, AsrRuntimeResolver, AsrRuntimeSpec, ModelLocator,
-};
+pub use model::{asr_fingerprint, validate_spec, AsrRuntimeResolver, AsrRuntimeSpec, ModelLocator};
 pub use repositories::{
     BatchRepository, ExpectedVersion, JobRepository, RetryTransactionRepository,
     RetryTransactionRequest, RetryTransactionResult, SnapshotRepository, StageCommitRepository,

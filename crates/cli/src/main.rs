@@ -317,7 +317,10 @@ fn run(cli: Cli) -> Result<ExitCode, VcError> {
                     let terminal = match &outcome {
                         videocaptionerr_bootstrap::RetryJobOutcome::DryRun(_) => None,
                         videocaptionerr_bootstrap::RetryJobOutcome::Executed { result, .. } => {
-                            result.jobs.first().map(|job| format!("{:?}", job.job.status()))
+                            result
+                                .jobs
+                                .first()
+                                .map(|job| format!("{:?}", job.job.status()))
                         }
                     };
                     emit_or_print(
@@ -337,7 +340,11 @@ fn run(cli: Cli) -> Result<ExitCode, VcError> {
                         format!(
                             "job {}: {} from {} (reuse {:?}, invalidate {:?})",
                             plan.job_id,
-                            if plan.dry_run { "would retry" } else { "retried" },
+                            if plan.dry_run {
+                                "would retry"
+                            } else {
+                                "retried"
+                            },
                             plan.start_stage.as_str(),
                             plan.reused_artifacts,
                             plan.invalidated_stages,

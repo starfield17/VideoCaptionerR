@@ -13,7 +13,7 @@ use videocaptionerr_domain::JobId;
 use crate::application_error::{AppResult, ApplicationError};
 use crate::ports::{LlmStage, PromptSnapshot};
 
-use super::types::{LlmPlan, LlmPlanEntry, LlmPipelineRequest};
+use super::types::{LlmPipelineRequest, LlmPlan, LlmPlanEntry};
 
 pub const LLM_PLAN_SCHEMA_VERSION: u32 = 2;
 pub const PROMPT_ARTIFACT_SCHEMA_VERSION: u32 = 1;
@@ -280,7 +280,11 @@ pub fn load_batch_result(
     Ok(Some(result))
 }
 
-pub fn append_attempt(ctx: &LlmDurableContext, stage: LlmStage, record: &LlmAttemptRecord) -> AppResult<()> {
+pub fn append_attempt(
+    ctx: &LlmDurableContext,
+    stage: LlmStage,
+    record: &LlmAttemptRecord,
+) -> AppResult<()> {
     // Never write API keys or full response bodies.
     let path = attempts_log_path(&ctx.job_dir, stage);
     if let Some(parent) = path.parent() {
@@ -330,7 +334,10 @@ pub fn plan_hash(plan: &LlmPlan) -> String {
             })
         }).collect::<Vec<_>>(),
     });
-    format!("blake3:{}", blake3::hash(body.to_string().as_bytes()).to_hex())
+    format!(
+        "blake3:{}",
+        blake3::hash(body.to_string().as_bytes()).to_hex()
+    )
 }
 
 pub fn work_unit_input_hash(
@@ -349,7 +356,10 @@ pub fn work_unit_input_hash(
         "cue_revisions": cue_revisions,
         "transcript_revision": plan.transcript_revision,
     });
-    format!("blake3:{}", blake3::hash(body.to_string().as_bytes()).to_hex())
+    format!(
+        "blake3:{}",
+        blake3::hash(body.to_string().as_bytes()).to_hex()
+    )
 }
 
 /// Classify provider/transport errors for retry policy.

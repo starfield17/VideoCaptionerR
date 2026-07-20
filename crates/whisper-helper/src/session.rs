@@ -96,7 +96,11 @@ pub fn handle_line(state: &Arc<HelperState>, line: &str) -> anyhow::Result<bool>
 
 fn handle_hello(state: &HelperState, env: &ProtocolEnvelope) -> anyhow::Result<()> {
     let (engine_id, runtime_version, confidence) = if state.engine == "fake" {
-        ("fake-helper".into(), "fake".into(), Some("word_prob".into()))
+        (
+            "fake-helper".into(),
+            "fake".into(),
+            Some("word_prob".into()),
+        )
     } else {
         (
             "whisper-cpp".into(),
@@ -290,7 +294,11 @@ fn run_transcribe(
                 return Ok(());
             }
             Err(e) => {
-                state.emit_error(req_id, "ASR_FAILED", &format!("transcription failed: {e:#}"))?;
+                state.emit_error(
+                    req_id,
+                    "ASR_FAILED",
+                    &format!("transcription failed: {e:#}"),
+                )?;
                 return Ok(());
             }
         }

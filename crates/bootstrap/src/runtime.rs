@@ -124,8 +124,7 @@ impl ApplicationRuntime {
         );
         let recovery_report =
             crate::recovery::run_startup_recovery_sync(recovery, vec![paths.jobs_dir.clone()])?;
-        let runtimes_root =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../python/runtimes");
+        let runtimes_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../python/runtimes");
         let resolver: Arc<dyn AsrRuntimeResolver> = Arc::new(FamilyAsrRuntimeResolver::new(
             helper_path.clone(),
             runtimes_root,

@@ -72,7 +72,12 @@ impl ManagedPythonEnv {
 pub fn lock_hash_for_family(runtimes_root: &Path, family: EngineFamily) -> VcResult<String> {
     let dir = runtimes_root.join(family.as_str());
     let mut hasher = Hasher::new();
-    for name in ["uv.lock", "requirements.lock", "pyproject.toml", "requirements.txt"] {
+    for name in [
+        "uv.lock",
+        "requirements.lock",
+        "pyproject.toml",
+        "requirements.txt",
+    ] {
         let path = dir.join(name);
         if path.is_file() {
             hasher.update(name.as_bytes());
@@ -136,16 +141,12 @@ fn create_env(config: &ManagedEnvConfig, env: &ManagedPythonEnv) -> VcResult<()>
             format!("create env dir {}: {e}", env.root.display()),
         )
     })?;
-    let uv = config
-        .uv_path
-        .clone()
-        .or_else(find_uv)
-        .ok_or_else(|| {
-            VcError::new(
-                ErrorCode::RuntimeUnavailable,
-                "uv not found; install uv to provision managed ASR Python envs",
-            )
-        })?;
+    let uv = config.uv_path.clone().or_else(find_uv).ok_or_else(|| {
+        VcError::new(
+            ErrorCode::RuntimeUnavailable,
+            "uv not found; install uv to provision managed ASR Python envs",
+        )
+    })?;
     let family_dir = config.runtimes_root.join(config.family.as_str());
     let requirements = family_dir.join("requirements.lock");
     let requirements = if requirements.is_file() {

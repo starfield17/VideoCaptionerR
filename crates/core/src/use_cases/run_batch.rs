@@ -261,12 +261,12 @@ mod tests {
     use super::*;
     use crate::application_error::AppResult;
     use crate::ports::{
-        ArtifactCommit, ArtifactInput, ArtifactStore, AsrDescriptor, AsrRuntime, AsrRuntimeResolver,
-        AsrRuntimeSpec, AsrSession, AsrTranscribeRequest, AudioExtraction, EventPublisher,
-        ExpectedVersion, ExportedSubtitle, ExtractAudioRequest, IdGenerator, JobRepository,
-        MediaGateway, ModelLocator, NormalizedAsrResult, ProbeMediaRequest, ProbedMedia,
-        StageCommitRepository, StageCommitRequest, StageCommitResult, SubtitleExportRequest,
-        SubtitleGateway, Versioned,
+        ArtifactCommit, ArtifactInput, ArtifactStore, AsrDescriptor, AsrRuntime,
+        AsrRuntimeResolver, AsrRuntimeSpec, AsrSession, AsrTranscribeRequest, AudioExtraction,
+        EventPublisher, ExpectedVersion, ExportedSubtitle, ExtractAudioRequest, IdGenerator,
+        JobRepository, MediaGateway, ModelLocator, NormalizedAsrResult, ProbeMediaRequest,
+        ProbedMedia, StageCommitRepository, StageCommitRequest, StageCommitResult,
+        SubtitleExportRequest, SubtitleGateway, Versioned,
     };
 
     struct Ids;
@@ -613,10 +613,7 @@ mod tests {
 
     #[async_trait]
     impl AsrRuntimeResolver for Resolver {
-        async fn resolve(
-            &self,
-            _spec: &AsrRuntimeSpec,
-        ) -> AppResult<Box<dyn AsrRuntime>> {
+        async fn resolve(&self, _spec: &AsrRuntimeSpec) -> AppResult<Box<dyn AsrRuntime>> {
             Ok(Box::new(Runtime {
                 opens: self.0.opens.clone(),
                 closes: self.0.closes.clone(),
@@ -912,11 +909,7 @@ mod tests {
         // Reopen only job A for retry.
         let mut batch = first.batch;
         batch.prepare_retry(&commands[0].job_id).unwrap();
-        let mut job_a = jobs
-            .load_job(&commands[0].job_id)
-            .await
-            .unwrap()
-            .unwrap();
+        let mut job_a = jobs.load_job(&commands[0].job_id).await.unwrap().unwrap();
         // Full stage restart for this subset fixture: the in-memory Artifacts
         // adapter does not retain Probe/Extract manifests across jobs.
         job_a.prepare_retry(Some(StageKind::Probe)).unwrap();

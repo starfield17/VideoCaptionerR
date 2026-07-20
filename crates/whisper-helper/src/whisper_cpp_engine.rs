@@ -58,10 +58,8 @@ mod ffi {
             t1: *mut i64,
             prob: *mut c_float,
         );
-        pub fn vc_whisper_segment_text(
-            ctx: *mut vc_whisper_ctx,
-            i_segment: c_int,
-        ) -> *const c_char;
+        pub fn vc_whisper_segment_text(ctx: *mut vc_whisper_ctx, i_segment: c_int)
+            -> *const c_char;
         pub fn vc_whisper_segment_t0(ctx: *mut vc_whisper_ctx, i_segment: c_int) -> i64;
         pub fn vc_whisper_segment_t1(ctx: *mut vc_whisper_ctx, i_segment: c_int) -> i64;
     }
@@ -82,7 +80,7 @@ pub fn load(path: &Path) -> anyhow::Result<()> {
             }
             *LOADED.lock().unwrap() = Some(LoadedModel { ctx });
         }
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(whisper_cpp_linked))]
     {
@@ -101,7 +99,6 @@ pub fn unload() {
                 ffi::vc_whisper_free(loaded.ctx);
             }
         }
-        return;
     }
     #[cfg(not(whisper_cpp_linked))]
     {
@@ -135,7 +132,7 @@ pub fn transcribe(
     }
     #[cfg(whisper_cpp_linked)]
     {
-        return transcribe_real(audio, language, cancel);
+        transcribe_real(audio, language, cancel)
     }
     #[cfg(not(whisper_cpp_linked))]
     {

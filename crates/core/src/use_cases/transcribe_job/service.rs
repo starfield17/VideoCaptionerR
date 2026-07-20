@@ -235,8 +235,9 @@ impl TranscribeJob {
                     )
                     .await?;
                 } else if stage_is_done(&job, StageKind::Translate) {
-                    final_transcript =
-                        self.load_stage_transcript(&job, StageKind::Translate).await?;
+                    final_transcript = self
+                        .load_stage_transcript(&job, StageKind::Translate)
+                        .await?;
                 }
             } else {
                 if stage_is_pending(&job, StageKind::Correct) {
@@ -364,9 +365,7 @@ impl TranscribeJob {
                 selected_stream_index: stream_index,
                 producer: probed.artifact.producer_fingerprint.clone(),
             };
-            manifest
-                .validate()
-                .map_err(|message| ApplicationError::Invalid(message))?;
+            manifest.validate().map_err(ApplicationError::Invalid)?;
             let bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| {
                 ApplicationError::Adapter(VcError::new(
                     ErrorCode::ArtifactCommitFailed,
@@ -454,9 +453,7 @@ impl TranscribeJob {
                 duration_ms: probe.probe.duration_ms,
                 producer: extracted.artifact.producer_fingerprint.clone(),
             };
-            manifest
-                .validate()
-                .map_err(|message| ApplicationError::Invalid(message))?;
+            manifest.validate().map_err(ApplicationError::Invalid)?;
             let bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| {
                 ApplicationError::Adapter(VcError::new(
                     ErrorCode::ArtifactCommitFailed,
@@ -504,11 +501,7 @@ impl TranscribeJob {
         )))
     }
 
-    async fn load_stage_transcript(
-        &self,
-        job: &Job,
-        stage: StageKind,
-    ) -> AppResult<Transcript> {
+    async fn load_stage_transcript(&self, job: &Job, stage: StageKind) -> AppResult<Transcript> {
         let artifact = stage_artifact(job, stage)?;
         self.artifacts
             .load_transcript(&artifact)
@@ -530,7 +523,9 @@ fn map_corrupt(error: ApplicationError, message: &str) -> ApplicationError {
     if vc.code == ErrorCode::ArtifactCorrupt {
         ApplicationError::Adapter(vc)
     } else {
-        ApplicationError::Adapter(VcError::new(ErrorCode::ArtifactCorrupt, message).with_detail(vc.message))
+        ApplicationError::Adapter(
+            VcError::new(ErrorCode::ArtifactCorrupt, message).with_detail(vc.message),
+        )
     }
 }
 
@@ -552,10 +547,7 @@ fn current_source_stat(path: &Path) -> AppResult<SourceStatSnapshot> {
     })
 }
 
-fn validate_source_against_snapshot(
-    path: &Path,
-    snapshot: &JobExecutionSnapshot,
-) -> AppResult<()> {
+fn validate_source_against_snapshot(path: &Path, snapshot: &JobExecutionSnapshot) -> AppResult<()> {
     if path.to_string_lossy() != snapshot.canonical_source_path {
         return Err(ApplicationError::Adapter(VcError::new(
             ErrorCode::SourceChanged,

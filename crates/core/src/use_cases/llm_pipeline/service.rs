@@ -7,9 +7,7 @@ use videocaptionerr_contracts::error::{ErrorCode, VcError};
 use videocaptionerr_domain::{CueTextUpdate, LlmResultBinding, LlmTextField, Transcript};
 
 use crate::application_error::{AppResult, ApplicationError};
-use crate::constants::{
-    CORRECTION_SIMILARITY, CORRECTION_TRANSLATION_RETRIES, SPLIT_RETRIES,
-};
+use crate::constants::{CORRECTION_SIMILARITY, CORRECTION_TRANSLATION_RETRIES, SPLIT_RETRIES};
 use crate::ports::{
     IdGenerator, LlmGateway, LlmMessage, LlmRequest, LlmRequestMetadata, LlmRequestRecorder,
     LlmRole, LlmStage,
@@ -557,10 +555,7 @@ impl LlmPipeline {
         let mut plan = LlmPlan {
             schema_version: super::durable::LLM_PLAN_SCHEMA_VERSION,
             plan_id: self.ids.next_id().to_string(),
-            job_id: request
-                .durable
-                .as_ref()
-                .map(|d| d.job_id.to_string()),
+            job_id: request.durable.as_ref().map(|d| d.job_id.to_string()),
             stage: request.stage,
             input_artifact_id: request
                 .durable
@@ -780,7 +775,7 @@ impl LlmPipeline {
                             }
                             // Cancellation-aware backoff with jitter.
                             let base_ms = 200u64.saturating_mul(1u64 << transport_attempt.min(4));
-                            let jitter = (started % 50) as u64;
+                            let jitter = started % 50;
                             tokio::time::sleep(std::time::Duration::from_millis(base_ms + jitter))
                                 .await;
                             continue;

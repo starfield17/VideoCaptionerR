@@ -46,4 +46,3 @@ pub(crate) fn hash_request(request: &LlmPipelineRequest, messages: &[LlmMessage]
         .to_hex()
         .to_string()
 }
-
