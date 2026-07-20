@@ -79,18 +79,16 @@ impl RunBatch {
             })?;
         }
 
-        // Opening the session is deliberately outside the per-Job loop. The
-        // worker/model stays alive until the Batch reaches a terminal state.
-        let mut session = self.asr.open_session(batch.execution_profile()).await?;
         if let Err(error) = batch.start() {
-            let _ = session.close().await;
             return Err(ApplicationError::Domain(error));
         }
         let expected = batch.expected_version();
-        if let Err(error) = self.batches.save_batch(&mut batch, expected).await {
-            let _ = session.close().await;
-            return Err(error);
-        }
+        self.batches.save_batch(&mut batch, expected).await?;
+
+        // Opening the session is deliberately outside the per-Job loop. The
+        // worker/model stays alive until the Batch reaches a terminal state,
+        // and the Batch is already durable before this external side effect.
+        let mut session = self.asr.open_session(batch.execution_profile()).await?;
 
         let result = self
             .execute_with_session(batch, command.jobs, session.as_mut())
@@ -149,7 +147,10 @@ impl RunBatch {
         };
         let event = batch.finish(final_status)?;
         self.save_batch(&mut batch).await?;
-        self.events.publish(event).await?;
+        // Business state is committed above. Event delivery is deliberately
+        // non-fatal so a live publisher outage cannot report a committed Batch
+        // as failed. The production publisher writes the durable outbox.
+        let _ = self.events.publish(event).await;
 
         Ok(RunBatchResponse {
             batch: batch.value,
@@ -218,7 +219,8 @@ mod tests {
         ArtifactCommit, ArtifactInput, ArtifactStore, AsrDescriptor, AsrSession,
         AsrTranscribeRequest, AudioExtraction, EventPublisher, ExpectedVersion, ExportedSubtitle,
         ExtractAudioRequest, IdGenerator, JobRepository, MediaGateway, NormalizedAsrResult,
-        ProbeMediaRequest, ProbedMedia, SubtitleExportRequest, SubtitleGateway, Versioned,
+        ProbeMediaRequest, ProbedMedia, StageCommitRepository, StageCommitRequest,
+        StageCommitResult, SubtitleExportRequest, SubtitleGateway, Versioned,
     };
 
     struct Ids;
@@ -235,6 +237,40 @@ mod tests {
     impl EventPublisher for Events {
         async fn publish(&self, _event: videocaptionerr_domain::DomainEvent) -> AppResult<()> {
             Ok(())
+        }
+    }
+
+    struct FailingEvents;
+
+    #[async_trait]
+    impl EventPublisher for FailingEvents {
+        async fn publish(&self, _event: videocaptionerr_domain::DomainEvent) -> AppResult<()> {
+            Err(ApplicationError::Invalid(
+                "event publisher unavailable".into(),
+            ))
+        }
+    }
+
+    struct StageCommits;
+
+    #[async_trait]
+    impl StageCommitRepository for StageCommits {
+        async fn commit_stage(&self, request: StageCommitRequest) -> AppResult<StageCommitResult> {
+            Ok(StageCommitResult {
+                job: request.job.map(|(job, expected)| {
+                    Versioned::with_version(job.value, next_version(job.version, expected))
+                }),
+                work_unit: request.work_unit.map(|(unit, expected)| {
+                    Versioned::with_version(unit.value, next_version(unit.version, expected))
+                }),
+            })
+        }
+    }
+
+    fn next_version(current: u64, expected: ExpectedVersion) -> u64 {
+        match expected {
+            ExpectedVersion::New => 1,
+            ExpectedVersion::Exact(version) => current.max(version).saturating_add(1),
         }
     }
 
@@ -300,6 +336,17 @@ mod tests {
                 .last()
                 .cloned()
                 .map(|batch| Versioned::with_version(batch, 1)))
+        }
+
+        async fn list_batches(&self) -> AppResult<Vec<Versioned<Batch>>> {
+            Ok(self
+                .values
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .map(|batch| Versioned::with_version(batch, 1))
+                .collect())
         }
 
         async fn save_batch(
@@ -541,15 +588,23 @@ mod tests {
         (Batch::new(batch_id, ids, profile()).unwrap(), commands)
     }
 
-    fn use_case(jobs: Arc<Jobs>) -> Arc<TranscribeJob> {
+    fn use_case_with_events(
+        jobs: Arc<Jobs>,
+        events: Arc<dyn EventPublisher>,
+    ) -> Arc<TranscribeJob> {
         Arc::new(TranscribeJob::new(
             jobs,
             Arc::new(Media),
             Arc::new(Artifacts),
             Arc::new(Subtitles),
-            Arc::new(Events),
+            events,
             Arc::new(Ids),
+            Arc::new(StageCommits),
         ))
+    }
+
+    fn use_case(jobs: Arc<Jobs>) -> Arc<TranscribeJob> {
+        use_case_with_events(jobs, Arc::new(Events))
     }
 
     fn seed_persisted_state(
@@ -716,5 +771,39 @@ mod tests {
         assert_eq!(result.batch.status(), BatchStatus::Failed);
         assert_eq!(opens.load(Ordering::SeqCst), 1);
         assert_eq!(closes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn committed_batch_does_not_fail_when_event_publisher_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = Arc::new(Jobs {
+            values: Mutex::new(HashMap::new()),
+        });
+        let (batch, commands) = make_batch(dir.path(), 1);
+        let batches = Arc::new(Batches {
+            values: Mutex::new(Vec::new()),
+        });
+        seed_persisted_state(&jobs, &batches, &batch, &commands);
+        let runner = RunBatch::new(
+            batches,
+            jobs.clone(),
+            Arc::new(Runtime {
+                opens: Arc::new(AtomicUsize::new(0)),
+                closes: Arc::new(AtomicUsize::new(0)),
+                fail_first: false,
+            }),
+            use_case_with_events(jobs, Arc::new(FailingEvents)),
+            Arc::new(FailingEvents),
+        );
+
+        let result = runner
+            .execute(RunBatchCommand {
+                batch,
+                jobs: commands,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.batch.status(), BatchStatus::Done);
     }
 }

@@ -4,6 +4,7 @@ pub mod chunk_plan;
 pub mod llm_pipeline;
 pub mod maintenance;
 pub mod run_batch;
+pub mod startup_recovery;
 pub mod transcribe_job;
 pub mod transcript_editor;
 
@@ -14,6 +15,7 @@ pub use maintenance::{
     RetryFailedWorkUnitsResponse, WorkUnitScheduler,
 };
 pub use run_batch::{RunBatch, RunBatchCommand, RunBatchFailure, RunBatchResponse};
+pub use startup_recovery::{RecoveryReport, StartupRecovery};
 pub use transcribe_job::{
     LlmProcessOptions, TranscribeJob, TranscribeJobCommand, TranscribeJobResponse,
 };

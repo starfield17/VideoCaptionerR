@@ -18,11 +18,12 @@ use crate::chunking::{
     apply_chunk_offset, chunk_cache_key, retain_core_words, ChunkPlan, ChunkPlanOptions,
 };
 use crate::ports::{
-    ArtifactCommit, ArtifactInput, ArtifactStore, AsrSession, AsrTranscribeRequest,
+    ArtifactInput, ArtifactSource, ArtifactStore, AsrSession, AsrTranscribeRequest,
     AudioAnalysisRequest, CacheRepository, ChunkPlanCommit, ChunkPlanStore, Clock, EventPublisher,
     ExpectedVersion, ExtractAudioRangeRequest, IdGenerator, JobRepository, LlmStage, MediaGateway,
-    ProbeMediaRequest, PromptSnapshot, StructuredOutput, SubtitleExportRequest, SubtitleGateway,
-    TranscriptCommit, Versioned, WorkUnitRepository,
+    OutboxEvent, PreparedArtifact, ProbeMediaRequest, PromptSnapshot, StageCommitRepository,
+    StageCommitRequest, StructuredOutput, SubtitleExportRequest, SubtitleGateway, Versioned,
+    WorkUnitRepository,
 };
 
 #[derive(Debug, Clone)]
@@ -88,6 +89,7 @@ pub struct TranscribeJob {
     subtitles: Arc<dyn SubtitleGateway>,
     events: Arc<dyn EventPublisher>,
     ids: Arc<dyn IdGenerator>,
+    stage_commits: Arc<dyn StageCommitRepository>,
     llm: Option<Arc<super::llm_pipeline::LlmPipeline>>,
     chunking: Option<ChunkingPorts>,
 }
@@ -107,6 +109,7 @@ impl TranscribeJob {
         subtitles: Arc<dyn SubtitleGateway>,
         events: Arc<dyn EventPublisher>,
         ids: Arc<dyn IdGenerator>,
+        stage_commits: Arc<dyn StageCommitRepository>,
     ) -> Self {
         Self {
             jobs,
@@ -115,6 +118,7 @@ impl TranscribeJob {
             subtitles,
             events,
             ids,
+            stage_commits,
             llm: None,
             chunking: None,
         }
@@ -228,9 +232,7 @@ impl TranscribeJob {
                 })?
                 .stream_index;
             if probe_pending {
-                let probe_artifact = self.commit_input(&command.job_id, probed.artifact).await?;
-                job.complete_stage(StageKind::Probe, probe_artifact, false)?;
-                self.save_job(&mut job).await?;
+                self.commit_input_stage(&mut job, probed.artifact).await?;
             }
 
             let extract_pending = stage_is_pending(&job, StageKind::ExtractAudio);
@@ -248,11 +250,8 @@ impl TranscribeJob {
                 })
                 .await?;
             if extract_pending {
-                let extract_artifact = self
-                    .commit_input(&command.job_id, extracted.artifact)
+                self.commit_input_stage(&mut job, extracted.artifact)
                     .await?;
-                job.complete_stage(StageKind::ExtractAudio, extract_artifact, false)?;
-                self.save_job(&mut job).await?;
             }
 
             let asr_pending = stage_is_pending(&job, StageKind::Asr);
@@ -278,20 +277,15 @@ impl TranscribeJob {
                     )
                     .await?;
                 transcript.validate()?;
-                let asr_artifact = self
-                    .artifacts
-                    .commit_transcript(TranscriptCommit {
-                        job_id: command.job_id.clone(),
-                        stage: StageKind::Asr,
-                        artifact_id: self.ids.next_id(),
-                        path: command.job_dir.join("01_asr.json"),
-                        transcript: transcript.clone(),
-                        producer_fingerprint: session.descriptor().fingerprint.clone(),
-                        work_unit_id: None,
-                    })
-                    .await?;
-                job.complete_stage(StageKind::Asr, asr_artifact, false)?;
-                self.save_job(&mut job).await?;
+                self.commit_transcript_stage(
+                    &mut job,
+                    StageKind::Asr,
+                    command.job_dir.join("01_asr.json"),
+                    transcript.clone(),
+                    session.descriptor().fingerprint.clone(),
+                    false,
+                )
+                .await?;
                 transcript
             } else {
                 let artifact = stage_artifact(&job, StageKind::Asr)?;
@@ -320,24 +314,19 @@ impl TranscribeJob {
                     degraded = !result.degraded_cue_ids.is_empty();
                     transcript = result.transcript;
                 }
-                let artifact = self
-                    .artifacts
-                    .commit_transcript(TranscriptCommit {
-                        job_id: command.job_id.clone(),
-                        stage: StageKind::Split,
-                        artifact_id: self.ids.next_id(),
-                        path: command.job_dir.join("02_split.json"),
-                        transcript: transcript.clone(),
-                        producer_fingerprint: if command.llm.is_some() {
-                            "llm-split".into()
-                        } else {
-                            "domain-rule-split".into()
-                        },
-                        work_unit_id: None,
-                    })
-                    .await?;
-                job.complete_stage(StageKind::Split, artifact, degraded)?;
-                self.save_job(&mut job).await?;
+                self.commit_transcript_stage(
+                    &mut job,
+                    StageKind::Split,
+                    command.job_dir.join("02_split.json"),
+                    transcript.clone(),
+                    if command.llm.is_some() {
+                        "llm-split".into()
+                    } else {
+                        "domain-rule-split".into()
+                    },
+                    degraded,
+                )
+                .await?;
                 transcript
             } else {
                 let artifact = stage_artifact(&job, StageKind::Split)?;
@@ -360,20 +349,15 @@ impl TranscribeJob {
                         .await?;
                     let degraded = !corrected.degraded_cue_ids.is_empty();
                     final_transcript = corrected.transcript;
-                    let artifact = self
-                        .artifacts
-                        .commit_transcript(TranscriptCommit {
-                            job_id: command.job_id.clone(),
-                            stage: StageKind::Correct,
-                            artifact_id: self.ids.next_id(),
-                            path: command.job_dir.join("03_correct.json"),
-                            transcript: final_transcript.clone(),
-                            producer_fingerprint: "llm-correction".into(),
-                            work_unit_id: None,
-                        })
-                        .await?;
-                    job.complete_stage(StageKind::Correct, artifact, degraded)?;
-                    self.save_job(&mut job).await?;
+                    self.commit_transcript_stage(
+                        &mut job,
+                        StageKind::Correct,
+                        command.job_dir.join("03_correct.json"),
+                        final_transcript.clone(),
+                        "llm-correction".into(),
+                        degraded,
+                    )
+                    .await?;
                 } else {
                     let artifact = stage_artifact(&job, StageKind::Correct)?;
                     final_transcript = self.artifacts.load_transcript(&artifact).await?;
@@ -387,20 +371,15 @@ impl TranscribeJob {
                         .await?;
                     let degraded = !translated.degraded_cue_ids.is_empty();
                     final_transcript = translated.transcript;
-                    let artifact = self
-                        .artifacts
-                        .commit_transcript(TranscriptCommit {
-                            job_id: command.job_id.clone(),
-                            stage: StageKind::Translate,
-                            artifact_id: self.ids.next_id(),
-                            path: command.job_dir.join("04_translate.json"),
-                            transcript: final_transcript.clone(),
-                            producer_fingerprint: "llm-translation".into(),
-                            work_unit_id: None,
-                        })
-                        .await?;
-                    job.complete_stage(StageKind::Translate, artifact, degraded)?;
-                    self.save_job(&mut job).await?;
+                    self.commit_transcript_stage(
+                        &mut job,
+                        StageKind::Translate,
+                        command.job_dir.join("04_translate.json"),
+                        final_transcript.clone(),
+                        "llm-translation".into(),
+                        degraded,
+                    )
+                    .await?;
                 } else {
                     let artifact = stage_artifact(&job, StageKind::Translate)?;
                     final_transcript = self.artifacts.load_transcript(&artifact).await?;
@@ -408,14 +387,14 @@ impl TranscribeJob {
             } else {
                 if stage_is_pending(&job, StageKind::Correct) {
                     current_stage = Some(StageKind::Correct);
-                    job.skip_stage(StageKind::Correct)?;
+                    self.commit_skip_stage(&mut job, StageKind::Correct).await?;
                 }
                 if stage_is_pending(&job, StageKind::Translate) {
                     current_stage = Some(StageKind::Translate);
-                    job.skip_stage(StageKind::Translate)?;
+                    self.commit_skip_stage(&mut job, StageKind::Translate)
+                        .await?;
                 }
             }
-            self.save_job(&mut job).await?;
 
             let export_path = if stage_is_pending(&job, StageKind::Export) {
                 job.start_stage(StageKind::Export)?;
@@ -432,16 +411,9 @@ impl TranscribeJob {
                     schema_version: videocaptionerr_domain::SCHEMA_VERSION,
                     producer_fingerprint: "subtitle-writer".into(),
                 };
-                self.artifacts
-                    .commit(ArtifactCommit {
-                        job_id: command.job_id.clone(),
-                        artifact: export_ref.clone(),
-                        work_unit_id: None,
-                    })
+                self.commit_export_stage(&mut job, export_ref.clone())
                     .await?;
-                let path = exported.path;
-                job.complete_stage(StageKind::Export, export_ref, false)?;
-                path
+                exported.path
             } else {
                 let artifact = stage_artifact(&job, StageKind::Export)?;
                 self.artifacts.validate(&artifact).await?;
@@ -466,8 +438,16 @@ impl TranscribeJob {
             } else if !job.status().is_terminal() {
                 let _ = job.cancel();
             }
-            let _ = self.save_job(&mut job).await;
-            return Err(error);
+            let primary = error.into_vc_error();
+            match self.save_job(&mut job).await {
+                Ok(()) => return Err(ApplicationError::Adapter(primary)),
+                Err(state) => {
+                    return Err(ApplicationError::StatePersistence {
+                        primary: Box::new(primary),
+                        state: Box::new(state.into_vc_error()),
+                    });
+                }
+            }
         }
         result
     }
@@ -477,7 +457,11 @@ impl TranscribeJob {
         self.jobs.save_job(job, expected).await
     }
 
-    async fn commit_input(&self, job_id: &JobId, input: ArtifactInput) -> AppResult<ArtifactRef> {
+    async fn commit_input_stage(
+        &self,
+        job: &mut Versioned<Job>,
+        input: ArtifactInput,
+    ) -> AppResult<ArtifactRef> {
         let artifact = ArtifactRef {
             id: self.ids.next_id(),
             stage: input.stage,
@@ -486,14 +470,104 @@ impl TranscribeJob {
             schema_version: input.schema_version,
             producer_fingerprint: input.producer_fingerprint,
         };
-        self.artifacts
-            .commit(ArtifactCommit {
-                job_id: job_id.clone(),
-                artifact: artifact.clone(),
-                work_unit_id: None,
-            })
+        let prepared = PreparedArtifact {
+            job_id: job.id().clone(),
+            artifact: artifact.clone(),
+            source: ArtifactSource::ExistingFile {
+                path: PathBuf::from(&artifact.path),
+            },
+        };
+        let mut candidate = job.value.clone();
+        candidate.complete_stage(input.stage, artifact.clone(), false)?;
+        self.commit_atomic_job(job, candidate, Some(prepared))
             .await?;
         Ok(artifact)
+    }
+
+    async fn commit_transcript_stage(
+        &self,
+        job: &mut Versioned<Job>,
+        stage: StageKind,
+        path: PathBuf,
+        transcript: Transcript,
+        producer_fingerprint: String,
+        degraded: bool,
+    ) -> AppResult<ArtifactRef> {
+        let bytes = serde_json::to_vec_pretty(&transcript).map_err(|error| {
+            ApplicationError::Adapter(VcError::new(
+                ErrorCode::ArtifactCommitFailed,
+                format!("encode transcript artifact: {error}"),
+            ))
+        })?;
+        let artifact = ArtifactRef {
+            id: self.ids.next_id(),
+            stage,
+            path: path.to_string_lossy().into_owned(),
+            content_hash: blake3::hash(&bytes).to_hex().to_string(),
+            schema_version: videocaptionerr_domain::SCHEMA_VERSION,
+            producer_fingerprint: producer_fingerprint.clone(),
+        };
+        let prepared = PreparedArtifact {
+            job_id: job.id().clone(),
+            artifact: artifact.clone(),
+            source: ArtifactSource::Bytes { bytes },
+        };
+        let mut candidate = job.value.clone();
+        candidate.complete_stage(stage, artifact.clone(), degraded)?;
+        self.commit_atomic_job(job, candidate, Some(prepared))
+            .await?;
+        Ok(artifact)
+    }
+
+    async fn commit_export_stage(
+        &self,
+        job: &mut Versioned<Job>,
+        artifact: ArtifactRef,
+    ) -> AppResult<()> {
+        let prepared = PreparedArtifact {
+            job_id: job.id().clone(),
+            artifact: artifact.clone(),
+            source: ArtifactSource::ExistingFile {
+                path: PathBuf::from(&artifact.path),
+            },
+        };
+        let mut candidate = job.value.clone();
+        candidate.complete_stage(StageKind::Export, artifact, false)?;
+        self.commit_atomic_job(job, candidate, Some(prepared)).await
+    }
+
+    async fn commit_skip_stage(&self, job: &mut Versioned<Job>, stage: StageKind) -> AppResult<()> {
+        let mut candidate = job.value.clone();
+        candidate.skip_stage(stage)?;
+        self.commit_atomic_job(job, candidate, None).await
+    }
+
+    async fn commit_atomic_job(
+        &self,
+        job: &mut Versioned<Job>,
+        candidate: Job,
+        artifact: Option<PreparedArtifact>,
+    ) -> AppResult<()> {
+        let stage = artifact.as_ref().map(|value| value.artifact.stage);
+        let event = stage_event(
+            &candidate,
+            stage,
+            artifact.as_ref().map(|value| &value.artifact),
+        );
+        let request = StageCommitRequest {
+            job: Some((
+                Versioned::with_version(candidate.clone(), job.version),
+                ExpectedVersion::Exact(job.version),
+            )),
+            work_unit: None,
+            artifact,
+            event: Some(event),
+        };
+        let result = self.stage_commits.commit_stage(request).await?;
+        *job = result.job.ok_or_else(|| {
+            ApplicationError::Invalid("atomic stage commit did not return Job".into())
+        })?;
+        Ok(())
     }
 
     async fn transcribe_asr(
@@ -679,31 +753,63 @@ impl TranscribeJob {
                     ))
                 })?;
                 ports.cache.write(&key, &bytes).await?;
-                self.artifacts
-                    .commit_transcript(TranscriptCommit {
-                        job_id: command.job_id.clone(),
-                        stage: StageKind::Asr,
-                        artifact_id: self.ids.next_id(),
-                        path: command
-                            .job_dir
-                            .join("asr-chunks")
-                            .join(format!("chunk-{:04}.json", chunk.index)),
-                        transcript: raw.clone(),
-                        producer_fingerprint: session.descriptor().fingerprint.clone(),
-                        work_unit_id: Some(leased.id().clone()),
+                let artifact = ArtifactRef {
+                    id: self.ids.next_id(),
+                    stage: StageKind::Asr,
+                    path: command
+                        .job_dir
+                        .join("asr-chunks")
+                        .join(format!("chunk-{:04}.json", chunk.index))
+                        .to_string_lossy()
+                        .into_owned(),
+                    content_hash: blake3::hash(&bytes).to_hex().to_string(),
+                    schema_version: videocaptionerr_domain::SCHEMA_VERSION,
+                    producer_fingerprint: session.descriptor().fingerprint.clone(),
+                };
+                let prepared = PreparedArtifact {
+                    job_id: command.job_id.clone(),
+                    artifact: artifact.clone(),
+                    source: ArtifactSource::Bytes { bytes },
+                };
+                let mut completed = leased.clone();
+                completed.complete(artifact.clone())?;
+                let result = self
+                    .stage_commits
+                    .commit_stage(StageCommitRequest {
+                        job: None,
+                        work_unit: Some((completed, ExpectedVersion::Exact(leased.version))),
+                        artifact: Some(prepared),
+                        event: Some(work_unit_event(&leased.value, &artifact)),
                     })
                     .await?;
+                leased = result.work_unit.ok_or_else(|| {
+                    ApplicationError::Invalid(
+                        "atomic ASR WorkUnit commit did not return WorkUnit".into(),
+                    )
+                })?;
                 Ok(raw)
             }
             .await;
             match result {
                 Ok(raw) => append_chunk_words(&mut words, &mut language, &mut engine, raw, chunk)?,
                 Err(error) => {
-                    let vc_error = error.into_vc_error();
-                    let _ = leased.fail(vc_error.code.as_str());
-                    let expected = leased.expected_version();
-                    let _ = ports.work_units.save_work_unit(&mut leased, expected).await;
-                    return Err(ApplicationError::Adapter(vc_error));
+                    let primary = error.into_vc_error();
+                    let state_result = match leased.fail(primary.code.as_str()) {
+                        Ok(()) => {
+                            let expected = leased.expected_version();
+                            ports.work_units.save_work_unit(&mut leased, expected).await
+                        }
+                        Err(error) => Err(ApplicationError::Domain(error)),
+                    };
+                    match state_result {
+                        Ok(()) => return Err(ApplicationError::Adapter(primary)),
+                        Err(state) => {
+                            return Err(ApplicationError::StatePersistence {
+                                primary: Box::new(primary),
+                                state: Box::new(state.into_vc_error()),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -752,6 +858,41 @@ impl TranscribeJob {
             ))
         })?;
         self.artifacts.load_transcript(artifact).await
+    }
+}
+
+fn stage_event(job: &Job, stage: Option<StageKind>, artifact: Option<&ArtifactRef>) -> OutboxEvent {
+    let payload_json = serde_json::json!({
+        "job_id": job.id().to_string(),
+        "stage": stage.map(StageKind::as_str),
+        "status": job.status(),
+        "artifact_id": artifact.map(|value| value.id.to_string()),
+    })
+    .to_string();
+    OutboxEvent {
+        aggregate_type: "Job".into(),
+        aggregate_id: job.id().to_string(),
+        event_type: stage
+            .map(|value| format!("stage_{}_committed", value.as_str()))
+            .unwrap_or_else(|| "job_stage_updated".into()),
+        payload_json,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    }
+}
+
+fn work_unit_event(unit: &WorkUnit, artifact: &ArtifactRef) -> OutboxEvent {
+    OutboxEvent {
+        aggregate_type: "WorkUnit".into(),
+        aggregate_id: unit.id().to_string(),
+        event_type: "work_unit_completed".into(),
+        payload_json: serde_json::json!({
+            "work_unit_id": unit.id().to_string(),
+            "job_id": unit.job_id().to_string(),
+            "stage": unit.stage().as_str(),
+            "artifact_id": artifact.id.to_string(),
+        })
+        .to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
     }
 }
 
@@ -820,10 +961,12 @@ mod tests {
     use super::*;
     use crate::application_error::AppResult;
     use crate::ports::{
-        ArtifactStore, AsrDescriptor, AudioAnalysis, AudioExtraction, AudioRangeExtraction,
-        CacheGcResult, CacheRepository, ChunkPlanCommit, ChunkPlanStore, Clock, ExpectedVersion,
-        ExportedSubtitle, ExtractAudioRangeRequest, ExtractAudioRequest, NormalizedAsrResult,
-        ProbedMedia, SubtitleFormat, SubtitleLayout, Versioned, WorkUnitRepository,
+        ArtifactCommit, ArtifactStore, AsrDescriptor, AudioAnalysis, AudioExtraction,
+        AudioRangeExtraction, CacheGcResult, CacheRepository, ChunkPlanCommit, ChunkPlanStore,
+        Clock, ExpectedVersion, ExportedSubtitle, ExtractAudioRangeRequest, ExtractAudioRequest,
+        NormalizedAsrResult, ProbedMedia, StageCommitRepository, StageCommitRequest,
+        StageCommitResult, SubtitleFormat, SubtitleLayout, TranscriptCommit, Versioned,
+        WorkUnitRepository,
     };
 
     struct FakeIds;
@@ -845,6 +988,7 @@ mod tests {
 
     struct FakeJobs {
         saved: Mutex<Vec<Job>>,
+        fail_terminal_save: Arc<AtomicBool>,
     }
 
     #[async_trait]
@@ -864,6 +1008,12 @@ mod tests {
             job: &mut Versioned<Job>,
             _expected: ExpectedVersion,
         ) -> AppResult<()> {
+            if job.status().is_terminal() && self.fail_terminal_save.swap(false, Ordering::SeqCst) {
+                return Err(ApplicationError::Adapter(VcError::new(
+                    ErrorCode::Internal,
+                    "injected terminal Job save failure",
+                )));
+            }
             self.saved.lock().unwrap().push(job.value.clone());
             job.version = job.version.saturating_add(1).max(1);
             Ok(())
@@ -1005,6 +1155,60 @@ mod tests {
         committed: Mutex<Vec<ArtifactRef>>,
         transcripts: Mutex<HashMap<String, Transcript>>,
         fail_export_once: Option<Arc<AtomicBool>>,
+    }
+
+    struct FakeStageCommits {
+        artifacts: Arc<FakeArtifacts>,
+    }
+
+    fn next_version(current: u64, expected: ExpectedVersion) -> u64 {
+        match expected {
+            ExpectedVersion::New => 1,
+            ExpectedVersion::Exact(version) => current.max(version).saturating_add(1),
+        }
+    }
+
+    #[async_trait]
+    impl StageCommitRepository for FakeStageCommits {
+        async fn commit_stage(&self, request: StageCommitRequest) -> AppResult<StageCommitResult> {
+            if let Some(prepared) = request.artifact {
+                if prepared.artifact.stage == StageKind::Export
+                    && self
+                        .artifacts
+                        .fail_export_once
+                        .as_ref()
+                        .is_some_and(|flag| flag.swap(false, Ordering::SeqCst))
+                {
+                    return Err(ApplicationError::Adapter(VcError::new(
+                        ErrorCode::ExportFailed,
+                        "injected export artifact commit failure",
+                    )));
+                }
+                if let ArtifactSource::Bytes { bytes } = prepared.source {
+                    if let Ok(transcript) = serde_json::from_slice::<Transcript>(&bytes) {
+                        self.artifacts
+                            .transcripts
+                            .lock()
+                            .unwrap()
+                            .insert(prepared.artifact.path.clone(), transcript);
+                    }
+                }
+                self.artifacts
+                    .committed
+                    .lock()
+                    .unwrap()
+                    .push(prepared.artifact);
+            }
+
+            Ok(StageCommitResult {
+                job: request.job.map(|(job, expected)| {
+                    Versioned::with_version(job.value, next_version(job.version, expected))
+                }),
+                work_unit: request.work_unit.map(|(unit, expected)| {
+                    Versioned::with_version(unit.value, next_version(unit.version, expected))
+                }),
+            })
+        }
     }
 
     #[async_trait]
@@ -1267,6 +1471,34 @@ mod tests {
         units: Arc<LongUnits>,
     }
 
+    struct LongStageCommits {
+        units: Arc<LongUnits>,
+    }
+
+    #[async_trait]
+    impl StageCommitRepository for LongStageCommits {
+        async fn commit_stage(&self, request: StageCommitRequest) -> AppResult<StageCommitResult> {
+            if let Some((unit, expected)) = &request.work_unit {
+                let mut values = self.units.values.lock().unwrap();
+                let existing = values
+                    .iter_mut()
+                    .find(|candidate| candidate.id() == unit.id())
+                    .ok_or_else(|| {
+                        ApplicationError::Invalid("long-audio WorkUnit missing".into())
+                    })?;
+                *existing = unit.value.clone();
+                return Ok(StageCommitResult {
+                    job: None,
+                    work_unit: Some(Versioned::with_version(
+                        unit.value.clone(),
+                        next_version(unit.version, *expected),
+                    )),
+                });
+            }
+            Ok(StageCommitResult::default())
+        }
+    }
+
     #[async_trait]
     impl ArtifactStore for LongArtifacts {
         async fn commit(&self, _commit: ArtifactCommit) -> AppResult<()> {
@@ -1420,6 +1652,7 @@ mod tests {
         TranscribeJob::new(
             Arc::new(FakeJobs {
                 saved: Mutex::new(Vec::new()),
+                fail_terminal_save: Arc::new(AtomicBool::new(false)),
             }),
             media,
             Arc::new(LongArtifacts {
@@ -1428,6 +1661,9 @@ mod tests {
             Arc::new(FakeSubtitles),
             Arc::new(FakeEvents),
             Arc::new(FakeIds),
+            Arc::new(LongStageCommits {
+                units: units.clone(),
+            }),
         )
         .with_chunking(plans, cache, units, Arc::new(LongClock))
     }
@@ -1505,6 +1741,7 @@ mod tests {
     fn make_use_case(fail_export_once: Option<Arc<AtomicBool>>) -> (TranscribeJob, Arc<FakeJobs>) {
         let jobs = Arc::new(FakeJobs {
             saved: Mutex::new(Vec::new()),
+            fail_terminal_save: Arc::new(AtomicBool::new(false)),
         });
         let artifacts = Arc::new(FakeArtifacts {
             committed: Mutex::new(Vec::new()),
@@ -1514,10 +1751,11 @@ mod tests {
         let use_case = TranscribeJob::new(
             jobs.clone(),
             Arc::new(FakeMedia),
-            artifacts,
+            artifacts.clone(),
             Arc::new(FakeSubtitles),
             Arc::new(FakeEvents),
             Arc::new(FakeIds),
+            Arc::new(FakeStageCommits { artifacts }),
         );
         (use_case, jobs)
     }
@@ -1686,6 +1924,21 @@ mod tests {
             jobs.saved.lock().unwrap().last().unwrap().status(),
             videocaptionerr_domain::JobStatus::Failed
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_state_save_failure_is_returned_with_the_primary_error() {
+        let dir = tempdir().unwrap();
+        let (use_case, jobs) = use_case();
+        jobs.fail_terminal_save.store(true, Ordering::SeqCst);
+        let mut asr = session(None, true);
+
+        let error = use_case
+            .execute(command(dir.path()), &mut asr)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ApplicationError::StatePersistence { .. }));
     }
 
     #[tokio::test]

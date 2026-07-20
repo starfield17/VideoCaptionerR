@@ -17,6 +17,7 @@ blake3 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

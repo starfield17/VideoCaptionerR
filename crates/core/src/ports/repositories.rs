@@ -5,6 +5,7 @@ use videocaptionerr_domain::{
 
 use crate::application_error::AppResult;
 use crate::execution_snapshot::JobExecutionSnapshot;
+use crate::ports::{OutboxEvent, PreparedArtifact};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Versioned<T> {
@@ -49,11 +50,34 @@ pub enum ExpectedVersion {
 #[async_trait]
 pub trait BatchRepository: Send + Sync {
     async fn load_batch(&self, id: &BatchId) -> AppResult<Option<Versioned<Batch>>>;
+    async fn list_batches(&self) -> AppResult<Vec<Versioned<Batch>>>;
     async fn save_batch(
         &self,
         batch: &mut Versioned<Batch>,
         expected: ExpectedVersion,
     ) -> AppResult<()>;
+}
+
+#[derive(Debug, Clone)]
+pub struct StageCommitRequest {
+    pub job: Option<(Versioned<Job>, ExpectedVersion)>,
+    pub work_unit: Option<(Versioned<WorkUnit>, ExpectedVersion)>,
+    pub artifact: Option<PreparedArtifact>,
+    pub event: Option<OutboxEvent>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct StageCommitResult {
+    pub job: Option<Versioned<Job>>,
+    pub work_unit: Option<Versioned<WorkUnit>>,
+}
+
+/// The application-owned consistency boundary for a successful stage or
+/// WorkUnit result. Implementations publish the file first, then atomically
+/// persist metadata, aggregate CAS updates, and the durable outbox event.
+#[async_trait]
+pub trait StageCommitRepository: Send + Sync {
+    async fn commit_stage(&self, request: StageCommitRequest) -> AppResult<StageCommitResult>;
 }
 
 #[async_trait]

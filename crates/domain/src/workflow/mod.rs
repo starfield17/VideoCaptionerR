@@ -215,6 +215,15 @@ impl Batch {
         })
     }
 
+    /// A running Batch has no active owner after process restart. Returning it
+    /// to Pending lets a later application command explicitly resume it.
+    pub fn recover_after_restart(&mut self) -> DomainResult<()> {
+        if self.status == BatchStatus::Running {
+            self.status = BatchStatus::Pending;
+        }
+        Ok(())
+    }
+
     pub fn terminal_event_emitted(&self) -> bool {
         self.terminal_event_emitted
     }
@@ -590,6 +599,33 @@ impl Job {
         Ok(())
     }
 
+    /// Convert an in-flight Job into a restartable state after process death.
+    /// Completed stages and their immutable artifact references are retained.
+    pub fn recover_after_restart(&mut self) -> DomainResult<()> {
+        if self.status != JobStatus::Running {
+            return Ok(());
+        }
+        for stage in &mut self.stages {
+            if matches!(stage.status, StageStatus::Running | StageStatus::Retrying) {
+                stage.status = StageStatus::Pending;
+            }
+        }
+        self.status = JobStatus::Pending;
+        Ok(())
+    }
+
+    /// Invalidate this stage and every dependent stage when its committed
+    /// artifact cannot be verified during startup recovery.
+    pub fn invalidate_stage_for_recovery(&mut self, kind: StageKind) -> DomainResult<()> {
+        let start_index = self.stage_index(kind)?;
+        for stage in self.stages.iter_mut().skip(start_index) {
+            stage.status = StageStatus::Pending;
+            stage.artifact = None;
+        }
+        self.status = JobStatus::Pending;
+        Ok(())
+    }
+
     pub fn cancel(&mut self) -> DomainResult<()> {
         if self.status.is_terminal() {
             return Err(DomainError::AlreadyTerminal { aggregate: "Job" });
@@ -847,6 +883,19 @@ impl WorkUnit {
         self.status = WorkUnitStatus::Pending;
         self.lease = None;
         self.attempt = self.attempt.saturating_add(1);
+        Ok(())
+    }
+
+    /// Clear a completed artifact reference when startup verification finds
+    /// that the backing file is missing or has a different hash.
+    pub fn invalidate_artifact_for_recovery(
+        &mut self,
+        error_code: impl Into<String>,
+    ) -> DomainResult<()> {
+        self.status = WorkUnitStatus::Pending;
+        self.lease = None;
+        self.artifact = None;
+        self.error_code = Some(error_code.into());
         Ok(())
     }
 

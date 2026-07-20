@@ -20,6 +20,29 @@ pub struct ArtifactInput {
     pub producer_fingerprint: String,
 }
 
+/// The file or bytes that an atomic stage commit must publish. Adapters may
+/// receive an already atomically-written file from an outbound gateway, or a
+/// serialized payload that they write through their own `.partial` path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactSource {
+    ExistingFile { path: PathBuf },
+    Bytes { bytes: Vec<u8> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedArtifact {
+    pub job_id: JobId,
+    pub artifact: ArtifactRef,
+    pub source: ArtifactSource,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArtifactRecoveryReport {
+    pub partial_files: Vec<PathBuf>,
+    pub orphan_files: Vec<PathBuf>,
+    pub corrupt_artifacts: Vec<String>,
+}
+
 pub struct TranscriptCommit {
     pub job_id: JobId,
     pub stage: StageKind,
@@ -47,6 +70,11 @@ pub trait ArtifactStore: Send + Sync {
         artifact: &ArtifactRef,
     ) -> AppResult<videocaptionerr_domain::Transcript>;
     async fn validate(&self, artifact: &ArtifactRef) -> AppResult<()>;
+}
+
+#[async_trait]
+pub trait ArtifactRecoveryStore: Send + Sync {
+    async fn recover(&self, roots: &[PathBuf]) -> AppResult<ArtifactRecoveryReport>;
 }
 
 #[async_trait]

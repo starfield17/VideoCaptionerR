@@ -6,6 +6,19 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use videocaptionerr_contracts::error::{ErrorCode, VcError, VcResult};
+use videocaptionerr_core::ports::{ArtifactSource, PreparedArtifact};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageCommitFaultPoint {
+    BeforeTempWrite,
+    AfterTempWrite,
+    AfterRename,
+    AfterArtifactInsert,
+    AfterWorkUnitUpdate,
+    AfterJobUpdate,
+    AfterOutboxInsert,
+    AfterDbCommit,
+}
 
 /// Compute BLAKE3 hex digest of bytes.
 pub fn blake3_bytes(data: &[u8]) -> String {
@@ -141,6 +154,196 @@ pub fn commit_file(tmp: &Path, final_path: &Path) -> VcResult<String> {
         )
     })?;
     Ok(hash)
+}
+
+/// Publish the file belonging to an atomic stage commit. The returned flag is
+/// true only when this call created or moved the final path, so a failed DB
+/// transaction can clean up its own publication without deleting a preexisting
+/// valid artifact.
+pub fn publish_prepared_artifact(prepared: &PreparedArtifact) -> VcResult<bool> {
+    publish_prepared_artifact_with_fault(prepared, None)
+}
+
+pub fn publish_prepared_artifact_with_fault(
+    prepared: &PreparedArtifact,
+    fault: Option<StageCommitFaultPoint>,
+) -> VcResult<bool> {
+    let final_path = Path::new(&prepared.artifact.path);
+    if let Some(parent) = final_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            VcError::new(
+                ErrorCode::ArtifactCommitFailed,
+                format!("create artifact parent {}: {error}", parent.display()),
+            )
+        })?;
+    }
+
+    match &prepared.source {
+        ArtifactSource::ExistingFile { path } => {
+            let source_hash = blake3_file(path)?;
+            if source_hash != prepared.artifact.content_hash {
+                return Err(VcError::new(
+                    ErrorCode::ArtifactCommitFailed,
+                    format!("prepared artifact hash mismatch: {}", path.display()),
+                ));
+            }
+            if path == final_path {
+                return Ok(false);
+            }
+            if final_path.exists() {
+                let final_hash = blake3_file(final_path)?;
+                if final_hash == prepared.artifact.content_hash {
+                    fs::remove_file(path).map_err(|error| {
+                        VcError::new(
+                            ErrorCode::ArtifactCommitFailed,
+                            format!(
+                                "remove duplicate prepared artifact {}: {error}",
+                                path.display()
+                            ),
+                        )
+                    })?;
+                    return Ok(false);
+                }
+                return Err(VcError::new(
+                    ErrorCode::ArtifactCommitFailed,
+                    format!(
+                        "refusing to replace non-matching artifact {}",
+                        final_path.display()
+                    ),
+                ));
+            }
+            fs::rename(path, final_path).map_err(|error| {
+                VcError::new(
+                    ErrorCode::ArtifactCommitFailed,
+                    format!(
+                        "publish {} -> {}: {error}",
+                        path.display(),
+                        final_path.display()
+                    ),
+                )
+            })?;
+            sync_parent(final_path);
+            fault_at(fault, StageCommitFaultPoint::AfterRename)?;
+            Ok(true)
+        }
+        ArtifactSource::Bytes { bytes } => {
+            let actual_hash = blake3_bytes(bytes);
+            if actual_hash != prepared.artifact.content_hash {
+                return Err(VcError::new(
+                    ErrorCode::ArtifactCommitFailed,
+                    format!(
+                        "serialized artifact hash mismatch: {}",
+                        final_path.display()
+                    ),
+                ));
+            }
+            if final_path.exists() {
+                let final_hash = blake3_file(final_path)?;
+                if final_hash == prepared.artifact.content_hash {
+                    return Ok(false);
+                }
+                return Err(VcError::new(
+                    ErrorCode::ArtifactCommitFailed,
+                    format!(
+                        "refusing to replace non-matching artifact {}",
+                        final_path.display()
+                    ),
+                ));
+            }
+
+            let partial = partial_path(final_path);
+            if partial.exists() {
+                return Err(VcError::new(
+                    ErrorCode::ArtifactCommitFailed,
+                    format!("partial artifact already exists: {}", partial.display()),
+                ));
+            }
+            fault_at(fault, StageCommitFaultPoint::BeforeTempWrite)?;
+            {
+                let mut file = File::create(&partial).map_err(|error| {
+                    VcError::new(
+                        ErrorCode::ArtifactCommitFailed,
+                        format!("create {}: {error}", partial.display()),
+                    )
+                })?;
+                file.write_all(bytes).map_err(|error| {
+                    VcError::new(
+                        ErrorCode::ArtifactCommitFailed,
+                        format!("write {}: {error}", partial.display()),
+                    )
+                })?;
+                file.sync_all().map_err(|error| {
+                    VcError::new(
+                        ErrorCode::ArtifactCommitFailed,
+                        format!("sync {}: {error}", partial.display()),
+                    )
+                })?;
+            }
+            fault_at(fault, StageCommitFaultPoint::AfterTempWrite)?;
+            if blake3_file(&partial)? != prepared.artifact.content_hash {
+                let _ = fs::remove_file(&partial);
+                return Err(VcError::new(
+                    ErrorCode::ArtifactCommitFailed,
+                    format!("reread hash mismatch: {}", partial.display()),
+                ));
+            }
+            if final_path.exists() {
+                let final_hash = blake3_file(final_path)?;
+                let _ = fs::remove_file(&partial);
+                if final_hash == prepared.artifact.content_hash {
+                    return Ok(false);
+                }
+                return Err(VcError::new(
+                    ErrorCode::ArtifactCommitFailed,
+                    format!(
+                        "refusing to replace non-matching artifact {}",
+                        final_path.display()
+                    ),
+                ));
+            }
+            fs::rename(&partial, final_path).map_err(|error| {
+                let _ = fs::remove_file(&partial);
+                VcError::new(
+                    ErrorCode::ArtifactCommitFailed,
+                    format!(
+                        "publish {} -> {}: {error}",
+                        partial.display(),
+                        final_path.display()
+                    ),
+                )
+            })?;
+            sync_parent(final_path);
+            fault_at(fault, StageCommitFaultPoint::AfterRename)?;
+            Ok(true)
+        }
+    }
+}
+
+fn fault_at(
+    configured: Option<StageCommitFaultPoint>,
+    point: StageCommitFaultPoint,
+) -> VcResult<()> {
+    if configured == Some(point) {
+        return Err(VcError::new(
+            ErrorCode::Internal,
+            format!("injected stage commit interruption at {point:?}"),
+        ));
+    }
+    Ok(())
+}
+
+pub fn partial_path(path: &Path) -> PathBuf {
+    let mut partial = path.as_os_str().to_os_string();
+    partial.push(".partial");
+    PathBuf::from(partial)
+}
+
+pub fn sync_parent(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(file) = File::open(parent) {
+            let _ = file.sync_all();
+        }
+    }
 }
 
 /// Remove uncommitted `.tmp` siblings under a directory (startup recovery).

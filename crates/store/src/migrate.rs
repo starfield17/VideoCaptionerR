@@ -233,6 +233,28 @@ CREATE INDEX IF NOT EXISTS idx_execution_snapshots_batch
   ON execution_snapshots(batch_id);
 "#,
     },
+    Migration {
+        version: 6,
+        name: "stage_commit_outbox",
+        sql: r#"
+CREATE TABLE IF NOT EXISTS outbox_events (
+  id TEXT PRIMARY KEY,
+  aggregate_type TEXT NOT NULL,
+  aggregate_id TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  event_type TEXT NOT NULL,
+  payload_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  delivered_at TEXT,
+  UNIQUE(aggregate_type, aggregate_id, sequence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_outbox_pending
+  ON outbox_events(delivered_at, created_at, id);
+CREATE INDEX IF NOT EXISTS idx_outbox_aggregate
+  ON outbox_events(aggregate_type, aggregate_id, sequence);
+"#,
+    },
 ];
 
 /// Apply pending migrations. Verifies checksums of already-applied versions.

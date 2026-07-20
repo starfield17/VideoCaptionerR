@@ -1107,6 +1107,7 @@ fn error_code(error: &ApplicationError) -> ErrorCode {
         ApplicationError::Adapter(error) => error.code,
         ApplicationError::Domain(_) => ErrorCode::InvalidArgument,
         ApplicationError::Cancelled => ErrorCode::Cancelled,
+        ApplicationError::StatePersistence { primary, .. } => primary.code,
         ApplicationError::Invalid(_) => ErrorCode::InvalidArgument,
     }
 }

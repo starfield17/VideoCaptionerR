@@ -6,7 +6,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use serde::Serialize;
 use ulid::Ulid;
 use videocaptionerr_asr::{resolve_helper_binary, WorkerAsrRuntime};
@@ -18,21 +17,22 @@ use videocaptionerr_core::execution_snapshot::{
     OutputPlanSnapshot, SourceStatSnapshot, JOB_EXECUTION_SNAPSHOT_SCHEMA_VERSION,
 };
 use videocaptionerr_core::ports::{
-    ArtifactStore, AsrRuntime, BatchRepository, CacheRepository, CapabilityProbeRecord,
-    CapabilityProbeStore, ChunkPlanStore, Clock, EventPublisher, ExpectedVersion, IdGenerator,
-    JobRepository, LlmStage, MediaGateway, PromptSnapshot, SnapshotRepository, StructuredOutput,
+    ArtifactRecoveryStore, ArtifactStore, AsrRuntime, BatchRepository, CacheRepository,
+    CapabilityProbeRecord, CapabilityProbeStore, ChunkPlanStore, Clock, EventPublisher,
+    ExpectedVersion, IdGenerator, JobRepository, LlmStage, MediaGateway, OutboxRepository,
+    PromptSnapshot, SnapshotRepository, StageCommitRepository, StructuredOutput,
     SubtitleExportRequest, SubtitleFormat, SubtitleGateway, SubtitleLayout, Versioned,
     WorkUnitRepository,
 };
 use videocaptionerr_core::use_cases::{
     CacheGc, EditTranscriptCommand, EditTranscriptResponse, LlmPipeline, LlmProcessOptions,
-    PersistChunkPlan, RetryFailedWorkUnits, RetryFailedWorkUnitsCommand,
-    RetryFailedWorkUnitsResponse, RunBatch, RunBatchCommand, RunBatchResponse, TranscribeJob,
-    TranscribeJobCommand, TranscriptEditor, WorkUnitScheduler,
+    PersistChunkPlan, RecoveryReport, RetryFailedWorkUnits, RetryFailedWorkUnitsCommand,
+    RetryFailedWorkUnitsResponse, RunBatch, RunBatchCommand, RunBatchResponse, StartupRecovery,
+    TranscribeJob, TranscribeJobCommand, TranscriptEditor, WorkUnitScheduler,
 };
 use videocaptionerr_domain::{
-    ArtifactRef, Batch, BatchExecutionProfile, BatchId, DomainEvent, Job, JobId, JobStatus,
-    LlmTextField, StageStatus, UlidStr,
+    ArtifactRef, Batch, BatchExecutionProfile, BatchId, Job, JobId, JobStatus, LlmTextField,
+    StageStatus, UlidStr,
 };
 use videocaptionerr_llm::application::ProviderLlmGateway;
 use videocaptionerr_llm::circuit::{CircuitBreaker, CircuitLlmProvider};
@@ -180,6 +180,7 @@ pub struct ApplicationRuntime {
     capability_probes: Arc<dyn CapabilityProbeStore>,
     transcript_editor: Arc<TranscriptEditor>,
     llm_defaults: Option<LlmProcessDefaults>,
+    recovery_report: RecoveryReport,
 }
 
 #[derive(Debug, Clone)]
@@ -245,17 +246,20 @@ impl ApplicationRuntime {
         let batches: Arc<dyn BatchRepository> = Arc::new(store.clone());
         let work_units: Arc<dyn WorkUnitRepository> = Arc::new(store.clone());
         let snapshots: Arc<dyn SnapshotRepository> = Arc::new(store.clone());
+        let outbox: Arc<dyn OutboxRepository> = Arc::new(store.clone());
         let capability_probes: Arc<dyn CapabilityProbeStore> = Arc::new(store.clone());
         let cached_capabilities = load_cached_capabilities(&store, &app_config)?;
-        let artifact_adapter = Arc::new(SqliteArtifactStore::new(store));
+        let artifact_adapter = Arc::new(SqliteArtifactStore::new(store.clone()));
         let artifacts: Arc<dyn ArtifactStore> = artifact_adapter.clone();
+        let artifact_recovery: Arc<dyn ArtifactRecoveryStore> = artifact_adapter.clone();
+        let stage_commits: Arc<dyn StageCommitRepository> = Arc::new(store.clone());
         let chunk_plan_store: Arc<dyn ChunkPlanStore> = artifact_adapter;
         let cache_store = CacheStore::new(&paths.cache_dir)?;
         let cache: Arc<dyn CacheRepository> = Arc::new(cache_store);
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let media: Arc<dyn MediaGateway> = Arc::new(FfmpegMediaGateway::default());
         let subtitles: Arc<dyn SubtitleGateway> = Arc::new(FileSubtitleGateway);
-        let events: Arc<dyn EventPublisher> = Arc::new(NoopEventPublisher);
+        let events: Arc<dyn EventPublisher> = Arc::new(store.clone());
         let ids: Arc<dyn IdGenerator> = Arc::new(UlidGenerator);
         let chunk_plans = Arc::new(PersistChunkPlan::new(chunk_plan_store.clone(), ids.clone()));
         let transcript_editor = Arc::new(TranscriptEditor::new(
@@ -270,6 +274,14 @@ impl ApplicationRuntime {
             ids.clone(),
             cached_capabilities,
         )?;
+        let recovery = StartupRecovery::new(
+            jobs.clone(),
+            batches.clone(),
+            work_units.clone(),
+            artifact_recovery,
+            outbox,
+        );
+        let recovery_report = run_startup_recovery_sync(recovery, vec![paths.jobs_dir.clone()])?;
         let asr: Arc<dyn AsrRuntime> = Arc::new(WorkerAsrRuntime::new(
             helper_path.clone(),
             config.engine.clone(),
@@ -282,6 +294,7 @@ impl ApplicationRuntime {
             subtitles,
             events.clone(),
             ids,
+            stage_commits,
         );
         if let Some(pipeline) = llm_pipeline {
             transcribe_service = transcribe_service.with_llm_pipeline(pipeline);
@@ -320,11 +333,16 @@ impl ApplicationRuntime {
             capability_probes,
             transcript_editor,
             llm_defaults,
+            recovery_report,
         })
     }
 
     pub fn paths(&self) -> &AppPaths {
         &self.paths
+    }
+
+    pub fn recovery_report(&self) -> &RecoveryReport {
+        &self.recovery_report
     }
 
     fn acquire_processing_lock(&self, owner: LockOwner) -> VcResult<ProcessingLease> {
@@ -821,6 +839,36 @@ impl ApplicationRuntime {
     }
 }
 
+fn run_startup_recovery_sync(
+    recovery: StartupRecovery,
+    roots: Vec<PathBuf>,
+) -> VcResult<RecoveryReport> {
+    let join = std::thread::Builder::new()
+        .name("videocaptionerr-startup-recovery".into())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| {
+                    VcError::new(
+                        ErrorCode::Internal,
+                        format!("create startup recovery runtime: {error}"),
+                    )
+                })?;
+            runtime
+                .block_on(recovery.execute(roots))
+                .map_err(ApplicationError::into_vc_error)
+        })
+        .map_err(|error| {
+            VcError::new(
+                ErrorCode::Internal,
+                format!("spawn startup recovery: {error}"),
+            )
+        })?;
+    join.join()
+        .map_err(|_| VcError::new(ErrorCode::Internal, "startup recovery thread panicked"))?
+}
+
 fn job_summary(job: &Job) -> JobSummary {
     JobSummary {
         id: job.id().to_string(),
@@ -1119,15 +1167,6 @@ impl Clock for SystemClock {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_millis() as u64)
             .unwrap_or(0)
-    }
-}
-
-struct NoopEventPublisher;
-
-#[async_trait]
-impl EventPublisher for NoopEventPublisher {
-    async fn publish(&self, _event: DomainEvent) -> videocaptionerr_core::AppResult<()> {
-        Ok(())
     }
 }
 

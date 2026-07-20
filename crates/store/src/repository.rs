@@ -12,11 +12,14 @@ use videocaptionerr_contracts::error::{ErrorCode, VcError};
 use videocaptionerr_core::application_error::{AppResult, ApplicationError};
 use videocaptionerr_core::execution_snapshot::JobExecutionSnapshot;
 use videocaptionerr_core::ports::{
-    ArtifactCommit, ArtifactStore, BatchRepository, CapabilityProbeRecord, CapabilityProbeStore,
-    ChunkPlanCommit, ChunkPlanStore, ExpectedVersion, JobRepository, SnapshotRepository,
-    TranscriptCommit, Versioned, WorkUnitRepository,
+    ArtifactCommit, ArtifactRecoveryStore, ArtifactStore, BatchRepository, CapabilityProbeRecord,
+    CapabilityProbeStore, ChunkPlanCommit, ChunkPlanStore, EventPublisher, ExpectedVersion,
+    JobRepository, OutboxEvent, OutboxRepository, SnapshotRepository, StageCommitRepository,
+    StageCommitRequest, StageCommitResult, TranscriptCommit, Versioned, WorkUnitRepository,
 };
-use videocaptionerr_domain::{ArtifactRef, Batch, BatchId, Job, JobId, StageKind, WorkUnit};
+use videocaptionerr_domain::{
+    ArtifactRef, Batch, BatchId, DomainEvent, Job, JobId, StageKind, WorkUnit,
+};
 
 use crate::artifact::{atomic_write_json, blake3_file};
 use crate::store::{LeaseRequest, WorkUnitRecord};
@@ -112,6 +115,25 @@ impl BatchRepository for StoreHandle {
         .transpose()
     }
 
+    async fn list_batches(&self) -> AppResult<Vec<Versioned<Batch>>> {
+        let rows = self
+            .list_batch_aggregates()
+            .await
+            .map_err(ApplicationError::Adapter)?;
+        rows.into_iter()
+            .map(|(body, version)| {
+                serde_json::from_str(&body)
+                    .map_err(|error| {
+                        ApplicationError::Adapter(VcError::new(
+                            ErrorCode::ArtifactCorrupt,
+                            format!("decode Batch aggregate: {error}"),
+                        ))
+                    })
+                    .map(|value| Versioned::with_version(value, version))
+            })
+            .collect()
+    }
+
     async fn save_batch(
         &self,
         batch: &mut Versioned<Batch>,
@@ -136,6 +158,76 @@ impl BatchRepository for StoreHandle {
         .map(|version| {
             batch.version = version;
         })
+    }
+}
+
+#[async_trait]
+impl StageCommitRepository for StoreHandle {
+    async fn commit_stage(&self, request: StageCommitRequest) -> AppResult<StageCommitResult> {
+        StoreHandle::commit_stage(self, request)
+            .await
+            .map_err(ApplicationError::Adapter)
+    }
+}
+
+#[async_trait]
+impl ArtifactRecoveryStore for SqliteArtifactStore {
+    async fn recover(
+        &self,
+        roots: &[std::path::PathBuf],
+    ) -> AppResult<videocaptionerr_core::ports::ArtifactRecoveryReport> {
+        self.store
+            .recover_artifacts(roots.to_vec())
+            .await
+            .map_err(ApplicationError::Adapter)
+    }
+}
+
+#[async_trait]
+impl OutboxRepository for StoreHandle {
+    async fn list_pending(
+        &self,
+        limit: u32,
+    ) -> AppResult<Vec<videocaptionerr_core::ports::StoredOutboxEvent>> {
+        self.list_pending_outbox(limit)
+            .await
+            .map_err(ApplicationError::Adapter)
+    }
+
+    async fn mark_delivered(
+        &self,
+        id: &videocaptionerr_domain::UlidStr,
+        delivered_at: &str,
+    ) -> AppResult<()> {
+        self.mark_outbox_delivered(id.as_str(), delivered_at)
+            .await
+            .map_err(ApplicationError::Adapter)
+    }
+}
+
+#[async_trait]
+impl EventPublisher for StoreHandle {
+    async fn publish(&self, event: DomainEvent) -> AppResult<()> {
+        let (aggregate_id, event_type) = match &event {
+            DomainEvent::BatchReachedTerminal { batch_id, .. } => {
+                (batch_id.to_string(), "batch_reached_terminal")
+            }
+        };
+        let payload_json = serde_json::to_string(&event).map_err(|error| {
+            ApplicationError::Adapter(VcError::new(
+                ErrorCode::Internal,
+                format!("encode domain event: {error}"),
+            ))
+        })?;
+        self.append_outbox(OutboxEvent {
+            aggregate_type: "Batch".into(),
+            aggregate_id,
+            event_type: event_type.into(),
+            payload_json,
+            created_at: Utc::now().to_rfc3339(),
+        })
+        .await
+        .map_err(ApplicationError::Adapter)
     }
 }
 
