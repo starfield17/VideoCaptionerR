@@ -246,6 +246,7 @@ fn verify_architecture() -> Result<()> {
         ],
     )?;
     verify_desktop_boundary()?;
+    verify_source_boundaries()?;
 
     let mut source_files = Vec::new();
     collect_files(Path::new("crates"), &mut source_files)?;
@@ -281,6 +282,80 @@ fn verify_architecture() -> Result<()> {
     }
 
     println!("architecture verification passed");
+    Ok(())
+}
+
+fn verify_source_boundaries() -> Result<()> {
+    let mut source_files = Vec::new();
+    collect_files(Path::new("crates"), &mut source_files)?;
+
+    for path in source_files {
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("read source file {}", path.display()))?;
+        let path_text = path.to_string_lossy();
+
+        if path_text.starts_with("crates/domain/src/")
+            && [
+                "std::fs",
+                "std::process",
+                "rusqlite",
+                "reqwest",
+                "sqlx",
+                "diesel",
+                "tokio::process",
+            ]
+            .iter()
+            .any(|needle| text.contains(needle))
+        {
+            bail!("domain imports infrastructure: {}", path.display());
+        }
+
+        if path_text.starts_with("crates/core/src/")
+            && [
+                "videocaptionerr_store",
+                "videocaptionerr_asr",
+                "videocaptionerr_llm",
+                "videocaptionerr_platform",
+            ]
+            .iter()
+            .any(|needle| text.contains(needle))
+        {
+            bail!("core imports a concrete adapter: {}", path.display());
+        }
+
+        let is_store_source = path_text.starts_with("crates/store/src/");
+        let is_sqlite_source = path_text.starts_with("crates/store/src/sqlite/");
+        let is_migration = path_text == "crates/store/src/migrate.rs";
+        let is_test_source = path_text.contains("/tests/");
+        if is_store_source
+            && !is_sqlite_source
+            && !is_migration
+            && !is_test_source
+            && ["SELECT ", "INSERT ", "UPDATE ", "DELETE "]
+                .iter()
+                .any(|needle| text.contains(needle))
+        {
+            bail!("SQL must live under store/sqlite: {}", path.display());
+        }
+    }
+
+    let store_root =
+        fs::read_to_string("crates/store/src/lib.rs").context("read store crate root")?;
+    if store_root
+        .lines()
+        .any(|line| line.trim_start().starts_with("pub use") && line.contains("SqliteStore"))
+    {
+        bail!("raw SqliteStore must not be exported from the store crate root");
+    }
+
+    let sqlite_module =
+        fs::read_to_string("crates/store/src/sqlite/mod.rs").context("read SQLite module")?;
+    if !sqlite_module.contains("pub(crate) struct SqliteStore")
+        || sqlite_module.contains("pub struct SqliteStore")
+    {
+        bail!("SqliteStore must remain an internal pub(crate) type");
+    }
+
     Ok(())
 }
 
