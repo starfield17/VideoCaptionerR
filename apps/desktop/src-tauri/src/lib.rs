@@ -101,6 +101,53 @@ async fn probe_provider(
         .map_err(error_text)
 }
 
+#[tauri::command]
+async fn cancel_job(state: State<'_, DesktopState>, job_id: String) -> Result<(), String> {
+    state
+        .runtime
+        .cancel_job(&job_id)
+        .await
+        .map_err(error_text)?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn retry_job(
+    state: State<'_, DesktopState>,
+    job_id: String,
+    from_stage: Option<String>,
+    dry_run: bool,
+) -> Result<String, String> {
+    let outcome = state
+        .runtime
+        .retry_job(&job_id, from_stage.as_deref(), dry_run)
+        .await
+        .map_err(error_text)?;
+    Ok(if outcome.dry_run() {
+        "dry_run".into()
+    } else {
+        "executed".into()
+    })
+}
+
+#[tauri::command]
+async fn pause_batch(state: State<'_, DesktopState>, batch_id: String) -> Result<(), String> {
+    state
+        .runtime
+        .pause_batch(&batch_id)
+        .await
+        .map_err(error_text)
+}
+
+#[tauri::command]
+async fn resume_batch(state: State<'_, DesktopState>, batch_id: String) -> Result<(), String> {
+    state
+        .runtime
+        .resume_batch(&batch_id)
+        .await
+        .map_err(error_text)
+}
+
 pub fn run() {
     let runtime = ApplicationRuntime::open(RuntimeConfig {
         home: None,
@@ -119,7 +166,11 @@ pub fn run() {
             process_files,
             load_transcript,
             edit_cue,
-            probe_provider
+            probe_provider,
+            cancel_job,
+            retry_job,
+            pause_batch,
+            resume_batch
         ])
         .run(tauri::generate_context!())
         .expect("run VideoCaptionerR desktop application");
