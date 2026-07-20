@@ -53,7 +53,10 @@ pub fn silero_capability(model_path: Option<&Path>) -> VadCapability {
     }
 }
 
-/// Run Silero ONNX VAD when the model is present. Without weights, fail honestly.
+/// Policy entry for VAD: capability checks and honest unavailable errors.
+///
+/// Core does not link ONNX. Bootstrap/platform adapters own inference
+/// (`vad_silero` with feature `silero-vad`).
 pub fn detect_silence_regions(
     pcm_s16le_mono_16k: &[i16],
     options: &VadOptions,
@@ -73,12 +76,10 @@ pub fn detect_silence_regions(
             format!("Silero VAD model not found: {}", model.display()),
         )));
     }
-    // Full ONNX inference is asset-gated. With a present model file we still
-    // require a linked runtime; until then report unavailable rather than fake.
     let _ = pcm_s16le_mono_16k;
     Err(ApplicationError::Adapter(VcError::new(
         ErrorCode::RuntimeUnavailable,
-        "Silero ONNX runtime not linked in this build; use engine-native VAD or energy cuts",
+        "ONNX Silero inference is provided by the outbound VAD adapter (feature silero-vad)",
     )))
 }
 

@@ -8,6 +8,11 @@ authors.workspace = true
 rust-version.workspace = true
 description = "Filesystem, ffmpeg, and subtitle I/O adapters for VideoCaptionerR"
 
+[features]
+default = []
+# Links ONNX Runtime for Silero VAD (optional; model file still required at runtime).
+silero-vad = ["dep:ort", "dep:ndarray"]
+
 [dependencies]
 videocaptionerr-contracts = { workspace = true }
 videocaptionerr-domain = { workspace = true }
@@ -20,6 +25,9 @@ blake3 = { workspace = true }
 fs2 = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
+# Pin pre-1.88 rustc: ort 2.0.0-rc.10+ requires rustc 1.88.
+ort = { version = "=2.0.0-rc.9", optional = true, default-features = true }
+ndarray = { version = "0.16", optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

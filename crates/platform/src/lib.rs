@@ -9,6 +9,7 @@ pub mod media_gateway;
 pub mod paths;
 pub mod subtitle_gateway;
 pub mod subtitle_io;
+pub mod vad_silero;
 
 pub use config::{AppConfig, LlmCapabilityOverride, LlmProviderConfig};
 pub use instance_lock::{InstanceLock, LockOwner};
