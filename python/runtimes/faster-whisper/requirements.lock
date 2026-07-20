@@ -1,0 +1,9 @@
+# Locked requirements for faster-whisper managed environment.
+# Generated for VideoCaptionerR v1; install only via managed uv.
+faster-whisper==1.1.1
+ctranslate2==4.5.0
+huggingface-hub>=0.23
+tokenizers>=0.19
+onnxruntime>=1.17
+av>=12.0
+numpy>=1.26

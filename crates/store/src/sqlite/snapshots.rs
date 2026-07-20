@@ -83,7 +83,12 @@ impl SqliteStore {
                     snapshot.job_dir,
                     snapshot.profile_revision.to_string(),
                     snapshot.asr.engine,
-                    snapshot.asr.model_locator,
+                    serde_json::to_string(&snapshot.asr.model_locator).map_err(|error| {
+                        VcError::new(
+                            ErrorCode::ArtifactCommitFailed,
+                            format!("encode model locator: {error}"),
+                        )
+                    })?,
                     snapshot.asr.model_id,
                     snapshot.asr.model_digest,
                     snapshot.asr.device,

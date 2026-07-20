@@ -88,7 +88,7 @@ fn snapshot(job_id: JobId, batch_id: videocaptionerr_domain::BatchId) -> JobExec
         profile_revision: Ulid::new().into(),
         asr: AsrExecutionSnapshot {
             engine: "fake".into(),
-            model_locator: "fake:default".into(),
+            model_locator: videocaptionerr_core::ModelLocator::file("fake:default"),
             model_id: Some("fake".into()),
             model_digest: None,
             device: "cpu".into(),

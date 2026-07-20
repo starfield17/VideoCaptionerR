@@ -89,3 +89,6 @@ Temporary Items
 ### macOS Patch ###
 # iCloud generated files
 *.icloud
+
+# Vendored whisper.cpp (clone pin v1.7.4 for --features whisper-cpp)
+crates/whisper-helper/vendor/

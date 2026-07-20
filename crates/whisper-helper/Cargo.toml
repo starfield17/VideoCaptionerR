@@ -8,10 +8,16 @@ authors.workspace = true
 rust-version.workspace = true
 description = "Isolated Rust whisper.cpp / fake ASR helper process"
 publish = false
+build = "build.rs"
 
 [[bin]]
 name = "videocaptionerr-whisper-helper"
 path = "src/main.rs"
+
+[features]
+default = []
+# Links whisper.cpp only into this helper binary (never the main process).
+whisper-cpp = ["dep:cmake", "dep:cc"]
 
 [dependencies]
 videocaptionerr-contracts = { workspace = true }
@@ -23,3 +29,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 ulid = { workspace = true }
 hound = "3.5"
+
+[build-dependencies]
+cmake = { version = "0.1", optional = true }
+cc = { version = "1", optional = true }

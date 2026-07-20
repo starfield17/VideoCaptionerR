@@ -1472,7 +1472,7 @@ async fn source_changed_is_reported_when_size_differs_from_snapshot() {
         profile_revision: cmd.profile_revision.clone(),
         asr: AsrExecutionSnapshot {
             engine: "fake".into(),
-            model_locator: "fake".into(),
+            model_locator: crate::ports::ModelLocator::file("fake"),
             model_id: None,
             model_digest: None,
             device: "cpu".into(),
@@ -1619,7 +1619,7 @@ async fn from_snapshot_rebuilds_command_without_profile_defaults() {
         profile_revision: Ulid::new().into(),
         asr: AsrExecutionSnapshot {
             engine: "whisper-cpp".into(),
-            model_locator: "/models/x.bin".into(),
+            model_locator: crate::ports::ModelLocator::file("/models/x.bin"),
             model_id: None,
             model_digest: None,
             device: "cpu".into(),

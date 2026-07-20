@@ -9,9 +9,9 @@ use tokio::sync::mpsc;
 use videocaptionerr_contracts::error::{ErrorCode, VcError};
 use videocaptionerr_core::application_error::{AppResult, ApplicationError};
 use videocaptionerr_core::ports::{
-    cancel_grace, ApplicationEvent, AsrCancelToken, AsrDescriptor as ApplicationAsrDescriptor,
-    AsrRuntime, AsrSession, AsrSessionControl, AsrTranscribeRequest, EventPublisher,
-    NormalizedAsrResult,
+    asr_fingerprint, cancel_grace, ApplicationEvent, AsrCancelToken,
+    AsrDescriptor as ApplicationAsrDescriptor, AsrRuntime, AsrRuntimeSpec, AsrSession,
+    AsrSessionControl, AsrTranscribeRequest, EventPublisher, ModelLocator, NormalizedAsrResult,
 };
 use videocaptionerr_domain::BatchExecutionProfile;
 
@@ -25,7 +25,7 @@ use crate::worker::{WorkerClient, WorkerControl};
 pub struct WorkerAsrRuntime {
     launch: WorkerLaunch,
     engine: String,
-    model_path: Option<PathBuf>,
+    spec: AsrRuntimeSpec,
 }
 
 #[derive(Debug, Clone)]
@@ -35,17 +35,17 @@ enum WorkerLaunch {
 }
 
 impl WorkerAsrRuntime {
-    pub fn new(
+    pub fn helper(
         helper_path: impl Into<PathBuf>,
         engine: impl Into<String>,
-        model_path: Option<PathBuf>,
+        spec: AsrRuntimeSpec,
     ) -> Self {
         Self {
             launch: WorkerLaunch::Helper {
                 path: helper_path.into(),
             },
             engine: engine.into(),
-            model_path,
+            spec,
         }
     }
 
@@ -53,7 +53,7 @@ impl WorkerAsrRuntime {
         python_path: impl Into<PathBuf>,
         worker_script: impl Into<PathBuf>,
         engine: impl Into<String>,
-        model_path: Option<PathBuf>,
+        spec: AsrRuntimeSpec,
     ) -> Self {
         Self {
             launch: WorkerLaunch::Python {
@@ -61,7 +61,54 @@ impl WorkerAsrRuntime {
                 script: worker_script.into(),
             },
             engine: engine.into(),
-            model_path,
+            spec,
+        }
+    }
+
+    /// Back-compat constructor used by older call sites / tests.
+    pub fn new(
+        helper_path: impl Into<PathBuf>,
+        engine: impl Into<String>,
+        model_path: Option<PathBuf>,
+    ) -> Self {
+        let engine = engine.into();
+        let locator = match model_path {
+            Some(p) if p.is_dir() => ModelLocator::directory(p.to_string_lossy()),
+            Some(p) => ModelLocator::file(p.to_string_lossy()),
+            None => ModelLocator::file(format!("{engine}:default")),
+        };
+        let model_id = locator.display();
+        Self::helper(
+            helper_path,
+            engine.clone(),
+            AsrRuntimeSpec {
+                engine_family: engine,
+                model_id,
+                verified_digest: None,
+                locator,
+                device: "cpu".into(),
+                compute_type: "default".into(),
+            },
+        )
+    }
+
+    fn model_load_path(&self) -> Option<PathBuf> {
+        match &self.spec.locator {
+            ModelLocator::File { path } | ModelLocator::Directory { path } => {
+                Some(PathBuf::from(path))
+            }
+            ModelLocator::HuggingFaceSnapshot {
+                repo_id,
+                revision,
+                path,
+            } => {
+                // Python engines accept HF repo ids; prefer explicit local path.
+                if let Some(local) = path {
+                    Some(PathBuf::from(local))
+                } else {
+                    Some(PathBuf::from(format!("{repo_id}@{revision}")))
+                }
+            }
         }
     }
 }
@@ -72,7 +119,7 @@ impl AsrRuntime for WorkerAsrRuntime {
         &self,
         profile: &BatchExecutionProfile,
     ) -> AppResult<Box<dyn AsrSession>> {
-        if profile.asr_engine != self.engine {
+        if profile.asr_engine != self.engine && profile.asr_engine != self.spec.engine_family {
             return Err(ApplicationError::Invalid(format!(
                 "ASR runtime engine {} does not match Batch engine {}",
                 self.engine, profile.asr_engine
@@ -85,8 +132,14 @@ impl AsrRuntime for WorkerAsrRuntime {
             }
         }
         .map_err(ApplicationError::Adapter)?;
+
+        // Pass device/compute through load payload via model path + options side channel.
         client
-            .load_model(self.model_path.as_deref())
+            .load_model_with_options(
+                self.model_load_path().as_deref(),
+                &self.spec.device,
+                &self.spec.compute_type,
+            )
             .await
             .map_err(ApplicationError::Adapter)?;
         let descriptor = client.descriptor().cloned().ok_or_else(|| {
@@ -102,20 +155,28 @@ impl AsrRuntime for WorkerAsrRuntime {
             )));
         }
         let mut application_descriptor = map_descriptor(&descriptor);
-        application_descriptor.fingerprint = format!(
-            "{}|{}|{}|{}|{}",
-            application_descriptor.engine_id,
-            application_descriptor.adapter_version,
-            application_descriptor.runtime_version,
-            profile.asr_model,
-            profile.device
+        let options_hash = blake3::hash(
+            format!(
+                "word_timestamps=true|device={}|compute={}",
+                self.spec.device, self.spec.compute_type
+            )
+            .as_bytes(),
+        )
+        .to_hex()
+        .to_string();
+        application_descriptor.fingerprint = asr_fingerprint(
+            &application_descriptor.engine_id,
+            &application_descriptor.adapter_version,
+            &application_descriptor.runtime_version,
+            &self.spec,
+            &options_hash,
         );
         let control: Arc<dyn AsrSessionControl> =
             Arc::new(WorkerControlAdapter(client.control()));
         Ok(Box::new(WorkerAsrSession {
             client,
             descriptor: application_descriptor,
-            device: profile.device.clone(),
+            device: self.spec.device.clone(),
             control,
         }))
     }
@@ -178,8 +239,6 @@ impl AsrSession for WorkerAsrSession {
             loop {
                 if token.is_requested() {
                     let _ = control.cancel_current().await;
-                    // Wait the cooperative grace window; hard kill is owned by
-                    // the session close/escalation path when the worker sticks.
                     tokio::time::sleep(cancel_grace()).await;
                     return;
                 }
@@ -204,8 +263,6 @@ impl AsrSession for WorkerAsrSession {
             .await;
         cancel_task.abort();
         let _ = collector.await;
-        // Map progress/language/segment/log into application events. Live
-        // delivery failures never rewrite committed business state.
         let collected: Vec<AsrEvent> = std::mem::take(&mut *buffered.lock().unwrap());
         for event in collected {
             let _ = events.publish_live(map_asr_event(event)).await;

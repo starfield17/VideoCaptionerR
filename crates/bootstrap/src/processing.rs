@@ -8,7 +8,8 @@ use videocaptionerr_core::execution_snapshot::{
     OutputPlanSnapshot, SourceStatSnapshot, JOB_EXECUTION_SNAPSHOT_SCHEMA_VERSION,
 };
 use videocaptionerr_core::ports::{
-    ExpectedVersion, SubtitleExportRequest, SubtitleFormat, SubtitleLayout, Versioned,
+    AsrRuntimeSpec, ExpectedVersion, ModelLocator, SubtitleExportRequest, SubtitleFormat,
+    SubtitleLayout, Versioned,
 };
 use videocaptionerr_core::use_cases::{
     LlmProcessOptions, RunBatchCommand, RunBatchResponse, TranscribeJobCommand,
@@ -103,28 +104,37 @@ impl ApplicationRuntime {
 
         let batch_id: BatchId = Ulid::new().into();
         let profile_revision: UlidStr = Ulid::new().into();
-        let model = self
-            .model_path
-            .as_ref()
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_else(|| format!("{}:default", self.engine));
-        let profile = BatchExecutionProfile {
-            asr_engine: self.engine.clone(),
-            asr_model: model.clone(),
-            device: "cpu".into(),
-            compute_type: "default".into(),
+        let locator = match self.model_path.as_ref() {
+            Some(path) if path.is_dir() => ModelLocator::directory(path.to_string_lossy()),
+            Some(path) => ModelLocator::file(path.to_string_lossy()),
+            None => ModelLocator::file(format!("{}:default", self.engine)),
         };
-
-        let mut planner = OutputPlanner::new(
-            "{stem}.{target_lang?}.{layout}.{format}",
-            ConflictPolicy::Rename,
-        );
+        let model_id = locator.display();
         let model_digest = self
             .model_path
             .as_deref()
             .filter(|path| path.is_file())
             .map(videocaptionerr_store::blake3_file)
             .transpose()?;
+        let asr_spec = AsrRuntimeSpec {
+            engine_family: self.engine.clone(),
+            model_id: model_id.clone(),
+            verified_digest: model_digest.clone(),
+            locator: locator.clone(),
+            device: "cpu".into(),
+            compute_type: "default".into(),
+        };
+        let profile = BatchExecutionProfile {
+            asr_engine: self.engine.clone(),
+            asr_model: model_id.clone(),
+            device: asr_spec.device.clone(),
+            compute_type: asr_spec.compute_type.clone(),
+        };
+
+        let mut planner = OutputPlanner::new(
+            "{stem}.{target_lang?}.{layout}.{format}",
+            ConflictPolicy::Rename,
+        );
         let mut job_ids = Vec::with_capacity(options.files.len());
         let mut commands = Vec::with_capacity(options.files.len());
         for file in options.files {
@@ -158,11 +168,11 @@ impl ApplicationRuntime {
                 profile_revision: profile_revision.clone(),
                 asr: AsrExecutionSnapshot {
                     engine: self.engine.clone(),
-                    model_locator: model.clone(),
-                    model_id: Some(model.clone()),
+                    model_locator: locator.clone(),
+                    model_id: Some(model_id.clone()),
                     model_digest: model_digest.clone(),
-                    device: profile.device.clone(),
-                    compute_type: profile.compute_type.clone(),
+                    device: asr_spec.device.clone(),
+                    compute_type: asr_spec.compute_type.clone(),
                 },
                 audio_stream: AudioStreamSelection::Auto,
                 source_language: options.language.clone(),
@@ -222,6 +232,7 @@ impl ApplicationRuntime {
             .execute(RunBatchCommand {
                 batch: persisted_batch.value,
                 jobs: commands,
+                asr_spec,
             })
             .await
             .map_err(ApplicationError::into_vc_error)

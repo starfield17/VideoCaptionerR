@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use videocaptionerr_asr::{resolve_helper_binary, WorkerAsrRuntime};
+use videocaptionerr_asr::{resolve_helper_binary, FamilyAsrRuntimeResolver};
 use videocaptionerr_contracts::error::{ErrorCode, VcError, VcResult};
 use videocaptionerr_core::ports::{
-    ArtifactRecoveryStore, ArtifactStore, AsrRuntime, BatchRepository, CacheRepository,
+    ArtifactRecoveryStore, ArtifactStore, AsrRuntimeResolver, BatchRepository, CacheRepository,
     CapabilityProbeStore, ChunkPlanStore, Clock, EventPublisher, IdGenerator, JobRepository,
     OutboxRepository, RetryTransactionRepository, SnapshotRepository, StageCommitRepository,
     SubtitleGateway, WorkUnitRepository,
@@ -62,13 +62,20 @@ impl ApplicationRuntime {
             let model_path = config.model_path.as_ref().ok_or_else(|| {
                 VcError::new(
                     ErrorCode::ModelNotFound,
-                    "no model selected; pass --model explicitly",
+                    "no model selected; pass --model explicitly (no silent default download)",
                 )
             })?;
-            if !model_path.is_file() {
+            // whisper-cpp requires a file; python engines accept file or directory.
+            if config.engine == "whisper-cpp" && !model_path.is_file() {
                 return Err(VcError::new(
                     ErrorCode::ModelNotFound,
                     format!("model file not found: {}", model_path.display()),
+                ));
+            }
+            if !model_path.exists() {
+                return Err(VcError::new(
+                    ErrorCode::ModelNotFound,
+                    format!("model path not found: {}", model_path.display()),
                 ));
             }
         }
@@ -117,10 +124,12 @@ impl ApplicationRuntime {
         );
         let recovery_report =
             crate::recovery::run_startup_recovery_sync(recovery, vec![paths.jobs_dir.clone()])?;
-        let asr: Arc<dyn AsrRuntime> = Arc::new(WorkerAsrRuntime::new(
+        let runtimes_root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../python/runtimes");
+        let resolver: Arc<dyn AsrRuntimeResolver> = Arc::new(FamilyAsrRuntimeResolver::new(
             helper_path.clone(),
-            config.engine.clone(),
-            config.model_path.clone(),
+            runtimes_root,
+            paths.envs_dir.clone(),
         ));
         let mut transcribe_service = videocaptionerr_core::use_cases::TranscribeJob::new(
             jobs.clone(),
@@ -145,7 +154,7 @@ impl ApplicationRuntime {
         let run_batch = Arc::new(RunBatch::new(
             batches.clone(),
             jobs.clone(),
-            asr,
+            resolver,
             transcribe,
             events,
         ));

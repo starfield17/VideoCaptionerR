@@ -6,12 +6,14 @@
 
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use videocaptionerr_domain::{BatchId, JobId, UlidStr};
 
-use crate::ports::{LlmStage, PromptSnapshot, StructuredOutput};
+use crate::ports::{AsrRuntimeSpec, LlmStage, ModelLocator, PromptSnapshot, StructuredOutput};
 
-pub const JOB_EXECUTION_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+/// Current write schema. Readers accept v1 (string locator) and v2 (typed locator).
+pub const JOB_EXECUTION_SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+pub const JOB_EXECUTION_SNAPSHOT_SCHEMA_V1: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceStatSnapshot {
@@ -29,11 +31,39 @@ pub enum AudioStreamSelection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AsrExecutionSnapshot {
     pub engine: String,
-    pub model_locator: String,
+    #[serde(deserialize_with = "deserialize_model_locator")]
+    pub model_locator: ModelLocator,
     pub model_id: Option<String>,
     pub model_digest: Option<String>,
     pub device: String,
     pub compute_type: String,
+}
+
+impl AsrExecutionSnapshot {
+    pub fn to_runtime_spec(&self) -> AsrRuntimeSpec {
+        AsrRuntimeSpec {
+            engine_family: self.engine.clone(),
+            model_id: self
+                .model_id
+                .clone()
+                .unwrap_or_else(|| self.model_locator.display()),
+            verified_digest: self.model_digest.clone(),
+            locator: self.model_locator.clone(),
+            device: self.device.clone(),
+            compute_type: self.compute_type.clone(),
+        }
+    }
+}
+
+fn deserialize_model_locator<'de, D>(deserializer: D) -> Result<ModelLocator, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::String(s) => Ok(ModelLocator::from_v1_string(&s)),
+        other => serde_json::from_value(other).map_err(serde::de::Error::custom),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,8 +132,14 @@ impl JobExecutionSnapshot {
         PathBuf::from(&self.output.path)
     }
 
+    pub fn asr_runtime_spec(&self) -> AsrRuntimeSpec {
+        self.asr.to_runtime_spec()
+    }
+
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version != JOB_EXECUTION_SNAPSHOT_SCHEMA_VERSION {
+        if self.schema_version != JOB_EXECUTION_SNAPSHOT_SCHEMA_VERSION
+            && self.schema_version != JOB_EXECUTION_SNAPSHOT_SCHEMA_V1
+        {
             return Err(format!(
                 "unsupported execution snapshot schema version {}",
                 self.schema_version
@@ -118,6 +154,7 @@ impl JobExecutionSnapshot {
         if self.job_dir.is_empty() || self.output.path.is_empty() {
             return Err("execution snapshot paths cannot be empty".into());
         }
+        self.asr.model_locator.validate()?;
         Ok(())
     }
 }
@@ -158,7 +195,7 @@ mod tests {
             profile_revision: Ulid::new().into(),
             asr: AsrExecutionSnapshot {
                 engine: "whisper-cpp".into(),
-                model_locator: "/models/ggml-tiny.bin".into(),
+                model_locator: ModelLocator::file("/models/ggml-tiny.bin"),
                 model_id: Some("tiny.en".into()),
                 model_digest: Some("blake3:model".into()),
                 device: "cpu".into(),
@@ -216,8 +253,30 @@ mod tests {
     #[test]
     fn snapshot_validation_rejects_an_unsupported_schema() {
         let mut snapshot = snapshot();
-        snapshot.schema_version += 1;
+        snapshot.schema_version = 99;
 
         assert!(snapshot.validate().is_err());
+    }
+
+    #[test]
+    fn v1_string_locator_deserializes_to_typed_file() {
+        let mut value = serde_json::to_value(snapshot()).unwrap();
+        value["schema_version"] = serde_json::json!(1);
+        value["asr"]["model_locator"] = serde_json::json!("/models/legacy.bin");
+        let loaded: JobExecutionSnapshot = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            loaded.asr.model_locator,
+            ModelLocator::file("/models/legacy.bin")
+        );
+        assert!(loaded.validate().is_ok());
+    }
+
+    #[test]
+    fn runtime_spec_carries_digest_and_locator() {
+        let snap = snapshot();
+        let spec = snap.asr_runtime_spec();
+        assert_eq!(spec.engine_family, "whisper-cpp");
+        assert_eq!(spec.verified_digest.as_deref(), Some("blake3:model"));
+        assert!(matches!(spec.locator, ModelLocator::File { .. }));
     }
 }

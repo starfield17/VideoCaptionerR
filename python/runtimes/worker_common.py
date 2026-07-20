@@ -45,6 +45,8 @@ class Worker:
         self.active_threads: dict[int, threading.Thread] = {}
         self.model: Any = None
         self.model_path: str | None = None
+        self.device = "cpu"
+        self.compute_type = "default"
         self.stopping = False
 
     def emit(
@@ -72,14 +74,38 @@ class Worker:
     def error(self, request_id: int | None, code: str, message: str) -> None:
         self.emit("error", request_id, {"code": code, "message": message})
 
+    def _runtime_version(self) -> str:
+        if self.engine == "faster-whisper":
+            try:
+                import faster_whisper
+                import ctranslate2
+
+                fw = getattr(faster_whisper, "__version__", "unknown")
+                ct2 = getattr(ctranslate2, "__version__", "unknown")
+                return f"faster-whisper={fw};ctranslate2={ct2};python={sys.version.split()[0]}"
+            except Exception as exc:  # noqa: BLE001 — report import failure in hello
+                return f"faster-whisper-unavailable:{type(exc).__name__}"
+        if self.engine == "mlx-whisper":
+            try:
+                import mlx_whisper
+
+                ver = getattr(mlx_whisper, "__version__", "unknown")
+                return f"mlx-whisper={ver};python={sys.version.split()[0]}"
+            except Exception as exc:  # noqa: BLE001
+                return f"mlx-whisper-unavailable:{type(exc).__name__}"
+        return sys.version.split()[0]
+
     def hello(self) -> None:
         is_mlx = self.engine == "mlx-whisper"
+        # MLX must not claim A2 merely because word_timestamps was requested.
+        # Only claim word timestamps when the engine actually returns them later;
+        # hello advertises capability intent, and Rust validates real words.
         self.emit(
             "hello_ok",
             data={
                 "engine_id": self.engine,
                 "adapter_version": "1",
-                "runtime_version": sys.version.split()[0],
+                "runtime_version": self._runtime_version(),
                 "devices": ["cpu" if not is_mlx else "apple-silicon"],
                 "native_vad": self.engine == "faster-whisper",
                 "language_detection": True,
@@ -87,6 +113,7 @@ class Worker:
                 "cooperative_cancel": True,
                 "max_audio_secs": None,
                 "timestamp_granularity": "word",
+                # Prefer honest confidence: MLX often lacks word probs.
                 "confidence_kind": "none" if is_mlx else "word_prob",
             },
         )
@@ -97,17 +124,34 @@ class Worker:
                 self.error(request_id, "WORKER_BUSY", "transcription is active")
                 return
         model_path = data.get("model_path")
+        device = data.get("device") or ("auto" if self.engine == "faster-whisper" else "cpu")
+        compute_type = data.get("compute_type") or "default"
         if model_path is None and self.engine != "fake":
             self.error(request_id, "MODEL_NOT_FOUND", "model_path is required")
             return
+        # HuggingFace snapshot form: repo@revision
+        if isinstance(model_path, str) and "@" in model_path and not Path(model_path).exists():
+            repo, _rev = model_path.split("@", 1)
+            model_path = repo
         try:
             if self.engine == "fake":
                 model = object()
             elif self.engine == "faster-whisper":
                 from faster_whisper import WhisperModel
 
-                model = WhisperModel(str(model_path), device="auto", compute_type="default")
+                model = WhisperModel(
+                    str(model_path),
+                    device=str(device),
+                    compute_type=str(compute_type),
+                )
             elif self.engine == "mlx-whisper":
+                if sys.platform != "darwin":
+                    self.error(
+                        request_id,
+                        "RUNTIME_UNAVAILABLE",
+                        "mlx-whisper real runtime is only available on macOS Apple Silicon",
+                    )
+                    return
                 import mlx_whisper  # noqa: F401
 
                 model = str(model_path)
@@ -121,7 +165,9 @@ class Worker:
         with self.state_lock:
             self.model = model
             self.model_path = str(model_path) if model_path is not None else None
-        self.emit("result", request_id, {"loaded": True})
+            self.device = str(device)
+            self.compute_type = str(compute_type)
+        self.emit("result", request_id, {"loaded": True, "device": device, "compute_type": compute_type})
 
     def unload_model(self, request_id: int) -> None:
         with self.state_lock:
@@ -257,6 +303,7 @@ class Worker:
         cancel_event: threading.Event,
     ) -> None:
         normalized: list[dict[str, Any]] = []
+        saw_words = False
         for segment in segments:
             if cancel_event.is_set():
                 self.emit("cancelled", request_id, {"reason": "cooperative_cancel"})
@@ -283,6 +330,8 @@ class Worker:
                     word_start = float(getattr(word, "start", start))
                     word_end = float(getattr(word, "end", word_start))
                     probability = float(getattr(word, "probability", -1.0))
+                if token.strip():
+                    saw_words = True
                 words.append({
                     "text": token,
                     "start_ms": max(0, round(word_start * 1000)),
@@ -298,6 +347,14 @@ class Worker:
             normalized.append(item)
             self.emit("segment", request_id, item)
             self.emit("progress", request_id, {"message": "inference"})
+        # A2 requires actual word timestamps. Never claim success without them.
+        if not saw_words:
+            self.error(
+                request_id,
+                "ENGINE_CAPABILITY_INSUFFICIENT",
+                "engine produced no word timestamps; cannot claim A2",
+            )
+            return
         language = None
         duration = None
         if isinstance(info, dict):

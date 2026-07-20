@@ -118,12 +118,27 @@ impl ApplicationRuntime {
             )
         })?;
 
+        // Resolve runtime from the durable Job snapshot (not current CLI defaults).
+        let snapshot = self
+            .snapshots
+            .load_execution_snapshot(&command.execution_snapshot_id)
+            .await
+            .map_err(ApplicationError::into_vc_error)?
+            .ok_or_else(|| {
+                VcError::new(
+                    ErrorCode::InvalidArgument,
+                    "retry requires a durable execution snapshot for ASR runtime resolution",
+                )
+            })?;
+        let asr_spec = snapshot.asr_runtime_spec();
+
         // One open, execute the reopened Job, finish Batch, one close.
         let result = self
             .run_batch
             .execute(RunBatchCommand {
                 batch,
                 jobs: vec![command],
+                asr_spec,
             })
             .await
             .map_err(ApplicationError::into_vc_error)?;

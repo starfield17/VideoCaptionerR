@@ -6,12 +6,16 @@ use videocaptionerr_contracts::error::VcError;
 use videocaptionerr_domain::{Batch, BatchStatus, JobStatus, JobTerminalStatus};
 
 use crate::application_error::{AppResult, ApplicationError};
-use crate::ports::{AsrRuntime, BatchRepository, EventPublisher, JobRepository, Versioned};
+use crate::ports::{
+    AsrRuntimeResolver, AsrRuntimeSpec, BatchRepository, EventPublisher, JobRepository, Versioned,
+};
 use crate::use_cases::{TranscribeJob, TranscribeJobCommand, TranscribeJobResponse};
 
 pub struct RunBatchCommand {
     pub batch: Batch,
     pub jobs: Vec<TranscribeJobCommand>,
+    /// Durable runtime identity resolved once per Batch (load once / unload once).
+    pub asr_spec: AsrRuntimeSpec,
 }
 
 pub struct RunBatchResponse {
@@ -29,7 +33,7 @@ pub struct RunBatchFailure {
 pub struct RunBatch {
     batches: Arc<dyn BatchRepository>,
     jobs: Arc<dyn JobRepository>,
-    asr: Arc<dyn AsrRuntime>,
+    resolver: Arc<dyn AsrRuntimeResolver>,
     transcribe: Arc<TranscribeJob>,
     events: Arc<dyn EventPublisher>,
 }
@@ -38,14 +42,14 @@ impl RunBatch {
     pub fn new(
         batches: Arc<dyn BatchRepository>,
         jobs: Arc<dyn JobRepository>,
-        asr: Arc<dyn AsrRuntime>,
+        resolver: Arc<dyn AsrRuntimeResolver>,
         transcribe: Arc<TranscribeJob>,
         events: Arc<dyn EventPublisher>,
     ) -> Self {
         Self {
             batches,
             jobs,
-            asr,
+            resolver,
             transcribe,
             events,
         }
@@ -54,6 +58,10 @@ impl RunBatch {
     pub async fn execute(&self, command: RunBatchCommand) -> AppResult<RunBatchResponse> {
         let requested_batch = command.batch;
         validate_commands(&requested_batch, &command.jobs)?;
+        command
+            .asr_spec
+            .validate()
+            .map_err(ApplicationError::Invalid)?;
         let mut batch = self
             .batches
             .load_batch(requested_batch.id())
@@ -85,10 +93,10 @@ impl RunBatch {
         let expected = batch.expected_version();
         self.batches.save_batch(&mut batch, expected).await?;
 
-        // Opening the session is deliberately outside the per-Job loop. The
-        // worker/model stays alive until the Batch reaches a terminal state,
-        // and the Batch is already durable before this external side effect.
-        let mut session = self.asr.open_session(batch.execution_profile()).await?;
+        // Resolve + open once outside the per-Job loop. The worker/model stays
+        // alive until the Batch reaches a terminal state.
+        let runtime = self.resolver.resolve(&command.asr_spec).await?;
+        let mut session = runtime.open_session(batch.execution_profile()).await?;
 
         let result = self
             .execute_with_session(batch, command.jobs, session.as_mut())
@@ -253,11 +261,12 @@ mod tests {
     use super::*;
     use crate::application_error::AppResult;
     use crate::ports::{
-        ArtifactCommit, ArtifactInput, ArtifactStore, AsrDescriptor, AsrSession,
-        AsrTranscribeRequest, AudioExtraction, EventPublisher, ExpectedVersion, ExportedSubtitle,
-        ExtractAudioRequest, IdGenerator, JobRepository, MediaGateway, NormalizedAsrResult,
-        ProbeMediaRequest, ProbedMedia, StageCommitRepository, StageCommitRequest,
-        StageCommitResult, SubtitleExportRequest, SubtitleGateway, Versioned,
+        ArtifactCommit, ArtifactInput, ArtifactStore, AsrDescriptor, AsrRuntime, AsrRuntimeResolver,
+        AsrRuntimeSpec, AsrSession, AsrTranscribeRequest, AudioExtraction, EventPublisher,
+        ExpectedVersion, ExportedSubtitle, ExtractAudioRequest, IdGenerator, JobRepository,
+        MediaGateway, ModelLocator, NormalizedAsrResult, ProbeMediaRequest, ProbedMedia,
+        StageCommitRepository, StageCommitRequest, StageCommitResult, SubtitleExportRequest,
+        SubtitleGateway, Versioned,
     };
 
     struct Ids;
@@ -600,10 +609,37 @@ mod tests {
         }
     }
 
+    struct Resolver(Runtime);
+
+    #[async_trait]
+    impl AsrRuntimeResolver for Resolver {
+        async fn resolve(
+            &self,
+            _spec: &AsrRuntimeSpec,
+        ) -> AppResult<Box<dyn AsrRuntime>> {
+            Ok(Box::new(Runtime {
+                opens: self.0.opens.clone(),
+                closes: self.0.closes.clone(),
+                fail_first: self.0.fail_first,
+            }))
+        }
+    }
+
     fn profile() -> BatchExecutionProfile {
         BatchExecutionProfile {
             asr_engine: "fake".into(),
             asr_model: "fake".into(),
+            device: "cpu".into(),
+            compute_type: "default".into(),
+        }
+    }
+
+    fn asr_spec() -> AsrRuntimeSpec {
+        AsrRuntimeSpec {
+            engine_family: "fake".into(),
+            model_id: "fake".into(),
+            verified_digest: None,
+            locator: ModelLocator::file("fake:default"),
             device: "cpu".into(),
             compute_type: "default".into(),
         }
@@ -707,11 +743,11 @@ mod tests {
         let runner = RunBatch::new(
             batches,
             jobs.clone(),
-            Arc::new(Runtime {
+            Arc::new(Resolver(Runtime {
                 opens: opens.clone(),
                 closes: closes.clone(),
                 fail_first: false,
-            }),
+            })),
             use_case(jobs),
             Arc::new(Events),
         );
@@ -720,6 +756,7 @@ mod tests {
             .execute(RunBatchCommand {
                 batch,
                 jobs: commands,
+                asr_spec: asr_spec(),
             })
             .await
             .unwrap();
@@ -744,11 +781,11 @@ mod tests {
         let runner = RunBatch::new(
             batches,
             jobs.clone(),
-            Arc::new(Runtime {
+            Arc::new(Resolver(Runtime {
                 opens: opens.clone(),
                 closes: Arc::new(AtomicUsize::new(0)),
                 fail_first: false,
-            }),
+            })),
             use_case(jobs),
             Arc::new(Events),
         );
@@ -757,6 +794,7 @@ mod tests {
             .execute(RunBatchCommand {
                 batch,
                 jobs: commands,
+                asr_spec: asr_spec(),
             })
             .await
             .is_err());
@@ -777,11 +815,11 @@ mod tests {
         let runner = RunBatch::new(
             batches,
             jobs.clone(),
-            Arc::new(Runtime {
+            Arc::new(Resolver(Runtime {
                 opens: opens.clone(),
                 closes: Arc::new(AtomicUsize::new(0)),
                 fail_first: false,
-            }),
+            })),
             use_case(jobs),
             Arc::new(Events),
         );
@@ -790,6 +828,7 @@ mod tests {
             .execute(RunBatchCommand {
                 batch,
                 jobs: commands,
+                asr_spec: asr_spec(),
             })
             .await
             .is_err());
@@ -812,11 +851,11 @@ mod tests {
         let runner = RunBatch::new(
             batches,
             jobs.clone(),
-            Arc::new(Runtime {
+            Arc::new(Resolver(Runtime {
                 opens: opens.clone(),
                 closes: closes.clone(),
                 fail_first: true,
-            }),
+            })),
             use_case(jobs),
             Arc::new(Events),
         );
@@ -825,6 +864,7 @@ mod tests {
             .execute(RunBatchCommand {
                 batch,
                 jobs: commands,
+                asr_spec: asr_spec(),
             })
             .await
             .unwrap();
@@ -851,11 +891,11 @@ mod tests {
         let runner = RunBatch::new(
             batches.clone(),
             jobs.clone(),
-            Arc::new(Runtime {
+            Arc::new(Resolver(Runtime {
                 opens: Arc::new(AtomicUsize::new(0)),
                 closes: Arc::new(AtomicUsize::new(0)),
                 fail_first: true,
-            }),
+            })),
             use_case(jobs.clone()),
             Arc::new(Events),
         );
@@ -863,6 +903,7 @@ mod tests {
             .execute(RunBatchCommand {
                 batch: batch.clone(),
                 jobs: commands.clone(),
+                asr_spec: asr_spec(),
             })
             .await
             .unwrap();
@@ -888,11 +929,11 @@ mod tests {
         let runner = RunBatch::new(
             batches,
             jobs.clone(),
-            Arc::new(Runtime {
+            Arc::new(Resolver(Runtime {
                 opens: opens.clone(),
                 closes: closes.clone(),
                 fail_first: false,
-            }),
+            })),
             use_case(jobs),
             Arc::new(Events),
         );
@@ -900,6 +941,7 @@ mod tests {
             .execute(RunBatchCommand {
                 batch,
                 jobs: vec![commands[0].clone()],
+                asr_spec: asr_spec(),
             })
             .await
             .unwrap();
@@ -924,11 +966,11 @@ mod tests {
         let runner = RunBatch::new(
             batches,
             jobs.clone(),
-            Arc::new(Runtime {
+            Arc::new(Resolver(Runtime {
                 opens: Arc::new(AtomicUsize::new(0)),
                 closes: Arc::new(AtomicUsize::new(0)),
                 fail_first: false,
-            }),
+            })),
             use_case_with_events(jobs, Arc::new(FailingEvents)),
             Arc::new(FailingEvents),
         );
@@ -937,6 +979,7 @@ mod tests {
             .execute(RunBatchCommand {
                 batch,
                 jobs: commands,
+                asr_spec: asr_spec(),
             })
             .await
             .unwrap();

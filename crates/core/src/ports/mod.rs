@@ -9,6 +9,7 @@ pub mod cache;
 pub mod events;
 pub mod llm;
 pub mod media;
+pub mod model;
 pub mod repositories;
 pub mod subtitle;
 pub mod system;
@@ -33,6 +34,9 @@ pub use llm::{
 pub use media::{
     AudioAnalysis, AudioAnalysisRequest, AudioExtraction, AudioRangeExtraction,
     ExtractAudioRangeRequest, ExtractAudioRequest, MediaGateway, ProbeMediaRequest, ProbedMedia,
+};
+pub use model::{
+    asr_fingerprint, validate_spec, AsrRuntimeResolver, AsrRuntimeSpec, ModelLocator,
 };
 pub use repositories::{
     BatchRepository, ExpectedVersion, JobRepository, RetryTransactionRepository,

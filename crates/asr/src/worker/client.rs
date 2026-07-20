@@ -264,14 +264,31 @@ impl WorkerClient {
     }
 
     pub async fn load_model(&mut self, model_path: Option<&Path>) -> VcResult<()> {
+        self.load_model_with_options(model_path, "cpu", "default")
+            .await
+    }
+
+    pub async fn load_model_with_options(
+        &mut self,
+        model_path: Option<&Path>,
+        device: &str,
+        compute_type: &str,
+    ) -> VcResult<()> {
         let req = self.alloc_request_id();
         self.session.begin_request(req)?;
-        let data = match model_path {
-            Some(p) => Some(serde_json::json!({"model_path": p.to_string_lossy()})),
-            None => Some(serde_json::json!({})),
-        };
-        self.send(Some(req), ProtocolMessageType::LoadModel, data)
-            .await?;
+        let mut payload = serde_json::json!({
+            "device": device,
+            "compute_type": compute_type,
+        });
+        if let Some(p) = model_path {
+            payload["model_path"] = serde_json::json!(p.to_string_lossy());
+        }
+        self.send(
+            Some(req),
+            ProtocolMessageType::LoadModel,
+            Some(payload),
+        )
+        .await?;
         let env = self.read_envelope_timeout(LOAD_TIMEOUT).await;
         self.session.end_request();
         let env = env?;

@@ -27,6 +27,11 @@ futures = { workspace = true }
 tempfile = { workspace = true }
 toml = { workspace = true }
 
+[features]
+default = []
+# When enabled, adapter smoke tests hard-fail if managed envs/models are missing.
+required-adapters = []
+
 [dev-dependencies]
 tempfile = { workspace = true }
 pretty_assertions = { workspace = true }

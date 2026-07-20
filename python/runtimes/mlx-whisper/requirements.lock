@@ -1,0 +1,4 @@
+# Locked requirements for mlx-whisper managed environment (Apple Silicon).
+mlx-whisper==0.4.1
+mlx>=0.18
+numpy>=1.26

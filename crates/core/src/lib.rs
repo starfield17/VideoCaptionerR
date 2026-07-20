@@ -24,7 +24,10 @@ pub use constants::*;
 pub use execution_snapshot::{
     AsrExecutionSnapshot, AudioStreamSelection, JobExecutionSnapshot,
     JobExecutionSnapshot as ExecutionSnapshot, LlmExecutionSnapshot, OutputPlanSnapshot,
-    SourceStatSnapshot, JOB_EXECUTION_SNAPSHOT_SCHEMA_VERSION,
+    SourceStatSnapshot, JOB_EXECUTION_SNAPSHOT_SCHEMA_VERSION, JOB_EXECUTION_SNAPSHOT_SCHEMA_V1,
+};
+pub use ports::{
+    asr_fingerprint, AsrRuntimeResolver, AsrRuntimeSpec, ModelLocator,
 };
 pub use ports::CacheGcResult;
 pub use split::{rule_split, RuleSplitConfig};
