@@ -50,6 +50,12 @@ pub struct DoctorView {
     pub ffmpeg: Option<String>,
     pub ffprobe: Option<String>,
     pub helper: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uv: Option<String>,
+    #[serde(default)]
+    pub helper_exists: bool,
+    #[serde(default)]
+    pub runtime_smokes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

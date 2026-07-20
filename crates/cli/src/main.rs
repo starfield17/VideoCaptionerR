@@ -186,12 +186,27 @@ fn run(cli: Cli) -> Result<ExitCode, VcError> {
             );
             println!(
                 "helper: {}",
-                if report.helper.exists() {
+                if report.helper_exists {
                     report.helper.display().to_string()
                 } else {
                     "not found".into()
                 }
             );
+            println!(
+                "uv: {}",
+                report
+                    .uv
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "not found".into())
+            );
+            for smoke in &report.runtime_smokes {
+                println!(
+                    "runtime {}: {} — {}",
+                    smoke.family,
+                    if smoke.ok { "ok" } else { "fail" },
+                    smoke.detail
+                );
+            }
             Ok(ExitCode::Success)
         }
         Commands::Transcribe {
