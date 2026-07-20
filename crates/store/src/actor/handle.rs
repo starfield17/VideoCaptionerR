@@ -9,8 +9,8 @@ use videocaptionerr_contracts::artifact::ArtifactMeta;
 use videocaptionerr_contracts::error::{ErrorCode, VcError, VcResult};
 use videocaptionerr_core::execution_snapshot::JobExecutionSnapshot;
 use videocaptionerr_core::ports::{
-    ArtifactRecoveryReport, CapabilityProbeRecord, ExpectedVersion, StageCommitRequest,
-    StageCommitResult, StoredOutboxEvent,
+    ArtifactRecoveryReport, CapabilityProbeRecord, ExpectedVersion, RetryTransactionRequest,
+    RetryTransactionResult, StageCommitRequest, StageCommitResult, StoredOutboxEvent,
 };
 
 use super::command::store_actor;
@@ -354,6 +354,30 @@ impl StoreHandle {
         let (reply, result) = response_channel();
         self.send(StoreCommand::CommitStage {
             request: Box::new(request),
+            reply,
+        })?;
+        await_response(result).await
+    }
+
+    pub(crate) async fn apply_retry(
+        &self,
+        request: RetryTransactionRequest,
+    ) -> VcResult<RetryTransactionResult> {
+        let (reply, result) = response_channel();
+        self.send(StoreCommand::ApplyRetry {
+            request: Box::new(request),
+            reply,
+        })?;
+        await_response(result).await
+    }
+
+    pub(crate) async fn list_work_units_for_job(
+        &self,
+        job_id: &str,
+    ) -> VcResult<Vec<(String, u64)>> {
+        let (reply, result) = response_channel();
+        self.send(StoreCommand::ListWorkUnitsForJob {
+            job_id: job_id.into(),
             reply,
         })?;
         await_response(result).await

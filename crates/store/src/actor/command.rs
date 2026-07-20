@@ -8,8 +8,8 @@ use videocaptionerr_contracts::artifact::ArtifactMeta;
 use videocaptionerr_contracts::error::{ErrorCode, VcError, VcResult};
 use videocaptionerr_core::execution_snapshot::JobExecutionSnapshot;
 use videocaptionerr_core::ports::{
-    ArtifactRecoveryReport, CapabilityProbeRecord, ExpectedVersion, StageCommitRequest,
-    StageCommitResult, StoredOutboxEvent,
+    ArtifactRecoveryReport, CapabilityProbeRecord, ExpectedVersion, RetryTransactionRequest,
+    RetryTransactionResult, StageCommitRequest, StageCommitResult, StoredOutboxEvent,
 };
 
 use super::handle::{LeaseRequest, StoreResponse, WorkUnitRecord};
@@ -138,6 +138,14 @@ pub(super) enum StoreCommand {
     CommitStage {
         request: Box<StageCommitRequest>,
         reply: StoreResponse<StageCommitResult>,
+    },
+    ApplyRetry {
+        request: Box<RetryTransactionRequest>,
+        reply: StoreResponse<RetryTransactionResult>,
+    },
+    ListWorkUnitsForJob {
+        job_id: String,
+        reply: StoreResponse<Vec<(String, u64)>>,
     },
     ListPendingOutbox {
         limit: u32,
@@ -320,6 +328,12 @@ impl StoreCommand {
             }
             Self::CommitStage { request, reply } => {
                 let _ = reply.send(store.commit_stage(*request));
+            }
+            Self::ApplyRetry { request, reply } => {
+                let _ = reply.send(store.apply_retry_transaction(*request));
+            }
+            Self::ListWorkUnitsForJob { job_id, reply } => {
+                let _ = reply.send(store.list_work_units_for_job(&job_id));
             }
             Self::ListPendingOutbox { limit, reply } => {
                 let _ = reply.send(store.list_pending_outbox(limit));

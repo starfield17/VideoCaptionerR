@@ -3,6 +3,7 @@
 //! This crate MUST NOT import Tauri, React, or terminal-rendering concerns.
 
 pub mod application_error;
+pub mod artifacts;
 pub mod chunking;
 pub mod constants;
 pub mod execution_snapshot;
@@ -12,6 +13,9 @@ pub mod text_joiner;
 pub mod use_cases;
 
 pub use application_error::{AppResult, ApplicationError};
+pub use artifacts::{
+    ExtractManifest, ProbeManifest, EXTRACT_MANIFEST_SCHEMA_VERSION, PROBE_MANIFEST_SCHEMA_VERSION,
+};
 pub use chunking::{
     apply_chunk_offset, chunk_cache_key, retain_core_words, AudioChunk, ChunkPlan,
     ChunkPlanOptions, CutReason, EnergySample, SilenceRegion,

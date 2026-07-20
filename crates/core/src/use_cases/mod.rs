@@ -3,6 +3,7 @@
 pub mod chunk_plan;
 pub mod llm_pipeline;
 pub mod maintenance;
+pub mod retry_job;
 pub mod run_batch;
 pub mod startup_recovery;
 pub mod transcribe_job;
@@ -14,6 +15,7 @@ pub use maintenance::{
     CacheGc, LeaseNextWorkUnitCommand, RetryFailedWorkUnits, RetryFailedWorkUnitsCommand,
     RetryFailedWorkUnitsResponse, WorkUnitScheduler,
 };
+pub use retry_job::{RetryJob, RetryJobCommand, RetryJobResponse, RetryPlan};
 pub use run_batch::{RunBatch, RunBatchCommand, RunBatchFailure, RunBatchResponse};
 pub use startup_recovery::{RecoveryReport, StartupRecovery};
 pub use transcribe_job::{

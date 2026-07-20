@@ -167,21 +167,58 @@ impl RunBatch {
 }
 
 fn validate_commands(batch: &Batch, commands: &[TranscribeJobCommand]) -> AppResult<()> {
-    if commands.len() != batch.job_ids().len() {
+    if commands.is_empty() {
         return Err(ApplicationError::Invalid(
-            "Batch command count does not match Batch job membership".into(),
+            "Batch execution requires at least one Job command".into(),
         ));
     }
-    for (expected, command) in batch.job_ids().iter().zip(commands) {
-        if expected != &command.job_id {
-            return Err(ApplicationError::Invalid(
-                "Batch jobs must be supplied in FIFO aggregate order".into(),
-            ));
+    if commands.len() == batch.job_ids().len() {
+        // Fresh Batch: every member must be supplied in FIFO aggregate order.
+        for (expected, command) in batch.job_ids().iter().zip(commands) {
+            if expected != &command.job_id {
+                return Err(ApplicationError::Invalid(
+                    "Batch jobs must be supplied in FIFO aggregate order".into(),
+                ));
+            }
+            if command.batch_id.as_ref() != Some(batch.id()) {
+                return Err(ApplicationError::Invalid(
+                    "Job command does not belong to the Batch".into(),
+                ));
+            }
         }
+        return Ok(());
+    }
+
+    // Retry invocation: a legal subset may run while unselected members stay
+    // terminal. Selected jobs must appear in Batch membership order.
+    let mut membership = batch.job_ids().iter().peekable();
+    for command in commands {
         if command.batch_id.as_ref() != Some(batch.id()) {
             return Err(ApplicationError::Invalid(
                 "Job command does not belong to the Batch".into(),
             ));
+        }
+        loop {
+            let Some(candidate) = membership.next() else {
+                return Err(ApplicationError::Invalid(
+                    "retry subset contains a Job outside Batch membership order".into(),
+                ));
+            };
+            if candidate == &command.job_id {
+                break;
+            }
+            if !batch.has_terminal_record(candidate) {
+                return Err(ApplicationError::Invalid(format!(
+                    "unselected Batch Job {candidate} must already be terminal before a subset retry"
+                )));
+            }
+        }
+    }
+    for remaining in membership {
+        if !batch.has_terminal_record(remaining) {
+            return Err(ApplicationError::Invalid(format!(
+                "unselected Batch Job {remaining} must already be terminal before a subset retry"
+            )));
         }
     }
     Ok(())
@@ -439,6 +476,24 @@ mod tests {
             ))
         }
 
+        async fn load_probe_manifest(
+            &self,
+            _artifact: &ArtifactRef,
+        ) -> AppResult<crate::artifacts::ProbeManifest> {
+            Err(ApplicationError::Invalid(
+                "fake store cannot load probe manifests".into(),
+            ))
+        }
+
+        async fn load_extract_manifest(
+            &self,
+            _artifact: &ArtifactRef,
+        ) -> AppResult<crate::artifacts::ExtractManifest> {
+            Err(ApplicationError::Invalid(
+                "fake store cannot load extract manifests".into(),
+            ))
+        }
+
         async fn validate(&self, _artifact: &ArtifactRef) -> AppResult<()> {
             Ok(())
         }
@@ -558,16 +613,22 @@ mod tests {
         job_id: JobId,
         dir: &Path,
     ) -> TranscribeJobCommand {
+        let input = dir.join("input.wav");
+        if !input.exists() {
+            std::fs::write(&input, b"RIFF....WAVEfmt ").unwrap();
+        }
+        let job_dir = dir.join(format!("job-{}", job_id.as_str()));
+        std::fs::create_dir_all(&job_dir).unwrap();
         TranscribeJobCommand {
             job_id,
             batch_id: Some(batch_id.clone()),
             profile_revision: Ulid::new().into(),
             execution_snapshot_id: Ulid::new().into(),
-            input: dir.join("input.wav"),
-            job_dir: dir.join("job"),
+            input,
+            job_dir,
             language: Some("en".into()),
             export: SubtitleExportRequest {
-                output_path: dir.join("output.srt"),
+                output_path: dir.join(format!("{}.srt", Ulid::new())),
                 format: crate::ports::SubtitleFormat::Srt,
                 layout: crate::ports::SubtitleLayout::SourceOnly,
                 fallback_to_source: true,
@@ -769,6 +830,81 @@ mod tests {
         assert_eq!(result.jobs.len(), 1);
         assert_eq!(result.failures.len(), 1);
         assert_eq!(result.batch.status(), BatchStatus::Failed);
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retry_subset_runs_only_selected_job_and_keeps_other_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = Arc::new(Jobs {
+            values: Mutex::new(HashMap::new()),
+        });
+        let (batch, commands) = make_batch(dir.path(), 2);
+        let batches = Arc::new(Batches {
+            values: Mutex::new(Vec::new()),
+        });
+        seed_persisted_state(&jobs, &batches, &batch, &commands);
+
+        // First full run: fail job A, succeed job B.
+        let runner = RunBatch::new(
+            batches.clone(),
+            jobs.clone(),
+            Arc::new(Runtime {
+                opens: Arc::new(AtomicUsize::new(0)),
+                closes: Arc::new(AtomicUsize::new(0)),
+                fail_first: true,
+            }),
+            use_case(jobs.clone()),
+            Arc::new(Events),
+        );
+        let first = runner
+            .execute(RunBatchCommand {
+                batch: batch.clone(),
+                jobs: commands.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(first.batch.status(), BatchStatus::Failed);
+
+        // Reopen only job A for retry.
+        let mut batch = first.batch;
+        batch.prepare_retry(&commands[0].job_id).unwrap();
+        let mut job_a = jobs
+            .load_job(&commands[0].job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        // Full stage restart for this subset fixture: the in-memory Artifacts
+        // adapter does not retain Probe/Extract manifests across jobs.
+        job_a.prepare_retry(Some(StageKind::Probe)).unwrap();
+        let expected = job_a.expected_version();
+        jobs.save_job(&mut job_a, expected).await.unwrap();
+        batches.values.lock().unwrap().push(batch.clone());
+
+        let opens = Arc::new(AtomicUsize::new(0));
+        let closes = Arc::new(AtomicUsize::new(0));
+        let runner = RunBatch::new(
+            batches,
+            jobs.clone(),
+            Arc::new(Runtime {
+                opens: opens.clone(),
+                closes: closes.clone(),
+                fail_first: false,
+            }),
+            use_case(jobs),
+            Arc::new(Events),
+        );
+        let result = runner
+            .execute(RunBatchCommand {
+                batch,
+                jobs: vec![commands[0].clone()],
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.jobs.len(), 1);
+        assert_eq!(result.jobs[0].job.id(), &commands[0].job_id);
+        assert_eq!(result.batch.status(), BatchStatus::Done);
         assert_eq!(opens.load(Ordering::SeqCst), 1);
         assert_eq!(closes.load(Ordering::SeqCst), 1);
     }

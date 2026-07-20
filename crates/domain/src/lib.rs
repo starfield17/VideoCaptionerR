@@ -18,6 +18,8 @@ pub use subtitle::{
     Transcript, Word, PROB_UNAVAILABLE,
 };
 pub use workflow::{
-    ArtifactRef, Batch, BatchExecutionProfile, BatchStatus, DomainEvent, Job, JobStatus,
-    JobTerminalStatus, StageKind, StageState, StageStatus, WorkUnit, WorkUnitStatus,
+    is_deterministic_work_unit_error, is_oom_error, ArtifactRef, Batch, BatchExecutionProfile,
+    BatchStatus, DomainEvent, Job, JobStatus, JobTerminalStatus, StageKind, StageState,
+    StageStatus, WorkUnit, WorkUnitStatus, WORK_UNIT_DEFAULT_AUTO_RETRIES,
+    WORK_UNIT_OOM_STRATEGY_RETRIES,
 };

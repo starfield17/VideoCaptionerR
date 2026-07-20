@@ -1,18 +1,20 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
 use tempfile::tempdir;
 use ulid::Ulid;
 use videocaptionerr_contracts::media::{AudioStream, MediaProbe};
-use videocaptionerr_domain::{EngineFingerprint, Word, PROB_UNAVAILABLE, SCHEMA_VERSION};
+use videocaptionerr_domain::{
+    BatchId, EngineFingerprint, Word, PROB_UNAVAILABLE, SCHEMA_VERSION,
+};
 
 use super::*;
 use crate::application_error::AppResult;
 use crate::ports::{
-    ArtifactCommit, ArtifactStore, AsrDescriptor, AudioAnalysis, AudioExtraction,
+    ArtifactCommit, ArtifactInput, ArtifactStore, AsrDescriptor, AudioAnalysis, AudioExtraction,
     AudioRangeExtraction, CacheGcResult, CacheRepository, ChunkPlanCommit, ChunkPlanStore, Clock,
     ExpectedVersion, ExportedSubtitle, ExtractAudioRangeRequest, ExtractAudioRequest,
     NormalizedAsrResult, ProbedMedia, StageCommitRepository, StageCommitRequest, StageCommitResult,
@@ -204,6 +206,7 @@ impl MediaGateway for LongMedia {
 struct FakeArtifacts {
     committed: Mutex<Vec<ArtifactRef>>,
     transcripts: Mutex<HashMap<String, Transcript>>,
+    documents: Mutex<HashMap<String, Vec<u8>>>,
     fail_export_once: Option<Arc<AtomicBool>>,
 }
 
@@ -242,6 +245,11 @@ impl StageCommitRepository for FakeStageCommits {
                         .unwrap()
                         .insert(prepared.artifact.path.clone(), transcript);
                 }
+                self.artifacts
+                    .documents
+                    .lock()
+                    .unwrap()
+                    .insert(prepared.artifact.path.clone(), bytes);
             }
             self.artifacts
                 .committed
@@ -308,8 +316,70 @@ impl ArtifactStore for FakeArtifacts {
             .ok_or_else(|| ApplicationError::Invalid("fake transcript not found".into()))
     }
 
-    async fn validate(&self, _artifact: &ArtifactRef) -> AppResult<()> {
-        Ok(())
+    async fn load_probe_manifest(
+        &self,
+        artifact: &ArtifactRef,
+    ) -> AppResult<crate::artifacts::ProbeManifest> {
+        let bytes = self
+            .documents
+            .lock()
+            .unwrap()
+            .get(&artifact.path)
+            .cloned()
+            .ok_or_else(|| {
+                ApplicationError::Adapter(VcError::new(
+                    ErrorCode::ArtifactCorrupt,
+                    "fake probe manifest not found",
+                ))
+            })?;
+        serde_json::from_slice(&bytes).map_err(|error| {
+            ApplicationError::Adapter(VcError::new(
+                ErrorCode::ArtifactCorrupt,
+                format!("decode fake probe manifest: {error}"),
+            ))
+        })
+    }
+
+    async fn load_extract_manifest(
+        &self,
+        artifact: &ArtifactRef,
+    ) -> AppResult<crate::artifacts::ExtractManifest> {
+        let bytes = self
+            .documents
+            .lock()
+            .unwrap()
+            .get(&artifact.path)
+            .cloned()
+            .ok_or_else(|| {
+                ApplicationError::Adapter(VcError::new(
+                    ErrorCode::ArtifactCorrupt,
+                    "fake extract manifest not found",
+                ))
+            })?;
+        serde_json::from_slice(&bytes).map_err(|error| {
+            ApplicationError::Adapter(VcError::new(
+                ErrorCode::ArtifactCorrupt,
+                format!("decode fake extract manifest: {error}"),
+            ))
+        })
+    }
+
+    async fn validate(&self, artifact: &ArtifactRef) -> AppResult<()> {
+        // WAV bodies referenced by extract manifests are not stored in the
+        // fake document map; only missing stage documents fail closed.
+        if artifact.path.ends_with(".wav") {
+            return Ok(());
+        }
+        if self.documents.lock().unwrap().contains_key(&artifact.path)
+            || self.transcripts.lock().unwrap().contains_key(&artifact.path)
+            || artifact.stage == StageKind::Export
+        {
+            return Ok(());
+        }
+        Err(ApplicationError::Adapter(VcError::new(
+            ErrorCode::ArtifactCorrupt,
+            format!("fake artifact missing: {}", artifact.path),
+        )))
     }
 }
 
@@ -473,6 +543,18 @@ impl WorkUnitRepository for LongUnits {
         Ok(count as u32)
     }
 
+    async fn list_for_job(&self, job_id: &JobId) -> AppResult<Vec<Versioned<WorkUnit>>> {
+        Ok(self
+            .values
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|unit| unit.job_id() == job_id)
+            .cloned()
+            .map(|unit| Versioned::with_version(unit, 1))
+            .collect())
+    }
+
     async fn lease_next_ready(
         &self,
         job_id: &JobId,
@@ -567,6 +649,24 @@ impl ArtifactStore for LongArtifacts {
     async fn load_transcript(&self, _artifact: &ArtifactRef) -> AppResult<Transcript> {
         Err(ApplicationError::Invalid(
             "long-audio fake does not load artifact transcripts".into(),
+        ))
+    }
+
+    async fn load_probe_manifest(
+        &self,
+        _artifact: &ArtifactRef,
+    ) -> AppResult<crate::artifacts::ProbeManifest> {
+        Err(ApplicationError::Invalid(
+            "long-audio fake does not load probe manifests".into(),
+        ))
+    }
+
+    async fn load_extract_manifest(
+        &self,
+        _artifact: &ArtifactRef,
+    ) -> AppResult<crate::artifacts::ExtractManifest> {
+        Err(ApplicationError::Invalid(
+            "long-audio fake does not load extract manifests".into(),
         ))
     }
 
@@ -790,6 +890,7 @@ fn make_use_case(fail_export_once: Option<Arc<AtomicBool>>) -> (TranscribeJob, A
     let artifacts = Arc::new(FakeArtifacts {
         committed: Mutex::new(Vec::new()),
         transcripts: Mutex::new(HashMap::new()),
+        documents: Mutex::new(HashMap::new()),
         fail_export_once,
     });
     let use_case = TranscribeJob::new(
@@ -815,12 +916,17 @@ fn use_case_with_export_failure() -> (TranscribeJob, Arc<FakeJobs>, Arc<AtomicBo
 }
 
 fn command(dir: &std::path::Path) -> TranscribeJobCommand {
+    let input = dir.join("input.wav");
+    if !input.exists() {
+        std::fs::write(&input, b"RIFF....WAVEfmt ").unwrap();
+    }
+    std::fs::create_dir_all(dir.join("job")).unwrap();
     TranscribeJobCommand {
         job_id: UlidStr::from(Ulid::new()),
         batch_id: None,
         execution_snapshot_id: UlidStr::from(Ulid::new()),
         profile_revision: UlidStr::from(Ulid::new()),
-        input: dir.join("input.wav"),
+        input,
         job_dir: dir.join("job"),
         language: Some("en".into()),
         export: SubtitleExportRequest {
@@ -1151,4 +1257,402 @@ async fn corrupt_completed_chunk_cache_fails_explicitly() {
         .unwrap_err();
     assert_eq!(error.into_vc_error().code, ErrorCode::CacheCorrupt);
     assert!(retry.calls().is_empty());
+}
+
+/// Counting media adapter used to prove Probe/Extract are not re-run.
+struct CountingMedia {
+    probes: AtomicUsize,
+    extracts: AtomicUsize,
+    hashes: AtomicUsize,
+}
+
+impl Default for CountingMedia {
+    fn default() -> Self {
+        Self {
+            probes: AtomicUsize::new(0),
+            extracts: AtomicUsize::new(0),
+            hashes: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl MediaGateway for CountingMedia {
+    async fn probe(&self, request: ProbeMediaRequest) -> AppResult<ProbedMedia> {
+        self.probes.fetch_add(1, Ordering::SeqCst);
+        FakeMedia.probe(request).await
+    }
+
+    async fn media_hash(&self, _input: &Path) -> AppResult<String> {
+        self.hashes.fetch_add(1, Ordering::SeqCst);
+        Ok("media-hash".into())
+    }
+
+    async fn extract_audio(&self, request: ExtractAudioRequest) -> AppResult<AudioExtraction> {
+        self.extracts.fetch_add(1, Ordering::SeqCst);
+        FakeMedia.extract_audio(request).await
+    }
+}
+
+#[tokio::test]
+async fn export_only_retry_does_not_reprobe_or_reextract_or_retranscribe() {
+    let dir = tempdir().unwrap();
+    let fail_export = Arc::new(AtomicBool::new(true));
+    let artifacts = Arc::new(FakeArtifacts {
+        committed: Mutex::new(Vec::new()),
+        transcripts: Mutex::new(HashMap::new()),
+        documents: Mutex::new(HashMap::new()),
+        fail_export_once: Some(fail_export.clone()),
+    });
+    let media = Arc::new(CountingMedia::default());
+    let jobs = Arc::new(FakeJobs {
+        saved: Mutex::new(Vec::new()),
+        fail_terminal_save: Arc::new(AtomicBool::new(false)),
+    });
+    let use_case = TranscribeJob::new(
+        jobs.clone(),
+        media.clone(),
+        artifacts.clone(),
+        Arc::new(FakeSubtitles),
+        Arc::new(FakeEvents),
+        Arc::new(FakeIds),
+        Arc::new(FakeStageCommits {
+            artifacts: artifacts.clone(),
+        }),
+    );
+    let first = command(dir.path());
+    let mut first_session = session(Some(transcript()), false);
+    let err = use_case
+        .execute(first.clone(), &mut first_session)
+        .await
+        .unwrap_err();
+    assert_eq!(err.into_vc_error().code, ErrorCode::ExportFailed);
+    assert_eq!(media.probes.load(Ordering::SeqCst), 1);
+    assert_eq!(media.extracts.load(Ordering::SeqCst), 1);
+
+    let failed = jobs.saved.lock().unwrap().last().unwrap().clone();
+    let mut retry_job = failed.clone();
+    retry_job.prepare_retry(None).unwrap();
+    let mut retry_job = Versioned::with_version(retry_job, 1);
+    jobs.save_job(&mut retry_job, ExpectedVersion::Exact(1))
+        .await
+        .unwrap();
+
+    let mut retry_command = first;
+    retry_command.job_id = failed.id().clone();
+    retry_command.execution_snapshot_id = failed.execution_snapshot_id().cloned().unwrap();
+    retry_command.profile_revision = failed.profile_revision().clone();
+    // Fail-on-call session proves ASR is not invoked again.
+    let mut retry_session = session(None, true);
+    let result = use_case
+        .execute(retry_command, &mut retry_session)
+        .await
+        .unwrap();
+    assert_eq!(result.job.status(), videocaptionerr_domain::JobStatus::Done);
+    assert_eq!(media.probes.load(Ordering::SeqCst), 1);
+    assert_eq!(media.extracts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn asr_retry_reruns_asr_and_later_stages_only() {
+    let dir = tempdir().unwrap();
+    let media = Arc::new(CountingMedia::default());
+    let jobs = Arc::new(FakeJobs {
+        saved: Mutex::new(Vec::new()),
+        fail_terminal_save: Arc::new(AtomicBool::new(false)),
+    });
+    let artifacts = Arc::new(FakeArtifacts {
+        committed: Mutex::new(Vec::new()),
+        transcripts: Mutex::new(HashMap::new()),
+        documents: Mutex::new(HashMap::new()),
+        fail_export_once: None,
+    });
+    let use_case = TranscribeJob::new(
+        jobs.clone(),
+        media.clone(),
+        artifacts.clone(),
+        Arc::new(FakeSubtitles),
+        Arc::new(FakeEvents),
+        Arc::new(FakeIds),
+        Arc::new(FakeStageCommits {
+            artifacts: artifacts.clone(),
+        }),
+    );
+    let first = command(dir.path());
+    let mut fail_session = session(None, true);
+    let err = use_case
+        .execute(first.clone(), &mut fail_session)
+        .await
+        .unwrap_err();
+    assert_eq!(err.into_vc_error().code, ErrorCode::AsrFailed);
+    assert_eq!(media.probes.load(Ordering::SeqCst), 1);
+    assert_eq!(media.extracts.load(Ordering::SeqCst), 1);
+
+    let failed = jobs.saved.lock().unwrap().last().unwrap().clone();
+    let mut retry_job = failed.clone();
+    assert_eq!(
+        retry_job.prepare_retry(None).unwrap(),
+        StageKind::Asr
+    );
+    let mut retry_job = Versioned::with_version(retry_job, 1);
+    jobs.save_job(&mut retry_job, ExpectedVersion::Exact(1))
+        .await
+        .unwrap();
+
+    let mut retry_command = first;
+    retry_command.job_id = failed.id().clone();
+    retry_command.execution_snapshot_id = failed.execution_snapshot_id().cloned().unwrap();
+    retry_command.profile_revision = failed.profile_revision().clone();
+    let mut ok_session = session(Some(transcript()), false);
+    let result = use_case
+        .execute(retry_command, &mut ok_session)
+        .await
+        .unwrap();
+    assert_eq!(result.job.status(), videocaptionerr_domain::JobStatus::Done);
+    assert_eq!(media.probes.load(Ordering::SeqCst), 1);
+    assert_eq!(media.extracts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn source_changed_is_reported_when_size_differs_from_snapshot() {
+    use crate::execution_snapshot::{
+        AsrExecutionSnapshot, AudioStreamSelection, JobExecutionSnapshot, OutputPlanSnapshot,
+        SourceStatSnapshot, JOB_EXECUTION_SNAPSHOT_SCHEMA_VERSION,
+    };
+    use crate::ports::SnapshotRepository;
+
+    struct Snapshots {
+        value: JobExecutionSnapshot,
+    }
+
+    #[async_trait]
+    impl SnapshotRepository for Snapshots {
+        async fn load_execution_snapshot(
+            &self,
+            id: &UlidStr,
+        ) -> AppResult<Option<JobExecutionSnapshot>> {
+            if id == &self.value.snapshot_id {
+                Ok(Some(self.value.clone()))
+            } else {
+                Ok(None)
+            }
+        }
+
+        async fn save_execution_snapshot(
+            &self,
+            _snapshot: &JobExecutionSnapshot,
+        ) -> AppResult<()> {
+            Ok(())
+        }
+
+        async fn load_snapshots_for_batch(
+            &self,
+            _id: &BatchId,
+        ) -> AppResult<Vec<JobExecutionSnapshot>> {
+            Ok(vec![self.value.clone()])
+        }
+    }
+
+    let dir = tempdir().unwrap();
+    let cmd = command(dir.path());
+    let snapshot = JobExecutionSnapshot {
+        snapshot_id: cmd.execution_snapshot_id.clone(),
+        schema_version: JOB_EXECUTION_SNAPSHOT_SCHEMA_VERSION,
+        created_at: "2026-07-20T00:00:00Z".into(),
+        job_id: cmd.job_id.clone(),
+        batch_id: Ulid::new().into(),
+        canonical_source_path: cmd.input.to_string_lossy().into_owned(),
+        source_stat: SourceStatSnapshot {
+            size: 1, // deliberately wrong vs actual fixture size
+            modified_at_ms: Some(0),
+        },
+        job_dir: cmd.job_dir.to_string_lossy().into_owned(),
+        profile_revision: cmd.profile_revision.clone(),
+        asr: AsrExecutionSnapshot {
+            engine: "fake".into(),
+            model_locator: "fake".into(),
+            model_id: None,
+            model_digest: None,
+            device: "cpu".into(),
+            compute_type: "default".into(),
+        },
+        audio_stream: AudioStreamSelection::Auto,
+        source_language: cmd.language.clone(),
+        target_language: None,
+        output: OutputPlanSnapshot {
+            path: cmd.export.output_path.to_string_lossy().into_owned(),
+            format: "srt".into(),
+            layout: "source_only".into(),
+            conflict_policy: "rename".into(),
+            fallback_to_source: true,
+        },
+        llm: None,
+    };
+    let jobs = Arc::new(FakeJobs {
+        saved: Mutex::new(Vec::new()),
+        fail_terminal_save: Arc::new(AtomicBool::new(false)),
+    });
+    jobs.saved.lock().unwrap().push(Job::new_with_snapshot(
+        cmd.job_id.clone(),
+        cmd.batch_id.clone(),
+        cmd.execution_snapshot_id.clone(),
+        cmd.profile_revision.clone(),
+        cmd.input.to_string_lossy(),
+    ));
+    let artifacts = Arc::new(FakeArtifacts {
+        committed: Mutex::new(Vec::new()),
+        transcripts: Mutex::new(HashMap::new()),
+        documents: Mutex::new(HashMap::new()),
+        fail_export_once: None,
+    });
+    let use_case = TranscribeJob::new(
+        jobs,
+        Arc::new(FakeMedia),
+        artifacts.clone(),
+        Arc::new(FakeSubtitles),
+        Arc::new(FakeEvents),
+        Arc::new(FakeIds),
+        Arc::new(FakeStageCommits { artifacts }),
+    )
+    .with_snapshots(Arc::new(Snapshots { value: snapshot }));
+    let mut asr = session(Some(transcript()), false);
+    let error = use_case.execute(cmd, &mut asr).await.unwrap_err();
+    assert_eq!(error.into_vc_error().code, ErrorCode::SourceChanged);
+}
+
+#[tokio::test]
+async fn probe_corrupt_manifest_returns_artifact_corrupt() {
+    let dir = tempdir().unwrap();
+    let media = Arc::new(CountingMedia::default());
+    let jobs = Arc::new(FakeJobs {
+        saved: Mutex::new(Vec::new()),
+        fail_terminal_save: Arc::new(AtomicBool::new(false)),
+    });
+    let artifacts = Arc::new(FakeArtifacts {
+        committed: Mutex::new(Vec::new()),
+        transcripts: Mutex::new(HashMap::new()),
+        documents: Mutex::new(HashMap::new()),
+        fail_export_once: None,
+    });
+    let use_case = TranscribeJob::new(
+        jobs.clone(),
+        media,
+        artifacts.clone(),
+        Arc::new(FakeSubtitles),
+        Arc::new(FakeEvents),
+        Arc::new(FakeIds),
+        Arc::new(FakeStageCommits {
+            artifacts: artifacts.clone(),
+        }),
+    );
+    let first = command(dir.path());
+    let mut job = Job::new_with_snapshot(
+        first.job_id.clone(),
+        first.batch_id.clone(),
+        first.execution_snapshot_id.clone(),
+        first.profile_revision.clone(),
+        first.input.to_string_lossy(),
+    );
+    job.start().unwrap();
+    job.start_stage(StageKind::Probe).unwrap();
+    let probe_path = first.job_dir.join("00_probe.json");
+    artifacts.documents.lock().unwrap().insert(
+        probe_path.to_string_lossy().into_owned(),
+        b"{not-json".to_vec(),
+    );
+    job.complete_stage(
+        StageKind::Probe,
+        ArtifactRef {
+            id: Ulid::new().into(),
+            stage: StageKind::Probe,
+            path: probe_path.to_string_lossy().into_owned(),
+            content_hash: "x".into(),
+            schema_version: SCHEMA_VERSION,
+            producer_fingerprint: "test".into(),
+        },
+        false,
+    )
+    .unwrap();
+    // Probe stays Done; job returns to Pending for resume.
+    job.recover_after_restart().unwrap();
+    let mut versioned = Versioned::with_version(job, 1);
+    jobs.save_job(&mut versioned, ExpectedVersion::Exact(1))
+        .await
+        .unwrap();
+
+    let mut asr = session(Some(transcript()), false);
+    let error = use_case.execute(first, &mut asr).await.unwrap_err();
+    assert_eq!(error.into_vc_error().code, ErrorCode::ArtifactCorrupt);
+}
+
+#[tokio::test]
+async fn from_snapshot_rebuilds_command_without_profile_defaults() {
+    use crate::execution_snapshot::{
+        AsrExecutionSnapshot, AudioStreamSelection, JobExecutionSnapshot, LlmExecutionSnapshot,
+        OutputPlanSnapshot, SourceStatSnapshot, JOB_EXECUTION_SNAPSHOT_SCHEMA_VERSION,
+    };
+    use crate::ports::{LlmStage, PromptSnapshot, StructuredOutput};
+    use std::collections::BTreeMap;
+
+    let prompt = |stage: LlmStage, body: &str| PromptSnapshot {
+        schema_version: 1,
+        stage,
+        files: BTreeMap::from([(String::from("system.txt"), body.to_owned())]),
+        content_hash: format!("hash-{body}"),
+    };
+    let job_id = Ulid::new().into();
+    let batch_id = Ulid::new().into();
+    let snapshot = JobExecutionSnapshot {
+        snapshot_id: Ulid::new().into(),
+        schema_version: JOB_EXECUTION_SNAPSHOT_SCHEMA_VERSION,
+        created_at: "2026-07-20T00:00:00Z".into(),
+        job_id,
+        batch_id,
+        canonical_source_path: "/media/input.mp4".into(),
+        source_stat: SourceStatSnapshot {
+            size: 9,
+            modified_at_ms: Some(1),
+        },
+        job_dir: "/jobs/1".into(),
+        profile_revision: Ulid::new().into(),
+        asr: AsrExecutionSnapshot {
+            engine: "whisper-cpp".into(),
+            model_locator: "/models/x.bin".into(),
+            model_id: None,
+            model_digest: None,
+            device: "cpu".into(),
+            compute_type: "default".into(),
+        },
+        audio_stream: AudioStreamSelection::Auto,
+        source_language: Some("en".into()),
+        target_language: Some("zh".into()),
+        output: OutputPlanSnapshot {
+            path: "/out/a.srt".into(),
+            format: "srt".into(),
+            layout: "bilingual_source_first".into(),
+            conflict_policy: "rename".into(),
+            fallback_to_source: false,
+        },
+        llm: Some(LlmExecutionSnapshot {
+            provider_profile_revision: "rev".into(),
+            model: "deepseek".into(),
+            max_context_tokens: Some(1),
+            max_output_tokens: Some(2),
+            chars_per_token: 4.0,
+            structured_output: StructuredOutput::JsonObject,
+            seed: Some(3),
+            target_language: "zh".into(),
+            split_prompt: prompt(LlmStage::Split, "split frozen"),
+            correct_prompt: prompt(LlmStage::Correct, "correct frozen"),
+            translate_prompt: prompt(LlmStage::Translate, "translate frozen"),
+        }),
+    };
+    let command = TranscribeJobCommand::from_snapshot(&snapshot).unwrap();
+    assert_eq!(command.input, PathBuf::from("/media/input.mp4"));
+    assert_eq!(command.export.output_path, PathBuf::from("/out/a.srt"));
+    assert_eq!(
+        command.llm.as_ref().unwrap().split_prompt.content_hash,
+        "hash-split frozen"
+    );
+    assert_eq!(command.llm.as_ref().unwrap().target_language, "zh");
 }

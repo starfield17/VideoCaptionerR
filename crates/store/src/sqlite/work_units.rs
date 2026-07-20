@@ -305,6 +305,41 @@ impl SqliteStore {
         Ok(retried)
     }
 
+    pub(crate) fn list_work_units_for_job(
+        &self,
+        job_id: &str,
+    ) -> VcResult<Vec<(String, u64)>> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT aggregate_json, aggregate_version FROM work_units
+                 WHERE job_id = ?1 AND aggregate_json IS NOT NULL
+                 ORDER BY unit_index, id",
+            )
+            .map_err(|error| {
+                VcError::new(
+                    ErrorCode::Internal,
+                    format!("prepare list work units: {error}"),
+                )
+            })?;
+        let rows = statement
+            .query_map([job_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })
+            .map_err(|error| {
+                VcError::new(
+                    ErrorCode::Internal,
+                    format!("query list work units: {error}"),
+                )
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+            VcError::new(
+                ErrorCode::Internal,
+                format!("read list work units: {error}"),
+            )
+        })
+    }
+
     pub(crate) fn count_retryable(&self, job_id: &str, from_stage: Option<&str>) -> VcResult<u32> {
         let mut statement = self
             .conn

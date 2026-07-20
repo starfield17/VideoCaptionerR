@@ -1,5 +1,9 @@
-use super::commit::{stage_artifact, stage_is_pending};
+use super::commit::{stage_artifact, stage_is_done, stage_is_pending};
 use super::*;
+use crate::artifacts::{
+    ExtractManifest, ProbeManifest, EXTRACT_MANIFEST_SCHEMA_VERSION, PROBE_MANIFEST_SCHEMA_VERSION,
+};
+use crate::execution_snapshot::{JobExecutionSnapshot, SourceStatSnapshot};
 
 impl TranscribeJob {
     pub async fn execute(
@@ -58,58 +62,18 @@ impl TranscribeJob {
 
         let mut current_stage = None;
         let result: AppResult<TranscribeJobResponse> = async {
-            let source_hash = self.media.media_hash(&command.input).await?;
-            let probe_pending = stage_is_pending(&job, StageKind::Probe);
-            if probe_pending {
-                job.start_stage(StageKind::Probe)?;
-                current_stage = Some(StageKind::Probe);
-            }
-            let probed = self
-                .media
-                .probe(ProbeMediaRequest {
-                    input: command.input.clone(),
-                    job_dir: command.job_dir.clone(),
-                })
-                .await?;
-            if !probed.probe.has_audio() {
-                return Err(ApplicationError::Adapter(VcError::new(
-                    ErrorCode::AudioStreamNotFound,
-                    "no audio streams",
-                )));
-            }
-            let stream_index = probed
-                .probe
-                .auto_select_stream()
-                .or_else(|| probed.probe.default_stream())
-                .ok_or_else(|| {
-                    ApplicationError::Adapter(VcError::new(
-                        ErrorCode::AudioStreamNotFound,
-                        "no selectable audio stream",
-                    ))
-                })?
-                .stream_index;
-            if probe_pending {
-                self.commit_input_stage(&mut job, probed.artifact).await?;
+            // Source identity is validated against the frozen snapshot before
+            // any stage work. A changed path/size/mtime fails closed.
+            if let Some(snapshot) = self.snapshot_for(&command).await? {
+                validate_source_against_snapshot(&command.input, &snapshot)?;
             }
 
-            let extract_pending = stage_is_pending(&job, StageKind::ExtractAudio);
-            if extract_pending {
-                job.start_stage(StageKind::ExtractAudio)?;
-                current_stage = Some(StageKind::ExtractAudio);
-            }
-            let extracted = self
-                .media
-                .extract_audio(crate::ports::ExtractAudioRequest {
-                    input: command.input.clone(),
-                    stream_index,
-                    expected_duration_ms: Some(probed.probe.duration_ms),
-                    job_dir: command.job_dir.clone(),
-                })
+            let probe = self
+                .ensure_probe(&mut job, &command, &mut current_stage)
                 .await?;
-            if extract_pending {
-                self.commit_input_stage(&mut job, extracted.artifact)
-                    .await?;
-            }
+            let extract = self
+                .ensure_extract(&mut job, &command, &probe, &mut current_stage)
+                .await?;
 
             let asr_pending = stage_is_pending(&job, StageKind::Asr);
             if asr_pending {
@@ -127,10 +91,10 @@ impl TranscribeJob {
                     .transcribe_asr(
                         &command,
                         session,
-                        &source_hash,
-                        &extracted.pcm_hash,
-                        &extracted.wav_path,
-                        probed.probe.duration_ms,
+                        &probe.source_hash,
+                        &extract.pcm_hash,
+                        &extract.wav_path_buf(),
+                        probe.probe.duration_ms,
                     )
                     .await?;
                 transcript.validate()?;
@@ -145,8 +109,7 @@ impl TranscribeJob {
                 .await?;
                 transcript
             } else {
-                let artifact = stage_artifact(&job, StageKind::Asr)?;
-                self.artifacts.load_transcript(&artifact).await?
+                self.load_stage_transcript(&job, StageKind::Asr).await?
             };
 
             let split_pending = stage_is_pending(&job, StageKind::Split);
@@ -185,9 +148,10 @@ impl TranscribeJob {
                 )
                 .await?;
                 transcript
+            } else if stage_is_done(&job, StageKind::Split) {
+                self.load_stage_transcript(&job, StageKind::Split).await?
             } else {
-                let artifact = stage_artifact(&job, StageKind::Split)?;
-                self.artifacts.load_transcript(&artifact).await?
+                asr_transcript
             };
 
             if let Some(options) = &command.llm {
@@ -215,9 +179,8 @@ impl TranscribeJob {
                         degraded,
                     )
                     .await?;
-                } else {
-                    let artifact = stage_artifact(&job, StageKind::Correct)?;
-                    final_transcript = self.artifacts.load_transcript(&artifact).await?;
+                } else if stage_is_done(&job, StageKind::Correct) {
+                    final_transcript = self.load_stage_transcript(&job, StageKind::Correct).await?;
                 }
 
                 if stage_is_pending(&job, StageKind::Translate) {
@@ -237,9 +200,9 @@ impl TranscribeJob {
                         degraded,
                     )
                     .await?;
-                } else {
-                    let artifact = stage_artifact(&job, StageKind::Translate)?;
-                    final_transcript = self.artifacts.load_transcript(&artifact).await?;
+                } else if stage_is_done(&job, StageKind::Translate) {
+                    final_transcript =
+                        self.load_stage_transcript(&job, StageKind::Translate).await?;
                 }
             } else {
                 if stage_is_pending(&job, StageKind::Correct) {
@@ -273,7 +236,9 @@ impl TranscribeJob {
                 exported.path
             } else {
                 let artifact = stage_artifact(&job, StageKind::Export)?;
-                self.artifacts.validate(&artifact).await?;
+                self.artifacts.validate(&artifact).await.map_err(|error| {
+                    map_corrupt(error, "export artifact is missing or hash-invalid")
+                })?;
                 PathBuf::from(artifact.path)
             };
             job.finish()?;
@@ -308,4 +273,276 @@ impl TranscribeJob {
         }
         result
     }
+
+    async fn snapshot_for(
+        &self,
+        command: &TranscribeJobCommand,
+    ) -> AppResult<Option<JobExecutionSnapshot>> {
+        let Some(loader) = &self.snapshots else {
+            return Ok(None);
+        };
+        loader
+            .load_execution_snapshot(&command.execution_snapshot_id)
+            .await
+    }
+
+    async fn ensure_probe(
+        &self,
+        job: &mut Versioned<Job>,
+        command: &TranscribeJobCommand,
+        current_stage: &mut Option<StageKind>,
+    ) -> AppResult<ProbeManifest> {
+        if stage_is_pending(job, StageKind::Probe) {
+            job.start_stage(StageKind::Probe)?;
+            *current_stage = Some(StageKind::Probe);
+            let source_hash = self.media.media_hash(&command.input).await?;
+            let source_stat = current_source_stat(&command.input)?;
+            let probed = self
+                .media
+                .probe(ProbeMediaRequest {
+                    input: command.input.clone(),
+                    job_dir: command.job_dir.clone(),
+                })
+                .await?;
+            if !probed.probe.has_audio() {
+                return Err(ApplicationError::Adapter(VcError::new(
+                    ErrorCode::AudioStreamNotFound,
+                    "no audio streams",
+                )));
+            }
+            let stream_index = probed
+                .probe
+                .auto_select_stream()
+                .or_else(|| probed.probe.default_stream())
+                .ok_or_else(|| {
+                    ApplicationError::Adapter(VcError::new(
+                        ErrorCode::AudioStreamNotFound,
+                        "no selectable audio stream",
+                    ))
+                })?
+                .stream_index;
+            let manifest = ProbeManifest {
+                schema_version: PROBE_MANIFEST_SCHEMA_VERSION,
+                source_path: command.input.to_string_lossy().into_owned(),
+                source_stat,
+                source_hash,
+                probe: probed.probe,
+                selected_stream_index: stream_index,
+                producer: probed.artifact.producer_fingerprint.clone(),
+            };
+            manifest
+                .validate()
+                .map_err(|message| ApplicationError::Invalid(message))?;
+            let bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| {
+                ApplicationError::Adapter(VcError::new(
+                    ErrorCode::ArtifactCommitFailed,
+                    format!("encode probe manifest: {error}"),
+                ))
+            })?;
+            let path = command.job_dir.join("00_probe.json");
+            self.commit_bytes_stage(
+                job,
+                StageKind::Probe,
+                path,
+                bytes,
+                manifest.producer.clone(),
+            )
+            .await?;
+            return Ok(manifest);
+        }
+
+        if stage_is_done(job, StageKind::Probe) {
+            let artifact = stage_artifact(job, StageKind::Probe)?;
+            let manifest = self
+                .artifacts
+                .load_probe_manifest(&artifact)
+                .await
+                .map_err(|error| map_corrupt(error, "probe artifact is corrupt"))?;
+            let current_hash = self.media.media_hash(&command.input).await?;
+            if current_hash != manifest.source_hash {
+                return Err(ApplicationError::Adapter(VcError::new(
+                    ErrorCode::SourceChanged,
+                    format!(
+                        "source content hash changed for {}",
+                        command.input.display()
+                    ),
+                )));
+            }
+            return Ok(manifest);
+        }
+
+        Err(ApplicationError::Invalid(format!(
+            "probe stage is {:?} and cannot be reused or executed",
+            stage_status(job, StageKind::Probe)
+        )))
+    }
+
+    async fn ensure_extract(
+        &self,
+        job: &mut Versioned<Job>,
+        command: &TranscribeJobCommand,
+        probe: &ProbeManifest,
+        current_stage: &mut Option<StageKind>,
+    ) -> AppResult<ExtractManifest> {
+        if stage_is_pending(job, StageKind::ExtractAudio) {
+            job.start_stage(StageKind::ExtractAudio)?;
+            *current_stage = Some(StageKind::ExtractAudio);
+            let extracted = self
+                .media
+                .extract_audio(crate::ports::ExtractAudioRequest {
+                    input: command.input.clone(),
+                    stream_index: probe.selected_stream_index,
+                    expected_duration_ms: Some(probe.probe.duration_ms),
+                    job_dir: command.job_dir.clone(),
+                })
+                .await?;
+            let stream = probe
+                .probe
+                .audio_streams
+                .iter()
+                .find(|stream| stream.stream_index == probe.selected_stream_index)
+                .ok_or_else(|| {
+                    ApplicationError::Adapter(VcError::new(
+                        ErrorCode::AudioStreamNotFound,
+                        "selected stream missing from probe manifest",
+                    ))
+                })?;
+            let probe_artifact_id = stage_artifact(job, StageKind::Probe)?.id;
+            let manifest = ExtractManifest {
+                schema_version: EXTRACT_MANIFEST_SCHEMA_VERSION,
+                probe_artifact_id,
+                stream_index: probe.selected_stream_index,
+                wav_path: extracted.wav_path.to_string_lossy().into_owned(),
+                wav_content_hash: extracted.artifact.content_hash.clone(),
+                pcm_hash: extracted.pcm_hash,
+                sample_rate: stream.sample_rate,
+                channels: stream.channels,
+                duration_ms: probe.probe.duration_ms,
+                producer: extracted.artifact.producer_fingerprint.clone(),
+            };
+            manifest
+                .validate()
+                .map_err(|message| ApplicationError::Invalid(message))?;
+            let bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| {
+                ApplicationError::Adapter(VcError::new(
+                    ErrorCode::ArtifactCommitFailed,
+                    format!("encode extract manifest: {error}"),
+                ))
+            })?;
+            let path = command.job_dir.join("00_extract.json");
+            self.commit_bytes_stage(
+                job,
+                StageKind::ExtractAudio,
+                path,
+                bytes,
+                manifest.producer.clone(),
+            )
+            .await?;
+            return Ok(manifest);
+        }
+
+        if stage_is_done(job, StageKind::ExtractAudio) {
+            let artifact = stage_artifact(job, StageKind::ExtractAudio)?;
+            let manifest = self
+                .artifacts
+                .load_extract_manifest(&artifact)
+                .await
+                .map_err(|error| map_corrupt(error, "extract artifact is corrupt"))?;
+            // Validate the WAV body against the committed hash. Corruption
+            // must surface as ARTIFACT_CORRUPT, never as a silent re-extract.
+            self.artifacts
+                .validate(&ArtifactRef {
+                    id: artifact.id.clone(),
+                    stage: StageKind::ExtractAudio,
+                    path: manifest.wav_path.clone(),
+                    content_hash: manifest.wav_content_hash.clone(),
+                    schema_version: artifact.schema_version,
+                    producer_fingerprint: artifact.producer_fingerprint.clone(),
+                })
+                .await
+                .map_err(|error| map_corrupt(error, "extracted WAV hash mismatch"))?;
+            return Ok(manifest);
+        }
+
+        Err(ApplicationError::Invalid(format!(
+            "extract stage is {:?} and cannot be reused or executed",
+            stage_status(job, StageKind::ExtractAudio)
+        )))
+    }
+
+    async fn load_stage_transcript(
+        &self,
+        job: &Job,
+        stage: StageKind,
+    ) -> AppResult<Transcript> {
+        let artifact = stage_artifact(job, stage)?;
+        self.artifacts
+            .load_transcript(&artifact)
+            .await
+            .map_err(|error| map_corrupt(error, &format!("{stage:?} transcript is corrupt")))
+    }
+}
+
+fn stage_status(job: &Job, kind: StageKind) -> StageStatus {
+    job.stages()
+        .iter()
+        .find(|stage| stage.kind == kind)
+        .map(|stage| stage.status)
+        .unwrap_or(StageStatus::Pending)
+}
+
+fn map_corrupt(error: ApplicationError, message: &str) -> ApplicationError {
+    let vc = error.into_vc_error();
+    if vc.code == ErrorCode::ArtifactCorrupt {
+        ApplicationError::Adapter(vc)
+    } else {
+        ApplicationError::Adapter(VcError::new(ErrorCode::ArtifactCorrupt, message).with_detail(vc.message))
+    }
+}
+
+fn current_source_stat(path: &Path) -> AppResult<SourceStatSnapshot> {
+    let metadata = std::fs::metadata(path).map_err(|error| {
+        ApplicationError::Adapter(VcError::new(
+            ErrorCode::InputNotFound,
+            format!("read source metadata {}: {error}", path.display()),
+        ))
+    })?;
+    let modified_at_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|value| u64::try_from(value.as_millis()).ok());
+    Ok(SourceStatSnapshot {
+        size: metadata.len(),
+        modified_at_ms,
+    })
+}
+
+fn validate_source_against_snapshot(
+    path: &Path,
+    snapshot: &JobExecutionSnapshot,
+) -> AppResult<()> {
+    if path.to_string_lossy() != snapshot.canonical_source_path {
+        return Err(ApplicationError::Adapter(VcError::new(
+            ErrorCode::SourceChanged,
+            format!(
+                "source path changed: expected {}, got {}",
+                snapshot.canonical_source_path,
+                path.display()
+            ),
+        )));
+    }
+    let current = current_source_stat(path)?;
+    if current.size != snapshot.source_stat.size
+        || current.modified_at_ms != snapshot.source_stat.modified_at_ms
+    {
+        return Err(ApplicationError::Adapter(VcError::new(
+            ErrorCode::SourceChanged,
+            format!(
+                "source size/mtime changed for {}",
+                snapshot.canonical_source_path
+            ),
+        )));
+    }
+    Ok(())
 }

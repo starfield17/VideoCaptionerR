@@ -3,6 +3,14 @@ use crate::error::{DomainError, DomainResult};
 use crate::identity::{JobId, WorkUnitId};
 use serde::{Deserialize, Serialize};
 
+/// Default automatic retry budget for a WorkUnit (two retries after the first
+/// attempt). Deterministic failures never consume this budget.
+pub const WORK_UNIT_DEFAULT_AUTO_RETRIES: u32 = 2;
+
+/// OOM may change strategy at most once (for example smaller batch or compute
+/// mode). Silent GPU→CPU fallback is never implied by this budget.
+pub const WORK_UNIT_OOM_STRATEGY_RETRIES: u32 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkUnitStatus {
@@ -11,6 +19,30 @@ pub enum WorkUnitStatus {
     Done,
     Failed,
     Cancelled,
+}
+
+/// Errors that must not be automatically retried. Protocol pollution, corrupt
+/// models, and unsupported parameters fall into this set.
+pub fn is_deterministic_work_unit_error(error_code: &str) -> bool {
+    matches!(
+        error_code,
+        "WORKER_PROTOCOL_ERROR"
+            | "MODEL_DIGEST_MISMATCH"
+            | "MODEL_NOT_FOUND"
+            | "OPTION_UNSUPPORTED"
+            | "ENGINE_CAPABILITY_INSUFFICIENT"
+            | "ARTIFACT_CORRUPT"
+            | "SOURCE_CHANGED"
+            | "INPUT_NOT_FOUND"
+            | "INPUT_UNSUPPORTED"
+            | "AUDIO_STREAM_NOT_FOUND"
+            | "INVALID_ARGUMENT"
+            | "INVALID_CONFIG"
+    )
+}
+
+pub fn is_oom_error(error_code: &str) -> bool {
+    error_code == "ASR_OOM"
 }
 
 impl WorkUnitStatus {
@@ -35,6 +67,8 @@ pub struct WorkUnit {
     input_hash: String,
     status: WorkUnitStatus,
     attempt: u32,
+    #[serde(default)]
+    oom_strategy_retries: u32,
     lease: Option<Lease>,
     error_code: Option<String>,
     artifact: Option<ArtifactRef>,
@@ -64,6 +98,7 @@ impl WorkUnit {
             input_hash,
             status: WorkUnitStatus::Pending,
             attempt: 0,
+            oom_strategy_retries: 0,
             lease: None,
             error_code: None,
             artifact: None,
@@ -102,8 +137,30 @@ impl WorkUnit {
         self.attempt
     }
 
+    pub fn oom_strategy_retries(&self) -> u32 {
+        self.oom_strategy_retries
+    }
+
+    pub fn error_code(&self) -> Option<&str> {
+        self.error_code.as_deref()
+    }
+
     pub fn lease(&self) -> Option<&Lease> {
         self.lease.as_ref()
+    }
+
+    /// Whether a recoverable failure may still be automatically retried under
+    /// the default two-retry budget. Deterministic errors always return false.
+    pub fn may_auto_retry(&self, error_code: &str) -> bool {
+        if is_deterministic_work_unit_error(error_code) || is_oom_error(error_code) {
+            return false;
+        }
+        self.attempt < WORK_UNIT_DEFAULT_AUTO_RETRIES
+    }
+
+    /// OOM is allowed one strategy-changing retry. GPU→CPU is not implied.
+    pub fn may_oom_strategy_retry(&self) -> bool {
+        self.oom_strategy_retries < WORK_UNIT_OOM_STRATEGY_RETRIES
     }
 
     pub fn artifact(&self) -> Option<&ArtifactRef> {
@@ -171,6 +228,52 @@ impl WorkUnit {
         self.lease = None;
         self.error_code = Some(error_code.into());
         Ok(())
+    }
+
+    /// Requeue a running unit after a recoverable failure. Returns `true` when
+    /// the unit was returned to Pending for another attempt, or `false` when
+    /// the automatic retry budget is exhausted and the unit is Failed.
+    pub fn fail_with_auto_retry(&mut self, error_code: impl Into<String>) -> DomainResult<bool> {
+        let error_code = error_code.into();
+        if self.status != WorkUnitStatus::Running {
+            return Err(DomainError::IllegalTransition {
+                aggregate: "WorkUnit",
+                from: format!("{:?}", self.status),
+                to: "auto_retry".into(),
+            });
+        }
+        if self.may_auto_retry(&error_code) {
+            self.status = WorkUnitStatus::Pending;
+            self.lease = None;
+            self.attempt = self.attempt.saturating_add(1);
+            self.error_code = Some(error_code);
+            Ok(true)
+        } else {
+            self.fail(error_code)?;
+            Ok(false)
+        }
+    }
+
+    /// Record the single allowed OOM strategy-changing retry and requeue.
+    /// Returns `true` when requeued, `false` when the unit is permanently Failed.
+    pub fn requeue_after_oom_strategy_change(&mut self) -> DomainResult<bool> {
+        if self.status != WorkUnitStatus::Running {
+            return Err(DomainError::IllegalTransition {
+                aggregate: "WorkUnit",
+                from: format!("{:?}", self.status),
+                to: "oom_strategy_retry".into(),
+            });
+        }
+        if !self.may_oom_strategy_retry() {
+            self.fail("ASR_OOM")?;
+            return Ok(false);
+        }
+        self.oom_strategy_retries = self.oom_strategy_retries.saturating_add(1);
+        self.status = WorkUnitStatus::Pending;
+        self.lease = None;
+        self.attempt = self.attempt.saturating_add(1);
+        self.error_code = Some("ASR_OOM".into());
+        Ok(true)
     }
 
     pub fn cancel(&mut self) -> DomainResult<()> {

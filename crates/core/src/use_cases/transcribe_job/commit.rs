@@ -6,28 +6,29 @@ impl TranscribeJob {
         self.jobs.save_job(job, expected).await
     }
 
-    pub(super) async fn commit_input_stage(
+    pub(super) async fn commit_bytes_stage(
         &self,
         job: &mut Versioned<Job>,
-        input: ArtifactInput,
+        stage: StageKind,
+        path: PathBuf,
+        bytes: Vec<u8>,
+        producer_fingerprint: String,
     ) -> AppResult<ArtifactRef> {
         let artifact = ArtifactRef {
             id: self.ids.next_id(),
-            stage: input.stage,
-            path: input.path.to_string_lossy().into_owned(),
-            content_hash: input.content_hash,
-            schema_version: input.schema_version,
-            producer_fingerprint: input.producer_fingerprint,
+            stage,
+            path: path.to_string_lossy().into_owned(),
+            content_hash: blake3::hash(&bytes).to_hex().to_string(),
+            schema_version: videocaptionerr_domain::SCHEMA_VERSION,
+            producer_fingerprint,
         };
         let prepared = PreparedArtifact {
             job_id: job.id().clone(),
             artifact: artifact.clone(),
-            source: ArtifactSource::ExistingFile {
-                path: PathBuf::from(&artifact.path),
-            },
+            source: ArtifactSource::Bytes { bytes },
         };
         let mut candidate = job.value.clone();
-        candidate.complete_stage(input.stage, artifact.clone(), false)?;
+        candidate.complete_stage(stage, artifact.clone(), false)?;
         self.commit_atomic_job(job, candidate, Some(prepared))
             .await?;
         Ok(artifact)
@@ -168,6 +169,12 @@ pub(super) fn stage_is_pending(job: &Job, kind: StageKind) -> bool {
         .iter()
         .find(|stage| stage.kind == kind)
         .is_some_and(|stage| stage.status == StageStatus::Pending)
+}
+
+pub(super) fn stage_is_done(job: &Job, kind: StageKind) -> bool {
+    job.stages().iter().find(|stage| stage.kind == kind).is_some_and(
+        |stage| matches!(stage.status, StageStatus::Done | StageStatus::DoneDegraded),
+    )
 }
 
 pub(super) fn stage_artifact(job: &Job, kind: StageKind) -> AppResult<ArtifactRef> {

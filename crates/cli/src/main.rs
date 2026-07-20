@@ -308,34 +308,39 @@ fn run(cli: Cli) -> Result<ExitCode, VcError> {
                             format!("create Tokio runtime: {error}"),
                         )
                     })?;
-                    let result = async_runtime.block_on(runtime.retry_job(
+                    let outcome = async_runtime.block_on(runtime.retry_job(
                         &id,
                         from_stage.as_deref(),
                         dry_run,
                     ))?;
+                    let plan = outcome.plan();
+                    let terminal = match &outcome {
+                        videocaptionerr_bootstrap::RetryJobOutcome::DryRun(_) => None,
+                        videocaptionerr_bootstrap::RetryJobOutcome::Executed { result, .. } => {
+                            result.jobs.first().map(|job| format!("{:?}", job.job.status()))
+                        }
+                    };
                     emit_or_print(
                         cli.json,
                         CliEvent::RetryFinished,
-                        Some(result.job_id.to_string()),
+                        Some(plan.job_id.to_string()),
                         serde_json::json!({
-                            "from_stage": result.from_stage.map(|stage| stage.as_str()),
-                            "retryable_units": result.retryable_units,
-                            "retried_units": result.retried_units,
-                            "dry_run": result.dry_run,
+                            "start_stage": plan.start_stage.as_str(),
+                            "reused_artifacts": plan.reused_artifacts.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                            "invalidated_stages": plan.invalidated_stages.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                            "work_units_to_reset": plan.work_units_to_reset,
+                            "output_path": plan.output_path,
+                            "needs_runtime": plan.needs_runtime,
+                            "dry_run": plan.dry_run,
+                            "terminal_status": terminal,
                         }),
                         format!(
-                            "job {}: {} {} retryable work units",
-                            result.job_id,
-                            if result.dry_run {
-                                "would retry"
-                            } else {
-                                "retried"
-                            },
-                            if result.dry_run {
-                                result.retryable_units
-                            } else {
-                                result.retried_units
-                            }
+                            "job {}: {} from {} (reuse {:?}, invalidate {:?})",
+                            plan.job_id,
+                            if plan.dry_run { "would retry" } else { "retried" },
+                            plan.start_stage.as_str(),
+                            plan.reused_artifacts,
+                            plan.invalidated_stages,
                         ),
                     )?;
                     Ok(ExitCode::Success)

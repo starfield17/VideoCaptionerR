@@ -406,3 +406,111 @@ pub(crate) fn insert_outbox_tx(
     .map_err(|error| VcError::new(ErrorCode::Internal, format!("insert outbox event: {error}")))?;
     Ok(())
 }
+
+impl SqliteStore {
+    pub(crate) fn apply_retry_transaction(
+        &mut self,
+        request: videocaptionerr_core::ports::RetryTransactionRequest,
+    ) -> VcResult<videocaptionerr_core::ports::RetryTransactionResult> {
+        let tx = self.conn.unchecked_transaction().map_err(|error| {
+            VcError::new(
+                ErrorCode::Internal,
+                format!("begin retry transaction: {error}"),
+            )
+        })?;
+
+        let (job, job_expected) = &request.job;
+        update_job_tx(&tx, job, *job_expected)?;
+        sync_stage_projection(&tx, &job.value)?;
+
+        let mut work_units = Vec::with_capacity(request.work_units.len());
+        for (unit, expected) in &request.work_units {
+            update_work_unit_tx(&tx, unit, *expected)?;
+            work_units.push(videocaptionerr_core::ports::Versioned::with_version(
+                unit.value.clone(),
+                next_version(unit.version, *expected),
+            ));
+        }
+
+        let batch = if let Some((batch, expected)) = &request.batch {
+            update_batch_tx(&tx, batch, *expected)?;
+            Some(videocaptionerr_core::ports::Versioned::with_version(
+                batch.value.clone(),
+                next_version(batch.version, *expected),
+            ))
+        } else {
+            None
+        };
+
+        insert_outbox_tx(&tx, &request.event)?;
+
+        tx.commit().map_err(|error| {
+            VcError::new(
+                ErrorCode::Internal,
+                format!("commit retry transaction: {error}"),
+            )
+        })?;
+
+        Ok(videocaptionerr_core::ports::RetryTransactionResult {
+            batch,
+            job: videocaptionerr_core::ports::Versioned::with_version(
+                job.value.clone(),
+                next_version(job.version, *job_expected),
+            ),
+            work_units,
+        })
+    }
+}
+
+fn update_batch_tx(
+    tx: &rusqlite::Transaction<'_>,
+    batch: &videocaptionerr_core::ports::Versioned<videocaptionerr_domain::Batch>,
+    expected: ExpectedVersion,
+) -> VcResult<()> {
+    let ExpectedVersion::Exact(version) = expected else {
+        return Err(VcError::new(
+            ErrorCode::InvalidArgument,
+            "retry Batch update requires an exact CAS version",
+        ));
+    };
+    let aggregate_json = serde_json::to_string(&batch.value).map_err(|error| {
+        VcError::new(
+            ErrorCode::Internal,
+            format!("encode Batch aggregate: {error}"),
+        )
+    })?;
+    let profile = batch.value.execution_profile();
+    let changed = tx
+        .execute(
+            "UPDATE batches SET
+                status = ?1, asr_model_id = ?2, asr_device = ?3,
+                aggregate_json = ?4, aggregate_version = aggregate_version + 1,
+                updated_at = ?5
+             WHERE id = ?6 AND aggregate_version = ?7",
+            params![
+                match batch.value.status() {
+                    videocaptionerr_domain::BatchStatus::Pending => "pending",
+                    videocaptionerr_domain::BatchStatus::Running => "running",
+                    videocaptionerr_domain::BatchStatus::Done => "done",
+                    videocaptionerr_domain::BatchStatus::Failed => "failed",
+                    videocaptionerr_domain::BatchStatus::Cancelled => "cancelled",
+                },
+                profile.asr_model.as_str(),
+                profile.device.as_str(),
+                aggregate_json,
+                chrono::Utc::now().to_rfc3339(),
+                batch.value.id().as_str(),
+                version as i64,
+            ],
+        )
+        .map_err(|error| {
+            VcError::new(
+                ErrorCode::Internal,
+                format!("update Batch aggregate: {error}"),
+            )
+        })?;
+    if changed != 1 {
+        return Err(stale_result("Batch", batch.value.id().as_str(), expected));
+    }
+    Ok(())
+}

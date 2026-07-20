@@ -31,6 +31,28 @@ pub enum SubtitleLayout {
     BilingualTranslationFirst,
 }
 
+impl SubtitleLayout {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "source_only" | "source" => Some(Self::SourceOnly),
+            "translation_only" | "translation" => Some(Self::TranslationOnly),
+            "bilingual_source_first" | "bilingual" => Some(Self::BilingualSourceFirst),
+            "bilingual_translation_first" => Some(Self::BilingualTranslationFirst),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SourceOnly => "source_only",
+            Self::TranslationOnly => "translation_only",
+            Self::BilingualSourceFirst => "bilingual_source_first",
+            Self::BilingualTranslationFirst => "bilingual_translation_first",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct SubtitleExportRequest {
     pub output_path: PathBuf,
     pub format: SubtitleFormat,

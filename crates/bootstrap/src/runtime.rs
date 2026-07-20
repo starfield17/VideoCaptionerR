@@ -6,11 +6,11 @@ use videocaptionerr_contracts::error::{ErrorCode, VcError, VcResult};
 use videocaptionerr_core::ports::{
     ArtifactRecoveryStore, ArtifactStore, AsrRuntime, BatchRepository, CacheRepository,
     CapabilityProbeStore, ChunkPlanStore, Clock, EventPublisher, IdGenerator, JobRepository,
-    OutboxRepository, SnapshotRepository, StageCommitRepository, SubtitleGateway,
-    WorkUnitRepository,
+    OutboxRepository, RetryTransactionRepository, SnapshotRepository, StageCommitRepository,
+    SubtitleGateway, WorkUnitRepository,
 };
 use videocaptionerr_core::use_cases::{
-    CacheGc, PersistChunkPlan, RecoveryReport, RetryFailedWorkUnits, RunBatch, StartupRecovery,
+    CacheGc, PersistChunkPlan, RecoveryReport, RetryJob, RunBatch, StartupRecovery,
     TranscriptEditor, WorkUnitScheduler,
 };
 use videocaptionerr_platform::{
@@ -34,7 +34,7 @@ pub struct ApplicationRuntime {
     pub(crate) batches: Arc<dyn BatchRepository>,
     pub(crate) snapshots: Arc<dyn SnapshotRepository>,
     pub(crate) run_batch: Arc<RunBatch>,
-    pub(crate) retry_failed: Arc<RetryFailedWorkUnits>,
+    pub(crate) retry_job_uc: Arc<RetryJob>,
     pub(crate) cache_gc: Arc<CacheGc>,
     pub(crate) scheduler: Arc<WorkUnitScheduler>,
     pub(crate) chunk_plans: Arc<PersistChunkPlan>,
@@ -129,7 +129,8 @@ impl ApplicationRuntime {
             events.clone(),
             ids,
             stage_commits,
-        );
+        )
+        .with_snapshots(snapshots.clone());
         if let Some(pipeline) = llm_pipeline {
             transcribe_service = transcribe_service.with_llm_pipeline(pipeline);
         }
@@ -147,7 +148,14 @@ impl ApplicationRuntime {
             transcribe,
             events,
         ));
-        let retry_failed = Arc::new(RetryFailedWorkUnits::new(jobs.clone(), work_units.clone()));
+        let retry_tx: Arc<dyn RetryTransactionRepository> = Arc::new(store.clone());
+        let retry_job_uc = Arc::new(RetryJob::new(
+            jobs.clone(),
+            batches.clone(),
+            work_units.clone(),
+            snapshots.clone(),
+            retry_tx,
+        ));
         let cache_gc = Arc::new(CacheGc::new(cache));
         let scheduler = Arc::new(WorkUnitScheduler::new(work_units, clock));
 
@@ -160,7 +168,7 @@ impl ApplicationRuntime {
             batches,
             snapshots,
             run_batch,
-            retry_failed,
+            retry_job_uc,
             cache_gc,
             scheduler,
             chunk_plans,

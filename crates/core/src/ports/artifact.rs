@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use videocaptionerr_domain::{ArtifactRef, JobId, StageKind, UlidStr, WorkUnitId};
 
 use crate::application_error::AppResult;
+use crate::artifacts::{ExtractManifest, ProbeManifest};
 use crate::chunking::ChunkPlan;
 
 pub struct ArtifactCommit {
@@ -69,6 +70,8 @@ pub trait ArtifactStore: Send + Sync {
         &self,
         artifact: &ArtifactRef,
     ) -> AppResult<videocaptionerr_domain::Transcript>;
+    async fn load_probe_manifest(&self, artifact: &ArtifactRef) -> AppResult<ProbeManifest>;
+    async fn load_extract_manifest(&self, artifact: &ArtifactRef) -> AppResult<ExtractManifest>;
     async fn validate(&self, artifact: &ArtifactRef) -> AppResult<()>;
 }
 

@@ -16,4 +16,7 @@ pub use batch::{Batch, BatchExecutionProfile, BatchStatus};
 pub use event::{DomainEvent, JobTerminalStatus};
 pub use job::Job;
 pub use stage::{ArtifactRef, JobStatus, StageKind, StageState, StageStatus};
-pub use work_unit::{Lease, WorkUnit, WorkUnitStatus};
+pub use work_unit::{
+    is_deterministic_work_unit_error, is_oom_error, Lease, WorkUnit, WorkUnitStatus,
+    WORK_UNIT_DEFAULT_AUTO_RETRIES, WORK_UNIT_OOM_STRATEGY_RETRIES,
+};

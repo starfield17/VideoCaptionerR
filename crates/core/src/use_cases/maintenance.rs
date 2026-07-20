@@ -47,7 +47,7 @@ impl RetryFailedWorkUnits {
 
         // Validate the aggregate transition even for a dry run. No state is
         // changed until this check succeeds.
-        job.prepare_retry(command.from_stage)?;
+        let _start = job.prepare_retry(command.from_stage)?;
         if command.dry_run {
             return Ok(RetryFailedWorkUnitsResponse {
                 job_id: command.job_id,

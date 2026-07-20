@@ -113,6 +113,12 @@ impl Batch {
         self.cancel_requested
     }
 
+    pub fn has_terminal_record(&self, job_id: &JobId) -> bool {
+        self.terminal_jobs
+            .iter()
+            .any(|(candidate, _)| candidate == job_id)
+    }
+
     pub fn start(&mut self) -> DomainResult<()> {
         self.transition(BatchStatus::Running)
     }
@@ -191,6 +197,35 @@ impl Batch {
             batch_id: self.id.clone(),
             status: BatchStatus::Cancelled,
         })
+    }
+
+    /// Request cancellation without immediately terminalizing the Batch.
+    /// Active Jobs/WorkUnits must reach their own Cancelled terminal states
+    /// before [`Self::finish`] may emit `BatchStatus::Cancelled`.
+    pub fn request_cancel(&mut self) -> DomainResult<()> {
+        if self.status.is_terminal() {
+            return Err(DomainError::AlreadyTerminal { aggregate: "Batch" });
+        }
+        self.cancel_requested = true;
+        Ok(())
+    }
+
+    /// Re-open a single member Job for retry without changing Batch identity,
+    /// membership, or ASR profile. Other terminal Jobs stay terminal.
+    pub fn prepare_retry(&mut self, job_id: &JobId) -> DomainResult<()> {
+        if !self.job_ids.iter().any(|candidate| candidate == job_id) {
+            return Err(DomainError::MemberNotFound {
+                aggregate: "Batch",
+                id: job_id.to_string(),
+            });
+        }
+        self.terminal_jobs.retain(|(candidate, _)| candidate != job_id);
+        self.terminal_event_emitted = false;
+        self.cancel_requested = false;
+        if self.status.is_terminal() || self.status == BatchStatus::Running {
+            self.status = BatchStatus::Pending;
+        }
+        Ok(())
     }
 
     /// A running Batch has no active owner after process restart. Returning it

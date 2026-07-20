@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use videocaptionerr_contracts::error::{ErrorCode, VcError, VcResult};
 use videocaptionerr_core::application_error::ApplicationError;
 use videocaptionerr_core::chunking::ChunkPlan;
-use videocaptionerr_core::use_cases::{RetryFailedWorkUnitsCommand, RetryFailedWorkUnitsResponse};
+use videocaptionerr_core::use_cases::{
+    RetryJobCommand, RetryJobResponse, RetryPlan, RunBatchCommand, RunBatchResponse,
+};
 use videocaptionerr_core::CacheGcResult;
 use videocaptionerr_domain::{ArtifactRef, Job, JobId, JobStatus, StageStatus};
 
@@ -38,12 +40,13 @@ impl ApplicationRuntime {
             .map_err(ApplicationError::into_vc_error)
     }
 
+    /// Plan and, unless dry-run, fully execute a Job retry to a terminal state.
     pub async fn retry_job(
         &self,
         id: &str,
         from_stage: Option<&str>,
         dry_run: bool,
-    ) -> VcResult<RetryFailedWorkUnitsResponse> {
+    ) -> VcResult<RetryJobOutcome> {
         let job_id: JobId = id.parse().map_err(|error| {
             VcError::new(
                 ErrorCode::InvalidArgument,
@@ -60,14 +63,47 @@ impl ApplicationRuntime {
                 })
             })
             .transpose()?;
-        self.retry_failed
-            .execute(RetryFailedWorkUnitsCommand {
-                job_id,
+
+        let prepared = self
+            .retry_job_uc
+            .execute(RetryJobCommand {
+                job_id: job_id.clone(),
                 from_stage: stage,
                 dry_run,
             })
             .await
-            .map_err(ApplicationError::into_vc_error)
+            .map_err(ApplicationError::into_vc_error)?;
+
+        if dry_run {
+            return Ok(RetryJobOutcome::DryRun(prepared.plan));
+        }
+
+        let command = prepared.command.ok_or_else(|| {
+            VcError::new(
+                ErrorCode::Internal,
+                "retry plan did not produce a TranscribeJobCommand",
+            )
+        })?;
+        let batch = prepared.batch.ok_or_else(|| {
+            VcError::new(
+                ErrorCode::InvalidArgument,
+                format!("Job {job_id} has no Batch and cannot open an ASR session"),
+            )
+        })?;
+
+        // One open, execute the reopened Job, finish Batch, one close.
+        let result = self
+            .run_batch
+            .execute(RunBatchCommand {
+                batch,
+                jobs: vec![command],
+            })
+            .await
+            .map_err(ApplicationError::into_vc_error)?;
+        Ok(RetryJobOutcome::Executed {
+            plan: prepared.plan,
+            result,
+        })
     }
 
     pub async fn gc_cache(&self, max_bytes: u64) -> VcResult<CacheGcResult> {
@@ -100,6 +136,27 @@ impl ApplicationRuntime {
             .execute(job_id, path, plan)
             .await
             .map_err(ApplicationError::into_vc_error)
+    }
+}
+
+pub enum RetryJobOutcome {
+    DryRun(RetryPlan),
+    Executed {
+        plan: RetryPlan,
+        result: RunBatchResponse,
+    },
+}
+
+impl RetryJobOutcome {
+    pub fn plan(&self) -> &RetryPlan {
+        match self {
+            Self::DryRun(plan) => plan,
+            Self::Executed { plan, .. } => plan,
+        }
+    }
+
+    pub fn dry_run(&self) -> bool {
+        matches!(self, Self::DryRun(_))
     }
 }
 
@@ -150,3 +207,7 @@ pub(crate) fn stage_status(status: StageStatus) -> String {
     }
     .into()
 }
+
+// Silence unused import warning if RetryJobResponse is only used transitively.
+#[allow(dead_code)]
+fn _retry_response_type(_: RetryJobResponse) {}

@@ -23,4 +23,5 @@ pub use dto::{
     CapabilityProbeView, CapabilityView, DoctorView, FailureView, JobSummary, ProcessOptions,
     ProcessView, StageSummary, TranscribeOptions, TranscriptEditView,
 };
+pub use jobs::RetryJobOutcome;
 pub use runtime::{ApplicationRuntime, ProcessingLease};

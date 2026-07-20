@@ -67,6 +67,54 @@ impl ArtifactStore for SqliteArtifactStore {
         Ok(transcript)
     }
 
+    async fn load_probe_manifest(
+        &self,
+        artifact: &ArtifactRef,
+    ) -> AppResult<videocaptionerr_core::ProbeManifest> {
+        self.validate(artifact).await?;
+        let body = fs::read_to_string(&artifact.path).map_err(|error| {
+            ApplicationError::Adapter(VcError::new(
+                ErrorCode::ArtifactCorrupt,
+                format!("read probe manifest {}: {error}", artifact.path),
+            ))
+        })?;
+        let manifest: videocaptionerr_core::ProbeManifest = serde_json::from_str(&body)
+            .map_err(|error| {
+                ApplicationError::Adapter(VcError::new(
+                    ErrorCode::ArtifactCorrupt,
+                    format!("decode probe manifest {}: {error}", artifact.path),
+                ))
+            })?;
+        manifest
+            .validate()
+            .map_err(|message| ApplicationError::Adapter(VcError::new(ErrorCode::ArtifactCorrupt, message)))?;
+        Ok(manifest)
+    }
+
+    async fn load_extract_manifest(
+        &self,
+        artifact: &ArtifactRef,
+    ) -> AppResult<videocaptionerr_core::ExtractManifest> {
+        self.validate(artifact).await?;
+        let body = fs::read_to_string(&artifact.path).map_err(|error| {
+            ApplicationError::Adapter(VcError::new(
+                ErrorCode::ArtifactCorrupt,
+                format!("read extract manifest {}: {error}", artifact.path),
+            ))
+        })?;
+        let manifest: videocaptionerr_core::ExtractManifest = serde_json::from_str(&body)
+            .map_err(|error| {
+                ApplicationError::Adapter(VcError::new(
+                    ErrorCode::ArtifactCorrupt,
+                    format!("decode extract manifest {}: {error}", artifact.path),
+                ))
+            })?;
+        manifest
+            .validate()
+            .map_err(|message| ApplicationError::Adapter(VcError::new(ErrorCode::ArtifactCorrupt, message)))?;
+        Ok(manifest)
+    }
+
     async fn validate(&self, artifact: &ArtifactRef) -> AppResult<()> {
         let actual = blake3_file(Path::new(&artifact.path)).map_err(ApplicationError::Adapter)?;
         if actual != artifact.content_hash {

@@ -1,4 +1,6 @@
 use super::*;
+use crate::execution_snapshot::JobExecutionSnapshot;
+use crate::ports::{SubtitleFormat, SubtitleLayout};
 
 #[derive(Debug, Clone)]
 pub struct LlmProcessOptions {
@@ -35,8 +37,25 @@ impl LlmProcessOptions {
             target_language: Some(self.target_language.clone()),
         }
     }
+
+    pub fn from_snapshot(snapshot: &crate::execution_snapshot::LlmExecutionSnapshot) -> Self {
+        Self {
+            model: snapshot.model.clone(),
+            provider_profile_revision: snapshot.provider_profile_revision.clone(),
+            split_prompt: snapshot.split_prompt.clone(),
+            correct_prompt: snapshot.correct_prompt.clone(),
+            translate_prompt: snapshot.translate_prompt.clone(),
+            max_context_tokens: snapshot.max_context_tokens,
+            max_output_tokens: snapshot.max_output_tokens,
+            chars_per_token: snapshot.chars_per_token,
+            structured_output: snapshot.structured_output,
+            seed: snapshot.seed,
+            target_language: snapshot.target_language.clone(),
+        }
+    }
 }
 
+#[derive(Debug, Clone)]
 pub struct TranscribeJobCommand {
     pub job_id: JobId,
     pub batch_id: Option<BatchId>,
@@ -47,6 +66,45 @@ pub struct TranscribeJobCommand {
     pub language: Option<String>,
     pub export: SubtitleExportRequest,
     pub llm: Option<LlmProcessOptions>,
+}
+
+impl TranscribeJobCommand {
+    /// Rebuild a Job command exclusively from its durable execution snapshot.
+    /// Retry/resume paths must not re-read Prompt files, OutputPlanner state,
+    /// or current Profile defaults.
+    pub fn from_snapshot(snapshot: &JobExecutionSnapshot) -> AppResult<Self> {
+        snapshot
+            .validate()
+            .map_err(ApplicationError::Invalid)?;
+        let format = SubtitleFormat::parse(&snapshot.output.format).ok_or_else(|| {
+            ApplicationError::Invalid(format!(
+                "execution snapshot has unsupported subtitle format '{}'",
+                snapshot.output.format
+            ))
+        })?;
+        let layout = SubtitleLayout::parse(&snapshot.output.layout).ok_or_else(|| {
+            ApplicationError::Invalid(format!(
+                "execution snapshot has unsupported subtitle layout '{}'",
+                snapshot.output.layout
+            ))
+        })?;
+        Ok(Self {
+            job_id: snapshot.job_id.clone(),
+            batch_id: Some(snapshot.batch_id.clone()),
+            execution_snapshot_id: snapshot.snapshot_id.clone(),
+            profile_revision: snapshot.profile_revision.clone(),
+            input: snapshot.source_path(),
+            job_dir: snapshot.job_dir_path(),
+            language: snapshot.source_language.clone(),
+            export: SubtitleExportRequest {
+                output_path: snapshot.output_path(),
+                format,
+                layout,
+                fallback_to_source: snapshot.output.fallback_to_source,
+            },
+            llm: snapshot.llm.as_ref().map(LlmProcessOptions::from_snapshot),
+        })
+    }
 }
 
 #[derive(Debug)]

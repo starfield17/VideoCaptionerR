@@ -138,6 +138,28 @@ impl WorkUnitRepository for StoreHandle {
             .map_err(ApplicationError::Adapter)
     }
 
+    async fn list_for_job(
+        &self,
+        job_id: &videocaptionerr_domain::JobId,
+    ) -> AppResult<Vec<Versioned<WorkUnit>>> {
+        let rows = self
+            .list_work_units_for_job(job_id.as_str())
+            .await
+            .map_err(ApplicationError::Adapter)?;
+        rows.into_iter()
+            .map(|(body, version)| {
+                serde_json::from_str(&body)
+                    .map_err(|error| {
+                        ApplicationError::Adapter(VcError::new(
+                            ErrorCode::ArtifactCorrupt,
+                            format!("decode WorkUnit aggregate: {error}"),
+                        ))
+                    })
+                    .map(|value| Versioned::with_version(value, version))
+            })
+            .collect()
+    }
+
     async fn lease_next_ready(
         &self,
         job_id: &videocaptionerr_domain::JobId,

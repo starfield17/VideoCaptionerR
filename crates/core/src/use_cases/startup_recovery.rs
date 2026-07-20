@@ -231,6 +231,13 @@ mod tests {
             Ok(0)
         }
 
+        async fn list_for_job(
+            &self,
+            _job_id: &JobId,
+        ) -> AppResult<Vec<Versioned<WorkUnit>>> {
+            Ok(Vec::new())
+        }
+
         async fn lease_next_ready(
             &self,
             _job_id: &JobId,

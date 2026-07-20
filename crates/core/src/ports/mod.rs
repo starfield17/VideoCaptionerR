@@ -30,7 +30,8 @@ pub use media::{
     ExtractAudioRangeRequest, ExtractAudioRequest, MediaGateway, ProbeMediaRequest, ProbedMedia,
 };
 pub use repositories::{
-    BatchRepository, ExpectedVersion, JobRepository, SnapshotRepository, StageCommitRepository,
+    BatchRepository, ExpectedVersion, JobRepository, RetryTransactionRepository,
+    RetryTransactionRequest, RetryTransactionResult, SnapshotRepository, StageCommitRepository,
     StageCommitRequest, StageCommitResult, Versioned, WorkUnitRepository,
 };
 pub use subtitle::{

@@ -13,6 +13,13 @@ pub struct Job {
     source_path: String,
     stages: Vec<StageState>,
     status: JobStatus,
+    /// Number of explicit user/application retries applied to this Job.
+    #[serde(default)]
+    retry_attempt: u32,
+    /// Monotonic generation bumped on every prepare_retry so WorkUnits and
+    /// projections can observe that a new attempt identity has begun.
+    #[serde(default)]
+    retry_generation: u32,
 }
 
 impl Job {
@@ -46,6 +53,8 @@ impl Job {
                 })
                 .collect(),
             status: JobStatus::Pending,
+            retry_attempt: 0,
+            retry_generation: 0,
         }
     }
 
@@ -87,6 +96,14 @@ impl Job {
 
     pub fn stages(&self) -> &[StageState] {
         &self.stages
+    }
+
+    pub fn retry_attempt(&self) -> u32 {
+        self.retry_attempt
+    }
+
+    pub fn retry_generation(&self) -> u32 {
+        self.retry_generation
     }
 
     /// Point the stage at a newly committed transcript revision. The previous
@@ -300,7 +317,11 @@ impl Job {
     /// Prepare an explicit retry without allowing a terminal job to silently
     /// return to the running state. Completed prerequisite stages remain
     /// reusable; the selected stage and all later stages are invalidated.
-    pub fn prepare_retry(&mut self, from_stage: Option<StageKind>) -> DomainResult<()> {
+    ///
+    /// When `from_stage` is `None`, the first Failed/Cancelled/WaitingProvider
+    /// stage is selected. There is no silent fallback to stage 0 — callers
+    /// that want a full restart must pass `Some(StageKind::Probe)`.
+    pub fn prepare_retry(&mut self, from_stage: Option<StageKind>) -> DomainResult<StageKind> {
         if !matches!(
             self.status,
             JobStatus::Failed | JobStatus::DoneDegraded | JobStatus::Cancelled
@@ -322,14 +343,21 @@ impl Job {
                         StageStatus::Failed | StageStatus::Cancelled | StageStatus::WaitingProvider
                     )
                 })
-                .unwrap_or(0),
+                .ok_or_else(|| {
+                    DomainError::InvalidArgument(
+                        "prepare_retry requires from_stage when no failed stage is present".into(),
+                    )
+                })?,
         };
+        let start_kind = self.stages[start_index].kind;
         for stage in self.stages.iter_mut().skip(start_index) {
             stage.status = StageStatus::Pending;
             stage.artifact = None;
         }
+        self.retry_attempt = self.retry_attempt.saturating_add(1);
+        self.retry_generation = self.retry_generation.saturating_add(1);
         self.status = JobStatus::Pending;
-        Ok(())
+        Ok(start_kind)
     }
 
     fn stage_index(&self, kind: StageKind) -> DomainResult<usize> {
