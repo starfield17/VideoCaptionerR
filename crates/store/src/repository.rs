@@ -349,7 +349,7 @@ impl ArtifactStore for SqliteArtifactStore {
             ArtifactCommit {
                 job_id: commit.job_id,
                 artifact: artifact.clone(),
-                work_unit_id: None,
+                work_unit_id: commit.work_unit_id,
             },
         )
         .await?;
@@ -499,8 +499,188 @@ impl StatusString for videocaptionerr_domain::WorkUnitStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use videocaptionerr_core::ports::{JobRepository, WorkUnitRepository};
-    use videocaptionerr_domain::WorkUnitStatus;
+    use rusqlite::Connection;
+    use videocaptionerr_core::ports::{
+        ArtifactStore, JobRepository, TranscriptCommit, WorkUnitRepository,
+    };
+    use videocaptionerr_domain::{
+        EngineFingerprint, JobStatus, StageStatus, Transcript, WorkUnitStatus,
+    };
+
+    fn complete_job(job: &mut Job, asr_artifact: ArtifactRef) {
+        job.start().unwrap();
+        for stage in [
+            StageKind::Probe,
+            StageKind::ExtractAudio,
+            StageKind::Asr,
+            StageKind::Split,
+            StageKind::Correct,
+            StageKind::Translate,
+            StageKind::Export,
+        ] {
+            job.start_stage(stage).unwrap();
+            let artifact = if stage == StageKind::Asr {
+                asr_artifact.clone()
+            } else {
+                ArtifactRef {
+                    id: ulid::Ulid::new().into(),
+                    stage,
+                    path: format!("{stage:?}.json"),
+                    content_hash: format!("{stage:?}-hash"),
+                    schema_version: videocaptionerr_domain::SCHEMA_VERSION,
+                    producer_fingerprint: "test".into(),
+                }
+            };
+            job.complete_stage(stage, artifact, false).unwrap();
+        }
+        job.finish().unwrap();
+    }
+
+    #[tokio::test]
+    async fn transcript_commit_completes_leased_chunk_and_terminal_job_has_no_running_units() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("repository.db");
+        let store = StoreHandle::open(&db_path).unwrap();
+        let artifact_store = SqliteArtifactStore::new(store.clone());
+        let job_id: JobId = ulid::Ulid::new().into();
+        let mut job = Job::new(
+            job_id.clone(),
+            None,
+            ulid::Ulid::new().into(),
+            "/media/input.wav",
+        );
+        <StoreHandle as JobRepository>::save_job(&store, &job)
+            .await
+            .unwrap();
+
+        let mut unit = WorkUnit::new(
+            ulid::Ulid::new().into(),
+            job_id.clone(),
+            StageKind::Asr,
+            "asr_chunk",
+            0,
+            "chunk-input-hash",
+        )
+        .unwrap();
+        unit.lease_for("asr:test", 0, 1_000).unwrap();
+        <StoreHandle as WorkUnitRepository>::save_work_unit(&store, &unit)
+            .await
+            .unwrap();
+
+        let artifact = artifact_store
+            .commit_transcript(TranscriptCommit {
+                job_id: job_id.clone(),
+                stage: StageKind::Asr,
+                artifact_id: ulid::Ulid::new().into(),
+                path: dir.path().join("job/asr-chunks/chunk-0000.json"),
+                transcript: Transcript::new_asr(
+                    "source-hash",
+                    EngineFingerprint::unknown(),
+                    Vec::new(),
+                ),
+                producer_fingerprint: "fake@test".into(),
+                work_unit_id: Some(unit.id().clone()),
+            })
+            .await
+            .unwrap();
+
+        let completed_unit = <StoreHandle as WorkUnitRepository>::load_work_unit(&store, unit.id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed_unit.status(), WorkUnitStatus::Done);
+        assert_eq!(completed_unit.artifact(), Some(&artifact));
+
+        complete_job(&mut job, artifact);
+        <StoreHandle as JobRepository>::save_job(&store, &job)
+            .await
+            .unwrap();
+        let persisted_job = <StoreHandle as JobRepository>::load_job(&store, &job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted_job.status(), JobStatus::Done);
+        assert!(persisted_job
+            .stages()
+            .iter()
+            .all(|stage| stage.status == StageStatus::Done));
+
+        let connection = Connection::open(&db_path).unwrap();
+        let non_terminal_units: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM work_units
+                 WHERE job_id = ?1 AND status IN ('pending', 'running')",
+                [job_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(non_terminal_units, 0);
+    }
+
+    #[tokio::test]
+    async fn transcript_commit_failure_leaves_chunk_lease_recoverable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StoreHandle::open(&dir.path().join("repository.db")).unwrap();
+        let artifact_store = SqliteArtifactStore::new(store.clone());
+        let job_id: JobId = ulid::Ulid::new().into();
+        let job = Job::new(
+            job_id.clone(),
+            None,
+            ulid::Ulid::new().into(),
+            "/media/input.wav",
+        );
+        <StoreHandle as JobRepository>::save_job(&store, &job)
+            .await
+            .unwrap();
+
+        let mut unit = WorkUnit::new(
+            ulid::Ulid::new().into(),
+            job_id.clone(),
+            StageKind::Asr,
+            "asr_chunk",
+            0,
+            "chunk-input-hash",
+        )
+        .unwrap();
+        unit.lease_for("asr:test", 0, 1_000).unwrap();
+        <StoreHandle as WorkUnitRepository>::save_work_unit(&store, &unit)
+            .await
+            .unwrap();
+
+        assert!(artifact_store
+            .commit_transcript(TranscriptCommit {
+                job_id: job_id.clone(),
+                stage: StageKind::Asr,
+                artifact_id: ulid::Ulid::new().into(),
+                path: std::path::PathBuf::from("\0invalid-artifact.json"),
+                transcript: Transcript::new_asr(
+                    "source-hash",
+                    EngineFingerprint::unknown(),
+                    Vec::new(),
+                ),
+                producer_fingerprint: "fake@test".into(),
+                work_unit_id: Some(unit.id().clone()),
+            })
+            .await
+            .is_err());
+
+        let failed_unit = <StoreHandle as WorkUnitRepository>::load_work_unit(&store, unit.id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed_unit.status(), WorkUnitStatus::Running);
+        assert_eq!(
+            <StoreHandle as WorkUnitRepository>::recover_expired(&store, 1_001)
+                .await
+                .unwrap(),
+            1
+        );
+        let retryable_unit = <StoreHandle as WorkUnitRepository>::load_work_unit(&store, unit.id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retryable_unit.status(), WorkUnitStatus::Pending);
+    }
 
     #[tokio::test]
     async fn work_unit_repository_recovery_keeps_json_and_control_state_aligned() {

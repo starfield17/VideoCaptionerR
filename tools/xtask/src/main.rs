@@ -163,6 +163,7 @@ fn check() -> Result<()> {
         "warnings",
     ]))?;
     run(Command::new("cargo").args(["test", "--workspace"]))?;
+    run(Command::new("cargo").args(["run", "-p", "xtask", "--", "verify-architecture"]))?;
     Ok(())
 }
 
