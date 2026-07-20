@@ -1,6 +1,7 @@
 use super::*;
 
 impl SqliteStore {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn save_job_aggregate(
         &self,
         id: &str,

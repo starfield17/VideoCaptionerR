@@ -343,6 +343,7 @@ impl SqliteStore {
     }
 
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_work_unit(
         &self,
         id: &str,
