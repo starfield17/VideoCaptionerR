@@ -31,11 +31,7 @@ pub struct EditCueRequest {
 
 #[tauri::command]
 async fn list_jobs(state: State<'_, DesktopState>) -> Result<Vec<JobSummary>, String> {
-    state
-        .runtime
-        .list_job_summaries()
-        .await
-        .map_err(error_text)
+    state.runtime.list_job_summaries().await.map_err(error_text)
 }
 
 #[tauri::command]
@@ -51,7 +47,10 @@ async fn process_files(
     if request.files.is_empty() {
         return Err("INVALID_ARGUMENT: no input files".into());
     }
-    let _lock = state.runtime.acquire_gui_processing_lock().map_err(error_text)?;
+    let _lock = state
+        .runtime
+        .acquire_gui_processing_lock()
+        .map_err(error_text)?;
     let files = request.files.into_iter().map(PathBuf::from).collect();
     state
         .runtime

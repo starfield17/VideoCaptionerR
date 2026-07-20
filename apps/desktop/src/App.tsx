@@ -27,6 +27,9 @@ import { call, isTauri } from "./lib/desktop";
 import type { Cue, DoctorReport, JobView, ProbeResult, Transcript } from "./types";
 
 const stageOrder = ["probe", "extract_audio", "asr", "split", "correct", "translate", "export"];
+const CUE_ROW_HEIGHT = 72;
+const VIRTUAL_WINDOW_SIZE = 36;
+const VIRTUAL_OVERSCAN = 4;
 
 const demoJobs: JobView[] = [
   {
@@ -136,6 +139,7 @@ export default function App() {
   const [jobs, setJobs] = useState<JobView[]>([]);
   const [selectedId, setSelectedId] = useState<string>();
   const [transcript, setTranscript] = useState<Transcript>();
+  const [doctor, setDoctor] = useState<DoctorReport>();
   const [path, setPath] = useState("");
   const [targetLanguage, setTargetLanguage] = useState("zh-CN");
   const [search, setSearch] = useState("");
@@ -164,15 +168,37 @@ export default function App() {
     }
   };
 
+  const loadDoctor = async () => {
+    if (!isTauri()) {
+      setDoctor({
+        version: "preview",
+        home: "browser preview",
+        database: "browser preview",
+        ffmpeg: "preview",
+        ffprobe: "preview",
+        helper: "preview",
+      });
+      return;
+    }
+    try {
+      setDoctor(await call<DoctorReport>("doctor"));
+    } catch (error) {
+      setNotice({ kind: "error", text: `Doctor check failed: ${String(error)}` });
+    }
+  };
+
   useEffect(() => {
     void refresh();
+    void loadDoctor();
   }, []);
 
   useEffect(() => {
     if (!selectedId) {
       setTranscript(undefined);
+      setEditorScroll(0);
       return;
     }
+    setEditorScroll(0);
     if (!isTauri() && selectedId.startsWith("demo-")) {
       setTranscript(demoTranscript);
       return;
@@ -183,10 +209,19 @@ export default function App() {
   }, [selectedId]);
 
   const visibleCues = useMemo(() => {
-    if (!transcript) return [];
-    const start = Math.max(0, Math.floor(editorScroll / 48) - 2);
-    return transcript.cues.slice(start, start + 28).map((cue, index) => ({ cue, index: start + index }));
+    if (!transcript) {
+      return { items: [], topPadding: 0, bottomPadding: 0 };
+    }
+    const start = Math.max(0, Math.floor(editorScroll / CUE_ROW_HEIGHT) - VIRTUAL_OVERSCAN);
+    const end = Math.min(transcript.cues.length, start + VIRTUAL_WINDOW_SIZE);
+    return {
+      items: transcript.cues.slice(start, end).map((cue) => ({ cue })),
+      topPadding: start * CUE_ROW_HEIGHT,
+      bottomPadding: (transcript.cues.length - end) * CUE_ROW_HEIGHT,
+    };
   }, [editorScroll, transcript]);
+
+  const servicesReady = Boolean(doctor?.ffmpeg && doctor?.ffprobe && doctor?.helper);
 
   const process = async () => {
     if (!path.trim()) {
@@ -373,10 +408,11 @@ export default function App() {
                 <table className="cue-table">
                   <thead><tr><th className="cue-index">#</th><th className="time-col">Time</th><th>Source</th><th>Translation</th><th className="flag-col" /></tr></thead>
                   <tbody>
-                    {visibleCues.map(({ cue, index }) => {
+                    {visibleCues.topPadding > 0 && <tr className="virtual-spacer" aria-hidden="true"><td colSpan={5} style={{ height: visibleCues.topPadding }} /></tr>}
+                    {visibleCues.items.map(({ cue }) => {
                       const [start, end] = transcript ? cueTimes(transcript, cue) : [0, 0];
                       return (
-                        <tr key={cue.id} style={{ transform: `translateY(${index * 0}px)` }}>
+                        <tr key={`${transcript?.revision ?? 0}:${cue.id}`}>
                           <td className="cue-index">{cue.id}</td>
                           <td className="time-col"><span>{formatTime(start)}</span><span>{formatTime(end)}</span></td>
                           <td><textarea aria-label={`Source cue ${cue.id}`} defaultValue={cue.text} onBlur={(event) => void editCue(cue, "source", event.currentTarget.value)} /></td>
@@ -385,6 +421,7 @@ export default function App() {
                         </tr>
                       );
                     })}
+                    {visibleCues.bottomPadding > 0 && <tr className="virtual-spacer" aria-hidden="true"><td colSpan={5} style={{ height: visibleCues.bottomPadding }} /></tr>}
                   </tbody>
                 </table>
                 {!transcript && <div className="empty-editor"><FileText size={22} /><span>Run a job to open its transcript.</span></div>}
@@ -406,7 +443,10 @@ export default function App() {
                 <label>Target language<div className="input-with-icon"><Languages size={15} /><input value={targetLanguage} onChange={(event) => setTargetLanguage(event.target.value)} /></div></label>
                 <button className="secondary-button" onClick={() => void process()} disabled={busy}><Play size={15} /> Add to queue</button>
               </div>
-              <div className="panel health-card"><div className="health-line"><span className="health-dot" /> <strong>Local services</strong><span>ready</span></div><div className="health-details"><span>SQLite actor</span><span>ffmpeg adapter</span><span>ASR session boundary</span></div></div>
+              <div className="panel health-card">
+                <div className="health-line"><span className={`health-dot ${servicesReady ? "" : "warning"}`} /> <strong>Local services</strong><span className={servicesReady ? "" : "warning"}>{doctor ? (servicesReady ? "ready" : "check") : "checking"}</span></div>
+                <div className="health-details"><span>SQLite actor</span><span>{doctor?.ffmpeg ? "ffmpeg" : "ffmpeg missing"}</span><span>{doctor?.ffprobe ? "ffprobe" : "ffprobe missing"}</span><span>{doctor?.helper ? "ASR helper" : "ASR helper missing"}</span></div>
+              </div>
             </aside>
           </section>
         </div>

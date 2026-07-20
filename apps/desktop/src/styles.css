@@ -23,6 +23,7 @@ button:disabled { cursor: wait; opacity: 0.55; }
 .rail-button.active { color: #b9eee5; background: #17302f; }
 .icon-button { width: 30px; height: 30px; }
 .version-dot, .health-dot { width: 7px; height: 7px; border-radius: 50%; background: #5bd1a9; box-shadow: 0 0 0 4px rgba(91, 209, 169, 0.11); }
+.health-dot.warning { background: #dfb86e; box-shadow: 0 0 0 4px rgba(223, 184, 110, 0.11); }
 .queue-panel { display: flex; flex-direction: column; min-height: 100vh; border-right: 1px solid #273033; background: #13191b; }
 .queue-head { display: flex; align-items: flex-start; justify-content: space-between; padding: 28px 22px 20px; }
 .eyebrow { margin: 0 0 6px; color: #738180; font-size: 10px; font-weight: 750; text-transform: uppercase; letter-spacing: 0.12em; }
@@ -101,6 +102,7 @@ h3 { margin: 0; color: #ecf4f2; font-size: 15px; line-height: 1.2; }
 .cue-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
 .cue-table th { position: sticky; top: 0; z-index: 1; padding: 11px 10px; border-bottom: 1px solid #303d3f; color: #6f7e7b; background: #171f21; font-size: 10px; font-weight: 700; text-align: left; text-transform: uppercase; letter-spacing: 0.09em; }
 .cue-table td { height: 72px; padding: 8px 10px; border-bottom: 1px solid #253033; vertical-align: top; }
+.cue-table .virtual-spacer td { height: auto; padding: 0; border-bottom: 0; }
 .cue-table tbody tr:hover td { background: #192325; }
 .cue-index { width: 43px; color: #71807d; font-size: 11px; text-align: center !important; }
 .time-col { width: 101px; color: #81918e; font-family: "SFMono-Regular", Consolas, monospace; font-size: 10px; }
@@ -136,6 +138,7 @@ h3 { margin: 0; color: #ecf4f2; font-size: 15px; line-height: 1.2; }
 .health-card { padding: 14px 16px; }
 .health-line { display: flex; align-items: center; gap: 8px; color: #aebdb9; font-size: 11px; }
 .health-line span:last-child { margin-left: auto; color: #62c99f; font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; }
+.health-line span:last-child.warning { color: #dfb86e; }
 .health-details { display: flex; flex-wrap: wrap; gap: 6px 11px; margin-top: 11px; color: #667572; font-size: 10px; }
 .spin { animation: spin 900ms linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
