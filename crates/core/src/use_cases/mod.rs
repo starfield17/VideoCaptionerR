@@ -14,7 +14,9 @@ pub use cancel_job::{
     CancelBatch, CancelBatchCommand, CancelJob, CancelJobCommand, CancelResponse,
 };
 pub use chunk_plan::PersistChunkPlan;
-pub use llm_pipeline::{LlmPipeline, LlmPipelineRequest, LlmPipelineResult, LlmPlan, LlmPlanEntry};
+pub use llm_pipeline::{
+    LlmDurableContext, LlmPipeline, LlmPipelineRequest, LlmPipelineResult, LlmPlan, LlmPlanEntry,
+};
 pub use maintenance::{
     CacheGc, LeaseNextWorkUnitCommand, RetryFailedWorkUnits, RetryFailedWorkUnitsCommand,
     RetryFailedWorkUnitsResponse, WorkUnitScheduler,

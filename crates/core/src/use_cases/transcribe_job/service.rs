@@ -128,8 +128,17 @@ impl TranscribeJob {
                             "LLM process stages are not configured",
                         ))
                     })?;
+                    let durable = Some(crate::use_cases::llm_pipeline::LlmDurableContext {
+                        job_id: command.job_id.clone(),
+                        job_dir: command.job_dir.clone(),
+                        input_artifact_id: stage_artifact(&job, StageKind::Asr)
+                            .ok()
+                            .map(|a| a.id.to_string()),
+                        transcript_revision: transcript.revision,
+                        invalidate_plan: false,
+                    });
                     let result = pipeline
-                        .execute(&transcript, options.request(LlmStage::Split))
+                        .execute(&transcript, options.request(LlmStage::Split, durable))
                         .await?;
                     degraded = !result.degraded_cue_ids.is_empty();
                     transcript = result.transcript;
@@ -165,8 +174,20 @@ impl TranscribeJob {
                 if stage_is_pending(&job, StageKind::Correct) {
                     job.start_stage(StageKind::Correct)?;
                     current_stage = Some(StageKind::Correct);
+                    let durable = Some(crate::use_cases::llm_pipeline::LlmDurableContext {
+                        job_id: command.job_id.clone(),
+                        job_dir: command.job_dir.clone(),
+                        input_artifact_id: stage_artifact(&job, StageKind::Split)
+                            .ok()
+                            .map(|a| a.id.to_string()),
+                        transcript_revision: final_transcript.revision,
+                        invalidate_plan: false,
+                    });
                     let corrected = pipeline
-                        .execute(&final_transcript, options.request(LlmStage::Correct))
+                        .execute(
+                            &final_transcript,
+                            options.request(LlmStage::Correct, durable),
+                        )
                         .await?;
                     let degraded = !corrected.degraded_cue_ids.is_empty();
                     final_transcript = corrected.transcript;
@@ -186,8 +207,21 @@ impl TranscribeJob {
                 if stage_is_pending(&job, StageKind::Translate) {
                     job.start_stage(StageKind::Translate)?;
                     current_stage = Some(StageKind::Translate);
+                    let durable = Some(crate::use_cases::llm_pipeline::LlmDurableContext {
+                        job_id: command.job_id.clone(),
+                        job_dir: command.job_dir.clone(),
+                        input_artifact_id: stage_artifact(&job, StageKind::Correct)
+                            .or_else(|_| stage_artifact(&job, StageKind::Split))
+                            .ok()
+                            .map(|a| a.id.to_string()),
+                        transcript_revision: final_transcript.revision,
+                        invalidate_plan: false,
+                    });
                     let translated = pipeline
-                        .execute(&final_transcript, options.request(LlmStage::Translate))
+                        .execute(
+                            &final_transcript,
+                            options.request(LlmStage::Translate, durable),
+                        )
                         .await?;
                     let degraded = !translated.degraded_cue_ids.is_empty();
                     final_transcript = translated.transcript;

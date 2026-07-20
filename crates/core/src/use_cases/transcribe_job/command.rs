@@ -18,7 +18,11 @@ pub struct LlmProcessOptions {
 }
 
 impl LlmProcessOptions {
-    pub(super) fn request(&self, stage: LlmStage) -> LlmPipelineRequest {
+    pub(super) fn request(
+        &self,
+        stage: LlmStage,
+        durable: Option<crate::use_cases::llm_pipeline::LlmDurableContext>,
+    ) -> LlmPipelineRequest {
         let prompt = match stage {
             LlmStage::Split => self.split_prompt.clone(),
             LlmStage::Correct => self.correct_prompt.clone(),
@@ -35,6 +39,7 @@ impl LlmProcessOptions {
             structured_output: self.structured_output,
             seed: self.seed,
             target_language: Some(self.target_language.clone()),
+            durable,
         }
     }
 
