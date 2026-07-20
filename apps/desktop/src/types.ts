@@ -28,6 +28,7 @@ export interface JobView {
   id: string;
   sourcePath: string;
   status: JobStatus;
+  batchId?: string;
   stages: StageView[];
 }
 

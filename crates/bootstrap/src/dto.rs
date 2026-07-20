@@ -30,6 +30,8 @@ pub struct JobSummary {
     pub id: String,
     pub source_path: String,
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
     pub stages: Vec<StageSummary>,
 }
 

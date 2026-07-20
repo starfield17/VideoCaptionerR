@@ -207,6 +207,7 @@ pub(crate) fn job_summary(job: &Job) -> JobSummary {
         id: job.id().to_string(),
         source_path: job.source_path().into(),
         status: job_status(job.status()),
+        batch_id: job.batch_id().map(|id| id.to_string()),
         stages: job
             .stages()
             .iter()

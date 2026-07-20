@@ -36,6 +36,7 @@ const demoJobs: JobView[] = [
     id: "demo-lecture",
     sourcePath: "/media/lecture-07.mp4",
     status: "done_degraded",
+    batchId: "demo-batch-1",
     stages: stageOrder.map((kind, index) => ({
       kind,
       status: index === 5 ? "done_degraded" : "done",
@@ -46,6 +47,7 @@ const demoJobs: JobView[] = [
     id: "demo-interview",
     sourcePath: "/media/interview.mp4",
     status: "running",
+    batchId: "demo-batch-2",
     stages: stageOrder.map((kind, index) => ({
       kind,
       status: index < 3 ? "done" : index === 3 ? "running" : "pending",
@@ -283,6 +285,90 @@ export default function App() {
     }
   };
 
+  const cancelSelected = async () => {
+    if (!selectedId) return;
+    if (!isTauri() || selectedId.startsWith("demo-")) {
+      setNotice({ kind: "ok", text: "Cancel is available in the desktop runtime." });
+      return;
+    }
+    setBusy(true);
+    try {
+      await call("cancel_job", { jobId: selectedId });
+      setNotice({ kind: "ok", text: `Cancel requested for ${selectedId}.` });
+      await refresh();
+    } catch (error) {
+      setNotice({ kind: "error", text: String(error) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const retrySelected = async () => {
+    if (!selectedId) return;
+    if (!isTauri() || selectedId.startsWith("demo-")) {
+      setNotice({ kind: "ok", text: "Retry is available in the desktop runtime." });
+      return;
+    }
+    setBusy(true);
+    try {
+      const outcome = await call<string>("retry_job", {
+        jobId: selectedId,
+        fromStage: null,
+        dryRun: false,
+      });
+      setNotice({ kind: "ok", text: `Retry ${outcome} for ${selectedId}.` });
+      await refresh();
+    } catch (error) {
+      setNotice({ kind: "error", text: String(error) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const pauseSelectedBatch = async () => {
+    const batchId = selectedJob?.batchId;
+    if (!batchId) {
+      setNotice({ kind: "error", text: "Selected job has no batch id." });
+      return;
+    }
+    if (!isTauri()) {
+      setNotice({ kind: "ok", text: "Pause is available in the desktop runtime." });
+      return;
+    }
+    setBusy(true);
+    try {
+      await call("pause_batch", { batchId });
+      setNotice({ kind: "ok", text: `Batch ${batchId} pause requested.` });
+      await refresh();
+    } catch (error) {
+      setNotice({ kind: "error", text: String(error) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const resumeSelectedBatch = async () => {
+    const batchId = selectedJob?.batchId;
+    if (!batchId) {
+      setNotice({ kind: "error", text: "Selected job has no batch id." });
+      return;
+    }
+    if (!isTauri()) {
+      setNotice({ kind: "ok", text: "Resume is available in the desktop runtime." });
+      return;
+    }
+    setBusy(true);
+    try {
+      await call("resume_batch", { batchId });
+      setNotice({ kind: "ok", text: `Batch ${batchId} resumed.` });
+      await refresh();
+    } catch (error) {
+      setNotice({ kind: "error", text: String(error) });
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const probe = async () => {
     if (!isTauri()) {
       setNotice({ kind: "ok", text: "Provider probe is available in the desktop runtime." });
@@ -356,6 +442,18 @@ export default function App() {
         <header className="topbar">
           <div className="breadcrumb"><span>Queue</span><ChevronRight size={14} /><strong>{selectedJob?.sourcePath.split(/[\\/]/).pop() ?? "No job selected"}</strong></div>
           <div className="topbar-actions">
+            <button className="quiet-button" onClick={() => void cancelSelected()} disabled={busy || !selectedId} title="Cancel selected job">
+              <XCircle size={16} /> Cancel
+            </button>
+            <button className="quiet-button" onClick={() => void retrySelected()} disabled={busy || !selectedId} title="Retry selected job">
+              <RefreshCw size={16} /> Retry
+            </button>
+            <button className="quiet-button" onClick={() => void pauseSelectedBatch()} disabled={busy || !selectedJob?.batchId} title="Pause batch">
+              <Clock3 size={16} /> Pause
+            </button>
+            <button className="quiet-button" onClick={() => void resumeSelectedBatch()} disabled={busy || !selectedJob?.batchId} title="Resume batch">
+              <Play size={16} /> Resume
+            </button>
             <button className="quiet-button" onClick={() => void probe()}><ShieldCheck size={16} /> Test provider</button>
             <button className="quiet-button" onClick={() => void refresh()}><RefreshCw size={16} /> Sync</button>
           </div>
