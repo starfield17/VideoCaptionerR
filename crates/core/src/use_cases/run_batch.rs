@@ -120,6 +120,17 @@ impl RunBatch {
         let mut failures = Vec::new();
 
         for job_command in commands {
+            // Reload batch so external pause/cancel is observed between Jobs.
+            if let Some(latest) = self.batches.load_batch(batch.id()).await? {
+                batch = latest;
+            }
+            if batch.cancel_requested() {
+                break;
+            }
+            if batch.pause_requested() {
+                // Keep model loaded; stop starting new Jobs until resume.
+                break;
+            }
             let job_id = job_command.job_id.clone();
             match self.transcribe.execute(job_command, session).await {
                 Ok(response) => {
@@ -148,7 +159,25 @@ impl RunBatch {
             }
         }
 
-        let final_status = if failed_job_ids.is_empty() {
+        // Paused batches stay Running with model still open only until the
+        // caller closes the session after this return; business status stays
+        // non-terminal when not all jobs finished.
+        let all_terminal = batch
+            .job_ids()
+            .iter()
+            .all(|id| batch.has_terminal_record(id));
+        if !all_terminal {
+            self.save_batch(&mut batch).await?;
+            return Ok(RunBatchResponse {
+                batch: batch.value.clone(),
+                jobs: responses,
+                failed_job_ids,
+                failures,
+            });
+        }
+        let final_status = if batch.cancel_requested() {
+            BatchStatus::Cancelled
+        } else if failed_job_ids.is_empty() {
             BatchStatus::Done
         } else {
             BatchStatus::Failed

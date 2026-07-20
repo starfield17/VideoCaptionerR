@@ -238,3 +238,25 @@ fn work_unit_oom_strategy_retry_is_at_most_once() {
     assert!(!unit.requeue_after_oom_strategy_change().unwrap());
     assert_eq!(unit.status(), WorkUnitStatus::Failed);
 }
+
+#[test]
+fn batch_pause_and_resume_do_not_terminalize() {
+    let job = id();
+    let mut batch = Batch::new(id(), vec![job], profile()).unwrap();
+    batch.start().unwrap();
+    batch.request_pause().unwrap();
+    assert!(batch.pause_requested());
+    assert_eq!(batch.status(), BatchStatus::Running);
+    batch.resume().unwrap();
+    assert!(!batch.pause_requested());
+    assert_eq!(batch.status(), BatchStatus::Running);
+}
+
+#[test]
+fn batch_cannot_pause_after_cancel_requested() {
+    let job = id();
+    let mut batch = Batch::new(id(), vec![job], profile()).unwrap();
+    batch.start().unwrap();
+    batch.request_cancel().unwrap();
+    assert!(batch.request_pause().is_err());
+}

@@ -92,6 +92,11 @@ enum Commands {
         #[command(subcommand)]
         action: ProvidersCmd,
     },
+    /// Batch control (pause/resume).
+    Batch {
+        #[command(subcommand)]
+        action: BatchCmd,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -127,6 +132,14 @@ enum ProvidersCmd {
         #[arg(long)]
         force: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum BatchCmd {
+    /// Stop starting new Jobs; model stays loaded until Batch terminal.
+    Pause { id: String },
+    /// Resume a paused Batch.
+    Resume { id: String },
 }
 
 fn main() -> StdExitCode {
@@ -459,6 +472,49 @@ fn run(cli: Cli) -> Result<ExitCode, VcError> {
                 ),
             )?;
             Ok(ExitCode::Success)
+        }
+        Commands::Batch { action } => {
+            let runtime = ApplicationRuntime::open(RuntimeConfig {
+                home: cli.home,
+                engine: "fake".into(),
+                model_path: None,
+                helper_path: None,
+                prompt_dir: None,
+            })?;
+            let async_runtime = tokio::runtime::Runtime::new().map_err(|error| {
+                VcError::new(
+                    ErrorCode::Internal,
+                    format!("create Tokio runtime: {error}"),
+                )
+            })?;
+            match action {
+                BatchCmd::Pause { id } => {
+                    async_runtime.block_on(runtime.pause_batch(&id))?;
+                    if cli.json {
+                        emit_event(
+                            CliEvent::JobListed,
+                            None,
+                            serde_json::json!({"batch_id": id, "action": "pause"}),
+                        )?;
+                    } else {
+                        println!("batch {id} pause requested");
+                    }
+                    Ok(ExitCode::Success)
+                }
+                BatchCmd::Resume { id } => {
+                    async_runtime.block_on(runtime.resume_batch(&id))?;
+                    if cli.json {
+                        emit_event(
+                            CliEvent::JobListed,
+                            None,
+                            serde_json::json!({"batch_id": id, "action": "resume"}),
+                        )?;
+                    } else {
+                        println!("batch {id} resumed");
+                    }
+                    Ok(ExitCode::Success)
+                }
+            }
         }
     }
 }

@@ -42,6 +42,10 @@ pub struct Batch {
     execution_profile: BatchExecutionProfile,
     status: BatchStatus,
     cancel_requested: bool,
+    /// When true, RunBatch must not start additional Jobs until resumed.
+    /// Model session stays loaded until Batch terminal (ADR 0020).
+    #[serde(default)]
+    pause_requested: bool,
     terminal_jobs: Vec<(JobId, JobTerminalStatusWire)>,
     terminal_event_emitted: bool,
 }
@@ -88,6 +92,7 @@ impl Batch {
             execution_profile,
             status: BatchStatus::Pending,
             cancel_requested: false,
+            pause_requested: false,
             terminal_jobs: Vec::new(),
             terminal_event_emitted: false,
         })
@@ -111,6 +116,33 @@ impl Batch {
 
     pub fn cancel_requested(&self) -> bool {
         self.cancel_requested
+    }
+
+    pub fn pause_requested(&self) -> bool {
+        self.pause_requested
+    }
+
+    /// Stop starting new Jobs/WorkUnits. Does not unload the model.
+    pub fn request_pause(&mut self) -> DomainResult<()> {
+        if self.status.is_terminal() {
+            return Err(DomainError::AlreadyTerminal { aggregate: "Batch" });
+        }
+        if self.cancel_requested {
+            return Err(DomainError::InvalidArgument(
+                "cannot pause a batch that has cancel requested".into(),
+            ));
+        }
+        self.pause_requested = true;
+        Ok(())
+    }
+
+    /// Clear pause so RunBatch may start remaining Jobs.
+    pub fn resume(&mut self) -> DomainResult<()> {
+        if self.status.is_terminal() {
+            return Err(DomainError::AlreadyTerminal { aggregate: "Batch" });
+        }
+        self.pause_requested = false;
+        Ok(())
     }
 
     pub fn has_terminal_record(&self, job_id: &JobId) -> bool {
@@ -221,6 +253,7 @@ impl Batch {
             .retain(|(candidate, _)| candidate != job_id);
         self.terminal_event_emitted = false;
         self.cancel_requested = false;
+        self.pause_requested = false;
         if self.status.is_terminal() || self.status == BatchStatus::Running {
             self.status = BatchStatus::Pending;
         }

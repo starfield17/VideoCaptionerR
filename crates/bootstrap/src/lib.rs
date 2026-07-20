@@ -3,6 +3,7 @@
 //! This crate is the only place that assembles concrete infrastructure
 //! adapters. It exposes application-shaped operations to inbound adapters.
 
+mod batch_control;
 mod capability;
 mod config;
 mod doctor;

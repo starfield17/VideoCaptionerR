@@ -2,6 +2,7 @@
 
 pub mod cancel_job;
 pub mod chunk_plan;
+pub mod job_ops;
 pub mod llm_pipeline;
 pub mod maintenance;
 pub mod retry_job;
@@ -14,6 +15,7 @@ pub use cancel_job::{
     CancelBatch, CancelBatchCommand, CancelJob, CancelJobCommand, CancelResponse,
 };
 pub use chunk_plan::PersistChunkPlan;
+pub use job_ops::{DeleteJob, ExportJob, ExportJobCommand, ExportJobResponse, ListJobs};
 pub use llm_pipeline::{
     LlmDurableContext, LlmPipeline, LlmPipelineRequest, LlmPipelineResult, LlmPlan, LlmPlanEntry,
 };
