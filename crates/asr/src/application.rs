@@ -1,21 +1,25 @@
 //! Application-port implementation backed by the existing worker client.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 use videocaptionerr_contracts::error::{ErrorCode, VcError};
 use videocaptionerr_core::application_error::{AppResult, ApplicationError};
 use videocaptionerr_core::ports::{
-    AsrDescriptor as ApplicationAsrDescriptor, AsrRuntime, AsrSession, AsrTranscribeRequest,
-    EventPublisher, NormalizedAsrResult,
+    cancel_grace, ApplicationEvent, AsrCancelToken, AsrDescriptor as ApplicationAsrDescriptor,
+    AsrRuntime, AsrSession, AsrSessionControl, AsrTranscribeRequest, EventPublisher,
+    NormalizedAsrResult,
 };
 use videocaptionerr_domain::BatchExecutionProfile;
 
 use crate::descriptor::{ConfidenceKind, EngineDescriptor, TimestampGranularity};
+use crate::engine::AsrEvent;
 use crate::normalize::{normalize_asr, NormalizeOptions};
 use crate::options::AsrOptions;
-use crate::worker::WorkerClient;
+use crate::worker::{WorkerClient, WorkerControl};
 
 #[derive(Debug, Clone)]
 pub struct WorkerAsrRuntime {
@@ -97,8 +101,7 @@ impl AsrRuntime for WorkerAsrRuntime {
                 "ASR worker does not provide A2 word/character timestamps",
             )));
         }
-        let application_descriptor = map_descriptor(&descriptor);
-        let mut application_descriptor = application_descriptor;
+        let mut application_descriptor = map_descriptor(&descriptor);
         application_descriptor.fingerprint = format!(
             "{}|{}|{}|{}|{}",
             application_descriptor.engine_id,
@@ -107,11 +110,30 @@ impl AsrRuntime for WorkerAsrRuntime {
             profile.asr_model,
             profile.device
         );
+        let control: Arc<dyn AsrSessionControl> =
+            Arc::new(WorkerControlAdapter(client.control()));
         Ok(Box::new(WorkerAsrSession {
             client,
             descriptor: application_descriptor,
             device: profile.device.clone(),
+            control,
         }))
+    }
+}
+
+struct WorkerControlAdapter(WorkerControl);
+
+#[async_trait]
+impl AsrSessionControl for WorkerControlAdapter {
+    async fn request_cancel(&self) -> AppResult<()> {
+        self.0
+            .cancel_current()
+            .await
+            .map_err(ApplicationError::Adapter)
+    }
+
+    async fn ping(&self) -> AppResult<()> {
+        self.0.ping().await.map_err(ApplicationError::Adapter)
     }
 }
 
@@ -119,6 +141,7 @@ struct WorkerAsrSession {
     client: WorkerClient,
     descriptor: ApplicationAsrDescriptor,
     device: String,
+    control: Arc<dyn AsrSessionControl>,
 }
 
 #[async_trait]
@@ -127,13 +150,43 @@ impl AsrSession for WorkerAsrSession {
         &self.descriptor
     }
 
+    fn control(&self) -> Option<Arc<dyn AsrSessionControl>> {
+        Some(self.control.clone())
+    }
+
     async fn transcribe(
         &mut self,
         request: AsrTranscribeRequest,
-        _events: &dyn EventPublisher,
+        events: &dyn EventPublisher,
+        cancel: Option<AsrCancelToken>,
     ) -> AppResult<NormalizedAsrResult> {
-        let (sink, mut events) = mpsc::channel(256);
-        let drain = tokio::spawn(async move { while events.recv().await.is_some() {} });
+        let (sink, mut rx) = mpsc::channel(256);
+        let buffered = Arc::new(Mutex::new(Vec::<AsrEvent>::new()));
+        let buffer = buffered.clone();
+        let collector = tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                buffer.lock().unwrap().push(event);
+            }
+        });
+
+        let control = self.client.control();
+        let cancel_watch = cancel.clone();
+        let cancel_task = tokio::spawn(async move {
+            let Some(token) = cancel_watch else {
+                return;
+            };
+            loop {
+                if token.is_requested() {
+                    let _ = control.cancel_current().await;
+                    // Wait the cooperative grace window; hard kill is owned by
+                    // the session close/escalation path when the worker sticks.
+                    tokio::time::sleep(cancel_grace()).await;
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+
         let raw = self
             .client
             .transcribe(
@@ -148,9 +201,20 @@ impl AsrSession for WorkerAsrSession {
                 sink,
                 None,
             )
-            .await
-            .map_err(ApplicationError::Adapter)?;
-        let _ = drain.await;
+            .await;
+        cancel_task.abort();
+        let _ = collector.await;
+        // Map progress/language/segment/log into application events. Live
+        // delivery failures never rewrite committed business state.
+        let collected: Vec<AsrEvent> = std::mem::take(&mut *buffered.lock().unwrap());
+        for event in collected {
+            let _ = events.publish_live(map_asr_event(event)).await;
+        }
+
+        let raw = raw.map_err(ApplicationError::Adapter)?;
+        if cancel.as_ref().is_some_and(AsrCancelToken::is_requested) {
+            return Err(ApplicationError::Cancelled);
+        }
         let transcript = normalize_asr(
             &raw,
             &NormalizeOptions {
@@ -179,6 +243,36 @@ impl AsrSession for WorkerAsrSession {
             (Ok(()), Err(error)) => Err(error),
             (Ok(()), Ok(())) => Ok(()),
         }
+    }
+}
+
+fn map_asr_event(event: AsrEvent) -> ApplicationEvent {
+    match event {
+        AsrEvent::Progress {
+            processed_ms,
+            total_ms,
+            message,
+        } => ApplicationEvent::Progress {
+            job_id: None,
+            processed_ms,
+            total_ms,
+            message,
+        },
+        AsrEvent::Language { language } => ApplicationEvent::Language {
+            job_id: None,
+            language,
+        },
+        AsrEvent::Segment(segment) => ApplicationEvent::Segment {
+            job_id: None,
+            text: segment.text,
+            start_ms: segment.start_ms,
+            end_ms: segment.end_ms,
+        },
+        AsrEvent::Log { level, message } => ApplicationEvent::Log {
+            job_id: None,
+            level,
+            message,
+        },
     }
 }
 

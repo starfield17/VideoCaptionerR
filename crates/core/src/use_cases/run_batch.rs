@@ -532,6 +532,7 @@ mod tests {
             &mut self,
             _request: AsrTranscribeRequest,
             _events: &dyn EventPublisher,
+            _cancel: Option<crate::ports::AsrCancelToken>,
         ) -> AppResult<NormalizedAsrResult> {
             self.calls += 1;
             if self.fail_first && self.calls == 1 {

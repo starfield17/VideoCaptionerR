@@ -32,6 +32,7 @@ pub struct ApplicationRuntime {
     pub(crate) helper_path: PathBuf,
     pub(crate) jobs: Arc<dyn JobRepository>,
     pub(crate) batches: Arc<dyn BatchRepository>,
+    pub(crate) work_units: Arc<dyn WorkUnitRepository>,
     pub(crate) snapshots: Arc<dyn SnapshotRepository>,
     pub(crate) run_batch: Arc<RunBatch>,
     pub(crate) retry_job_uc: Arc<RetryJob>,
@@ -157,7 +158,7 @@ impl ApplicationRuntime {
             retry_tx,
         ));
         let cache_gc = Arc::new(CacheGc::new(cache));
-        let scheduler = Arc::new(WorkUnitScheduler::new(work_units, clock));
+        let scheduler = Arc::new(WorkUnitScheduler::new(work_units.clone(), clock));
 
         Ok(Self {
             paths,
@@ -166,6 +167,7 @@ impl ApplicationRuntime {
             helper_path,
             jobs,
             batches,
+            work_units,
             snapshots,
             run_batch,
             retry_job_uc,

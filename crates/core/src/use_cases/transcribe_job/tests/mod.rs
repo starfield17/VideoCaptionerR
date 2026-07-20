@@ -724,6 +724,7 @@ impl AsrSession for LongSession {
         &mut self,
         request: AsrTranscribeRequest,
         _events: &dyn EventPublisher,
+        _cancel: Option<crate::ports::AsrCancelToken>,
     ) -> AppResult<NormalizedAsrResult> {
         let path = request.audio_path;
         self.calls.lock().unwrap().push(path.clone());
@@ -844,6 +845,7 @@ impl AsrSession for FakeSession {
         &mut self,
         _request: AsrTranscribeRequest,
         _events: &dyn EventPublisher,
+        _cancel: Option<crate::ports::AsrCancelToken>,
     ) -> AppResult<NormalizedAsrResult> {
         if self.fail {
             return Err(ApplicationError::Adapter(VcError::new(

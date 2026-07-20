@@ -30,6 +30,28 @@ fn batch_rejects_model_profile_switch() {
 }
 
 #[test]
+fn batch_request_cancel_does_not_terminalize_until_all_jobs_finish() {
+    let job = id();
+    let mut batch = Batch::new(id(), vec![job.clone()], profile()).unwrap();
+    batch.start().unwrap();
+    batch.request_cancel().unwrap();
+    assert!(batch.cancel_requested());
+    assert_eq!(batch.status(), BatchStatus::Running);
+    assert!(batch.finish_cancelled().is_err());
+    batch
+        .record_job_terminal(&job, JobTerminalStatus::Cancelled)
+        .unwrap();
+    let event = batch.finish_cancelled().unwrap();
+    assert!(matches!(
+        event,
+        DomainEvent::BatchReachedTerminal {
+            status: BatchStatus::Cancelled,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn batch_emits_one_terminal_event_and_cannot_restart() {
     let job = id();
     let mut batch = Batch::new(id(), vec![job.clone()], profile()).unwrap();

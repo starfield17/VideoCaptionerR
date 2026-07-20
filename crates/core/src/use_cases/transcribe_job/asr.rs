@@ -171,6 +171,7 @@ impl TranscribeJob {
                                     duration_ms: Some(chunk.read_end_ms - chunk.read_start_ms),
                                 },
                                 self.events.as_ref(),
+                                None,
                             )
                             .await?
                             .transcript;
@@ -270,6 +271,7 @@ impl TranscribeJob {
                     duration_ms: Some(duration_ms),
                 },
                 self.events.as_ref(),
+                None,
             )
             .await?
             .transcript)

@@ -4,7 +4,8 @@ use videocaptionerr_contracts::error::{ErrorCode, VcError, VcResult};
 use videocaptionerr_core::application_error::ApplicationError;
 use videocaptionerr_core::chunking::ChunkPlan;
 use videocaptionerr_core::use_cases::{
-    RetryJobCommand, RetryJobResponse, RetryPlan, RunBatchCommand, RunBatchResponse,
+    CancelBatch, CancelBatchCommand, CancelJob, CancelJobCommand, CancelResponse, RetryJobCommand,
+    RetryJobResponse, RetryPlan, RunBatchCommand, RunBatchResponse,
 };
 use videocaptionerr_core::CacheGcResult;
 use videocaptionerr_domain::{ArtifactRef, Job, JobId, JobStatus, StageStatus};
@@ -36,6 +37,32 @@ impl ApplicationRuntime {
         })?;
         self.jobs
             .delete_job(&job_id)
+            .await
+            .map_err(ApplicationError::into_vc_error)
+    }
+
+    pub async fn cancel_job(&self, id: &str) -> VcResult<CancelResponse> {
+        let job_id: JobId = id.parse().map_err(|error| {
+            VcError::new(
+                ErrorCode::InvalidArgument,
+                format!("invalid Job id: {error}"),
+            )
+        })?;
+        CancelJob::new(self.jobs.clone(), self.work_units.clone())
+            .execute(CancelJobCommand { job_id })
+            .await
+            .map_err(ApplicationError::into_vc_error)
+    }
+
+    pub async fn cancel_batch(&self, id: &str) -> VcResult<CancelResponse> {
+        let batch_id: videocaptionerr_domain::BatchId = id.parse().map_err(|error| {
+            VcError::new(
+                ErrorCode::InvalidArgument,
+                format!("invalid Batch id: {error}"),
+            )
+        })?;
+        CancelBatch::new(self.batches.clone(), self.jobs.clone())
+            .execute(CancelBatchCommand { batch_id })
             .await
             .map_err(ApplicationError::into_vc_error)
     }

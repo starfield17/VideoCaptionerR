@@ -186,28 +186,26 @@ impl Batch {
         })
     }
 
-    pub fn cancel(&mut self) -> DomainResult<DomainEvent> {
-        if self.status.is_terminal() {
-            return Err(DomainError::AlreadyTerminal { aggregate: "Batch" });
-        }
-        self.cancel_requested = true;
-        self.status = BatchStatus::Cancelled;
-        self.terminal_event_emitted = true;
-        Ok(DomainEvent::BatchReachedTerminal {
-            batch_id: self.id.clone(),
-            status: BatchStatus::Cancelled,
-        })
-    }
-
     /// Request cancellation without immediately terminalizing the Batch.
     /// Active Jobs/WorkUnits must reach their own Cancelled terminal states
-    /// before [`Self::finish`] may emit `BatchStatus::Cancelled`.
+    /// before [`Self::finish`] may emit `BatchStatus::Cancelled`. Immediate
+    /// terminalization is intentionally not provided.
     pub fn request_cancel(&mut self) -> DomainResult<()> {
         if self.status.is_terminal() {
             return Err(DomainError::AlreadyTerminal { aggregate: "Batch" });
         }
         self.cancel_requested = true;
         Ok(())
+    }
+
+    /// Finish the Batch as Cancelled only after every member Job is terminal.
+    pub fn finish_cancelled(&mut self) -> DomainResult<DomainEvent> {
+        if !self.cancel_requested {
+            return Err(DomainError::InvalidArgument(
+                "batch cancel finish requires a prior request_cancel".into(),
+            ));
+        }
+        self.finish(BatchStatus::Cancelled)
     }
 
     /// Re-open a single member Job for retry without changing Batch identity,

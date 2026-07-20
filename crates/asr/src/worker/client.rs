@@ -1,94 +1,49 @@
-//! NDJSON worker/helper client over stdio.
+//! Async NDJSON helper client (one active transcription).
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{ChildStdin, ChildStdout, Command as TokioCommand};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{ChildStdout, Command as TokioCommand};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio::time::timeout;
-use tracing::{debug, warn};
 use videocaptionerr_contracts::error::{ErrorCode, VcError, VcResult};
 use videocaptionerr_contracts::protocol::{
     AsrResultData, HelloData, ProtocolEnvelope, ProtocolMessageType, SegmentData, PROTOCOL_VERSION,
-    WORKER_MAX_LINE_BYTES,
 };
 
 use crate::descriptor::{ConfidenceKind, DeviceDescriptor, EngineDescriptor, TimestampGranularity};
 use crate::engine::{AsrEvent, AsrRawResult};
 use crate::options::AsrOptions;
 
-/// Async NDJSON helper client (one active transcription).
+use super::control::WorkerControl;
+use super::process::{kill_process_tree, map_protocol_error, send_to_worker};
+use super::protocol_session::WorkerProtocolSession;
+
+/// Distinct timeout budgets. Progress is not a heartbeat.
+pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+pub const LOAD_TIMEOUT: Duration = Duration::from_secs(120);
+pub const FIRST_SEGMENT_TIMEOUT: Duration = Duration::from_secs(120);
+pub const INTER_SEGMENT_TIMEOUT: Duration = Duration::from_secs(600);
+pub const CANCEL_GRACE: Duration = Duration::from_millis(3000);
+pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+
 pub struct WorkerClient {
     child: tokio::process::Child,
-    stdin: std::sync::Arc<AsyncMutex<ChildStdin>>,
+    stdin: Arc<AsyncMutex<tokio::process::ChildStdin>>,
     stdout: BufReader<ChildStdout>,
-    session_id: String,
+    session: WorkerProtocolSession,
     next_request_id: AtomicU64,
-    next_seq: std::sync::Arc<AtomicU64>,
-    current_request_id: std::sync::Arc<AtomicU64>,
+    next_seq: Arc<AtomicU64>,
+    current_request_id: Arc<AtomicU64>,
     descriptor: Option<EngineDescriptor>,
     helper_path: PathBuf,
     engine_arg: String,
     last_request_id: Option<u64>,
-}
-
-/// Control path that can be cloned before a long transcription starts.
-/// It shares only the worker stdin and sequence allocator; stdout remains
-/// owned by the main client reader so terminal messages stay ordered.
-#[derive(Clone)]
-pub struct WorkerControl {
-    stdin: std::sync::Arc<AsyncMutex<ChildStdin>>,
-    session_id: String,
-    next_seq: std::sync::Arc<AtomicU64>,
-    current_request_id: std::sync::Arc<AtomicU64>,
-}
-
-impl WorkerControl {
-    async fn send(
-        &self,
-        request_id: Option<u64>,
-        msg_type: ProtocolMessageType,
-        data: Option<serde_json::Value>,
-    ) -> VcResult<()> {
-        send_to_worker(
-            &self.stdin,
-            &self.session_id,
-            &self.next_seq,
-            request_id,
-            msg_type,
-            data,
-        )
-        .await
-    }
-
-    pub async fn cancel_current(&self) -> VcResult<()> {
-        let target = self.current_request_id.load(Ordering::SeqCst);
-        if target == 0 {
-            return Err(VcError::new(
-                ErrorCode::InvalidArgument,
-                "worker has no active transcription",
-            ));
-        }
-        self.cancel(target).await
-    }
-
-    pub async fn cancel(&self, target_request_id: u64) -> VcResult<()> {
-        self.send(
-            None,
-            ProtocolMessageType::Cancel,
-            Some(serde_json::json!({"target_request_id": target_request_id})),
-        )
-        .await
-    }
-
-    /// Send a heartbeat while inference is running. The response is consumed
-    /// by the main reader and remains subject to the normal protocol checks.
-    pub async fn ping(&self) -> VcResult<()> {
-        self.send(None, ProtocolMessageType::Ping, None).await
-    }
+    saw_first_segment: bool,
 }
 
 impl WorkerClient {
@@ -97,9 +52,6 @@ impl WorkerClient {
         Self::spawn_command(command, helper_path, engine).await
     }
 
-    /// Spawn a managed Python runtime using the same versioned stdio protocol.
-    /// The Python script is an adapter boundary; it never owns application
-    /// retries, persistence or subtitle splitting.
     pub async fn spawn_python(
         python_path: &Path,
         worker_script: &Path,
@@ -148,16 +100,17 @@ impl WorkerClient {
 
         let mut client = Self {
             child,
-            stdin: std::sync::Arc::new(AsyncMutex::new(stdin)),
+            stdin: Arc::new(AsyncMutex::new(stdin)),
             stdout: BufReader::new(stdout),
-            session_id: String::new(),
+            session: WorkerProtocolSession::new(),
             next_request_id: AtomicU64::new(1),
-            next_seq: std::sync::Arc::new(AtomicU64::new(0)),
-            current_request_id: std::sync::Arc::new(AtomicU64::new(0)),
+            next_seq: Arc::new(AtomicU64::new(0)),
+            current_request_id: Arc::new(AtomicU64::new(0)),
             descriptor: None,
             helper_path: executable_path.to_path_buf(),
             engine_arg: engine.to_string(),
             last_request_id: None,
+            saw_first_segment: false,
         };
         client.hello().await?;
         Ok(client)
@@ -168,17 +121,21 @@ impl WorkerClient {
     }
 
     pub fn session_id(&self) -> &str {
-        &self.session_id
+        self.session.session_id().unwrap_or("")
     }
 
     pub fn last_request_id(&self) -> Option<u64> {
         self.last_request_id
     }
 
+    pub fn protocol_session(&self) -> &WorkerProtocolSession {
+        &self.session
+    }
+
     pub fn control(&self) -> WorkerControl {
         WorkerControl {
             stdin: self.stdin.clone(),
-            session_id: self.session_id.clone(),
+            session_id: self.session_id().to_owned(),
             next_seq: self.next_seq.clone(),
             current_request_id: self.current_request_id.clone(),
         }
@@ -196,11 +153,7 @@ impl WorkerClient {
     ) -> VcResult<()> {
         send_to_worker(
             &self.stdin,
-            if self.session_id.is_empty() {
-                "bootstrap"
-            } else {
-                &self.session_id
-            },
+            self.session_id(),
             &self.next_seq,
             request_id,
             msg_type,
@@ -212,6 +165,7 @@ impl WorkerClient {
     async fn read_envelope(&mut self) -> VcResult<ProtocolEnvelope> {
         let mut line = String::new();
         let n = self.stdout.read_line(&mut line).await.map_err(|e| {
+            self.session.end_request();
             VcError::new(ErrorCode::WorkerProtocolError, format!("read stdout: {e}"))
         })?;
         if n == 0 {
@@ -220,18 +174,7 @@ impl WorkerClient {
                 "helper stdout closed",
             ));
         }
-        if line.len() > WORKER_MAX_LINE_BYTES {
-            return Err(VcError::new(
-                ErrorCode::WorkerProtocolError,
-                "helper line exceeds 4 MiB",
-            ));
-        }
-        ProtocolEnvelope::from_ndjson_line(&line).map_err(|e| {
-            VcError::new(
-                ErrorCode::WorkerProtocolError,
-                format!("protocol pollution / invalid json: {e}"),
-            )
-        })
+        self.session.accept_line(&line)
     }
 
     async fn read_envelope_timeout(&mut self, dur: Duration) -> VcResult<ProtocolEnvelope> {
@@ -246,14 +189,13 @@ impl WorkerClient {
 
     pub async fn hello(&mut self) -> VcResult<&EngineDescriptor> {
         self.send(None, ProtocolMessageType::Hello, None).await?;
-        let env = self.read_envelope_timeout(Duration::from_secs(10)).await?;
+        let env = self.read_envelope_timeout(STARTUP_TIMEOUT).await?;
         if env.typed() != Some(ProtocolMessageType::HelloOk) {
             return Err(VcError::new(
                 ErrorCode::WorkerProtocolError,
                 format!("expected hello_ok, got {}", env.msg_type),
             ));
         }
-        self.session_id = env.session_id.clone();
         let data = env.data.unwrap_or_else(|| serde_json::json!({}));
         let hello: HelloData = serde_json::from_value(data).map_err(|e| {
             VcError::new(
@@ -265,6 +207,32 @@ impl WorkerClient {
         let mut supported = std::collections::BTreeSet::new();
         supported.insert("language".into());
         supported.insert("word_timestamps".into());
+
+        // Unknown timestamp/confidence capabilities must NOT be promoted to A2.
+        let timestamp_granularity = match hello.timestamp_granularity.as_deref() {
+            Some("word") => TimestampGranularity::Word,
+            Some("character") => TimestampGranularity::Character,
+            Some("segment") => TimestampGranularity::Segment,
+            Some(other) => {
+                return Err(VcError::new(
+                    ErrorCode::EngineCapabilityInsufficient,
+                    format!("unknown timestamp_granularity capability '{other}'"),
+                ));
+            }
+            None => TimestampGranularity::Segment,
+        };
+        let confidence_kind = match hello.confidence_kind.as_deref() {
+            Some("word_prob") => ConfidenceKind::WordProb,
+            Some("log_prob") => ConfidenceKind::LogProb,
+            Some("none") => ConfidenceKind::None,
+            Some(other) => {
+                return Err(VcError::new(
+                    ErrorCode::EngineCapabilityInsufficient,
+                    format!("unknown confidence_kind capability '{other}'"),
+                ));
+            }
+            None => ConfidenceKind::None,
+        };
 
         let desc = EngineDescriptor {
             protocol_version: PROTOCOL_VERSION,
@@ -281,18 +249,8 @@ impl WorkerClient {
                     id,
                 })
                 .collect(),
-            timestamp_granularity: match hello.timestamp_granularity.as_deref() {
-                Some("word") => TimestampGranularity::Word,
-                Some("character") => TimestampGranularity::Character,
-                Some("segment") => TimestampGranularity::Segment,
-                _ => TimestampGranularity::Word,
-            },
-            confidence_kind: match hello.confidence_kind.as_deref() {
-                Some("word_prob") => ConfidenceKind::WordProb,
-                Some("log_prob") => ConfidenceKind::LogProb,
-                Some("none") => ConfidenceKind::None,
-                _ => ConfidenceKind::WordProb,
-            },
+            timestamp_granularity,
+            confidence_kind,
             native_vad: hello.native_vad,
             language_detection: hello.language_detection,
             streaming_events: hello.streaming_events,
@@ -307,13 +265,16 @@ impl WorkerClient {
 
     pub async fn load_model(&mut self, model_path: Option<&Path>) -> VcResult<()> {
         let req = self.alloc_request_id();
+        self.session.begin_request(req)?;
         let data = match model_path {
             Some(p) => Some(serde_json::json!({"model_path": p.to_string_lossy()})),
             None => Some(serde_json::json!({})),
         };
         self.send(Some(req), ProtocolMessageType::LoadModel, data)
             .await?;
-        let env = self.read_envelope_timeout(Duration::from_secs(120)).await?;
+        let env = self.read_envelope_timeout(LOAD_TIMEOUT).await;
+        self.session.end_request();
+        let env = env?;
         match env.typed() {
             Some(ProtocolMessageType::Result) => Ok(()),
             Some(ProtocolMessageType::Error) => Err(map_protocol_error(&env)),
@@ -326,9 +287,12 @@ impl WorkerClient {
 
     pub async fn unload_model(&mut self) -> VcResult<()> {
         let req = self.alloc_request_id();
+        self.session.begin_request(req)?;
         self.send(Some(req), ProtocolMessageType::UnloadModel, None)
             .await?;
-        let env = self.read_envelope_timeout(Duration::from_secs(30)).await?;
+        let env = self.read_envelope_timeout(Duration::from_secs(30)).await;
+        self.session.end_request();
+        let env = env?;
         match env.typed() {
             Some(ProtocolMessageType::Result) => Ok(()),
             Some(ProtocolMessageType::Error) => Err(map_protocol_error(&env)),
@@ -361,10 +325,13 @@ impl WorkerClient {
         let req = self.alloc_request_id();
         self.last_request_id = Some(req);
         self.current_request_id.store(req, Ordering::SeqCst);
+        self.session.begin_request(req)?;
+        self.saw_first_segment = false;
         let result = self
             .transcribe_request(req, audio, opts, sink, inject_delay_ms)
             .await;
         self.current_request_id.store(0, Ordering::SeqCst);
+        self.session.end_request();
         result
     }
 
@@ -395,14 +362,17 @@ impl WorkerClient {
         let mut duration_ms = None;
 
         loop {
-            let env = self.read_envelope_timeout(Duration::from_secs(600)).await?;
-            if let Some(rid) = env.request_id {
-                if rid != req {
-                    debug!(rid, "ignoring message for other request");
+            let wait = if self.saw_first_segment {
+                INTER_SEGMENT_TIMEOUT
+            } else {
+                FIRST_SEGMENT_TIMEOUT
+            };
+            let env = self.read_envelope_timeout(wait).await?;
+            match env.typed() {
+                Some(ProtocolMessageType::Pong) => {
+                    // Heartbeat response during inference; not progress.
                     continue;
                 }
-            }
-            match env.typed() {
                 Some(ProtocolMessageType::Progress) => {
                     if let Some(d) = env.data {
                         let _ = sink
@@ -418,6 +388,7 @@ impl WorkerClient {
                     }
                 }
                 Some(ProtocolMessageType::Segment) => {
+                    self.saw_first_segment = true;
                     if let Some(d) = env.data {
                         let seg: SegmentData = serde_json::from_value(d).map_err(|e| {
                             VcError::new(
@@ -442,6 +413,21 @@ impl WorkerClient {
                                 })
                                 .await;
                         }
+                    }
+                }
+                Some(ProtocolMessageType::Log) => {
+                    if let Some(d) = env.data {
+                        let level = d
+                            .get("level")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("info")
+                            .to_string();
+                        let message = d
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let _ = sink.send(AsrEvent::Log { level, message }).await;
                     }
                 }
                 Some(ProtocolMessageType::Result) => {
@@ -489,7 +475,10 @@ impl WorkerClient {
                     ));
                 }
                 Some(other) => {
-                    warn!(msg = other.as_str(), "unexpected helper event");
+                    return Err(VcError::new(
+                        ErrorCode::WorkerProtocolError,
+                        format!("unexpected helper event during transcribe: {}", other.as_str()),
+                    ));
                 }
                 None => {
                     return Err(VcError::new(
@@ -505,12 +494,28 @@ impl WorkerClient {
         self.control().cancel(target_request_id).await
     }
 
+    /// Cooperative cancel, wait [`CANCEL_GRACE`], then hard-kill the process tree.
+    pub async fn cancel_with_escalation(&mut self, target_request_id: u64) -> VcResult<()> {
+        let _ = self.cancel(target_request_id).await;
+        match timeout(CANCEL_GRACE, self.read_envelope()).await {
+            Ok(Ok(env)) if env.typed() == Some(ProtocolMessageType::Cancelled) => Ok(()),
+            Ok(Ok(env)) if env.typed().is_some_and(|t| t.is_terminal()) => Ok(()),
+            _ => {
+                self.kill_tree().await?;
+                Err(VcError::new(
+                    ErrorCode::Cancelled,
+                    "transcription cancelled after hard kill",
+                ))
+            }
+        }
+    }
+
     pub async fn shutdown(&mut self) -> VcResult<()> {
         let req = self.alloc_request_id();
         let _ = self
             .send(Some(req), ProtocolMessageType::Shutdown, None)
             .await;
-        let _ = timeout(Duration::from_secs(3), self.child.wait()).await;
+        let _ = timeout(SHUTDOWN_TIMEOUT, self.child.wait()).await;
         Ok(())
     }
 
@@ -529,271 +534,5 @@ impl WorkerClient {
 
     pub fn engine_arg(&self) -> &str {
         &self.engine_arg
-    }
-}
-
-async fn send_to_worker(
-    stdin: &std::sync::Arc<AsyncMutex<ChildStdin>>,
-    session_id: &str,
-    next_seq: &std::sync::Arc<AtomicU64>,
-    request_id: Option<u64>,
-    msg_type: ProtocolMessageType,
-    data: Option<serde_json::Value>,
-) -> VcResult<()> {
-    let env = ProtocolEnvelope {
-        protocol_version: PROTOCOL_VERSION,
-        session_id: if session_id.is_empty() {
-            "bootstrap".into()
-        } else {
-            session_id.to_owned()
-        },
-        request_id,
-        seq: next_seq.fetch_add(1, Ordering::SeqCst),
-        msg_type: msg_type.as_str().to_string(),
-        data,
-    };
-    let line = env
-        .to_ndjson_line()
-        .map_err(|e| VcError::new(ErrorCode::WorkerProtocolError, format!("serialize: {e}")))?;
-    let mut writer = stdin.lock().await;
-    writer
-        .write_all(line.as_bytes())
-        .await
-        .map_err(|e| VcError::new(ErrorCode::WorkerProtocolError, format!("write stdin: {e}")))?;
-    writer
-        .flush()
-        .await
-        .map_err(|e| VcError::new(ErrorCode::WorkerProtocolError, format!("flush stdin: {e}")))?;
-    Ok(())
-}
-
-fn map_protocol_error(env: &ProtocolEnvelope) -> VcError {
-    let (code, message) = env
-        .data
-        .as_ref()
-        .map(|d| {
-            (
-                d.get("code")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("WORKER_PROTOCOL_ERROR"),
-                d.get("message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("worker error")
-                    .to_string(),
-            )
-        })
-        .unwrap_or(("WORKER_PROTOCOL_ERROR", "worker error".into()));
-    let ec = ErrorCode::parse(code).unwrap_or(ErrorCode::WorkerProtocolError);
-    VcError::new(ec, message)
-}
-
-/// Unix: kill process group. Windows: best-effort taskkill.
-pub fn kill_process_tree(pid: u32) {
-    #[cfg(unix)]
-    {
-        let _ = Command::new("pkill")
-            .args(["-TERM", "-P", &pid.to_string()])
-            .status();
-        let _ = Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .status();
-        std::thread::sleep(Duration::from_millis(100));
-        let _ = Command::new("pkill")
-            .args(["-KILL", "-P", &pid.to_string()])
-            .status();
-        let _ = Command::new("kill")
-            .args(["-KILL", &pid.to_string()])
-            .status();
-    }
-    #[cfg(windows)]
-    {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .status();
-    }
-}
-
-/// Resolve helper binary next to current exe or via env / target/debug.
-pub fn resolve_helper_binary() -> PathBuf {
-    if let Ok(p) = std::env::var("VIDEOCAPTIONERR_HELPER") {
-        return PathBuf::from(p);
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join("videocaptionerr-whisper-helper");
-            if candidate.exists() {
-                return candidate;
-            }
-            #[cfg(windows)]
-            {
-                let candidate = dir.join("videocaptionerr-whisper-helper.exe");
-                if candidate.exists() {
-                    return candidate;
-                }
-            }
-        }
-    }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/debug/videocaptionerr-whisper-helper")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-
-    fn helper_bin() -> PathBuf {
-        resolve_helper_binary()
-    }
-
-    fn python_bin() -> Option<PathBuf> {
-        [
-            PathBuf::from("/home/hazel/miniconda3/envs/Lab/bin/python"),
-            PathBuf::from("/usr/bin/python3"),
-        ]
-        .into_iter()
-        .find(|path| path.is_file())
-    }
-
-    fn python_worker() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../python/runtimes/worker_common.py")
-    }
-
-    #[tokio::test]
-    async fn hello_and_transcribe_fake() {
-        let bin = helper_bin();
-        if !bin.exists() {
-            eprintln!("skip: helper not built at {}", bin.display());
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let wav = dir.path().join("t.wav");
-        let status = std::process::Command::new("ffmpeg")
-            .args([
-                "-nostdin",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "sine=frequency=440:duration=0.3",
-                "-ar",
-                "16000",
-                "-ac",
-                "1",
-                "-y",
-            ])
-            .arg(&wav)
-            .status();
-        if !status.map(|s| s.success()).unwrap_or(false) {
-            eprintln!("skip: ffmpeg failed");
-            return;
-        }
-
-        let mut client = WorkerClient::spawn(&bin, "fake").await.unwrap();
-        assert!(client.descriptor().unwrap().supports_full_pipeline());
-        client.load_model(None).await.unwrap();
-        let (tx, mut rx) = mpsc::channel(32);
-        let opts = AsrOptions {
-            word_timestamps: true,
-            language: Some("en".into()),
-            ..Default::default()
-        };
-        let result = client.transcribe(&wav, &opts, tx, None).await.unwrap();
-        assert!(!result.words.is_empty());
-        let mut events = 0;
-        while rx.try_recv().is_ok() {
-            events += 1;
-        }
-        assert!(events > 0);
-        client.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn python_fake_worker_supports_heartbeat_and_control_cancel() {
-        let Some(python) = python_bin() else {
-            eprintln!("skip: managed Python runtime not installed");
-            return;
-        };
-        let script = python_worker();
-        if !script.is_file() {
-            eprintln!("skip: Python worker missing at {}", script.display());
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let wav = dir.path().join("python-worker.wav");
-        let status = std::process::Command::new("ffmpeg")
-            .args([
-                "-nostdin",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "sine=frequency=440:duration=0.3",
-                "-ar",
-                "16000",
-                "-ac",
-                "1",
-                "-y",
-            ])
-            .arg(&wav)
-            .status();
-        if !status.map(|value| value.success()).unwrap_or(false) {
-            eprintln!("skip: ffmpeg failed");
-            return;
-        }
-
-        let mut client = WorkerClient::spawn_python(&python, &script, "fake")
-            .await
-            .unwrap();
-        client.load_model(None).await.unwrap();
-        let control = client.control();
-        let (sink, _events) = mpsc::channel(32);
-        let opts = AsrOptions {
-            word_timestamps: true,
-            ..Default::default()
-        };
-        let task =
-            tokio::spawn(async move { client.transcribe(&wav, &opts, sink, Some(1000)).await });
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        control.ping().await.unwrap();
-        control.cancel_current().await.unwrap();
-        let error = task.await.unwrap().unwrap_err();
-        assert_eq!(error.code, ErrorCode::Cancelled);
-    }
-
-    #[tokio::test]
-    async fn python_worker_rejects_dirty_partial_and_oversized_stdout() {
-        let Some(python) = python_bin() else {
-            eprintln!("skip: managed Python runtime not installed");
-            return;
-        };
-        let cases = [
-            ("print('dirty', flush=True)", ErrorCode::WorkerProtocolError),
-            (
-                "import sys; sys.stdout.write('{\\\"broken\\\"'); sys.stdout.flush()",
-                ErrorCode::WorkerProtocolError,
-            ),
-            (
-                "print('x' * (4 * 1024 * 1024 + 1), flush=True)",
-                ErrorCode::WorkerProtocolError,
-            ),
-        ];
-        for (index, (source, expected)) in cases.into_iter().enumerate() {
-            let dir = tempfile::tempdir().unwrap();
-            let script = dir.path().join(format!("bad-{index}.py"));
-            fs::write(&script, source).unwrap();
-            let error = match WorkerClient::spawn_python(&python, &script, "fake").await {
-                Ok(mut client) => {
-                    let _ = client.kill_tree().await;
-                    panic!("bad worker unexpectedly completed hello")
-                }
-                Err(error) => error,
-            };
-            assert_eq!(error.code, expected);
-        }
     }
 }

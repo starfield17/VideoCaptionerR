@@ -1,5 +1,6 @@
 //! Application use cases.
 
+pub mod cancel_job;
 pub mod chunk_plan;
 pub mod llm_pipeline;
 pub mod maintenance;
@@ -9,6 +10,9 @@ pub mod startup_recovery;
 pub mod transcribe_job;
 pub mod transcript_editor;
 
+pub use cancel_job::{
+    CancelBatch, CancelBatchCommand, CancelJob, CancelJobCommand, CancelResponse,
+};
 pub use chunk_plan::PersistChunkPlan;
 pub use llm_pipeline::{LlmPipeline, LlmPipelineRequest, LlmPipelineResult, LlmPlan, LlmPlanEntry};
 pub use maintenance::{

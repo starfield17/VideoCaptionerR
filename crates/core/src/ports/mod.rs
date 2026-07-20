@@ -17,9 +17,14 @@ pub use artifact::{
     ArtifactCommit, ArtifactInput, ArtifactRecoveryReport, ArtifactRecoveryStore, ArtifactSource,
     ArtifactStore, ChunkPlanCommit, ChunkPlanStore, PreparedArtifact, TranscriptCommit,
 };
-pub use asr::{AsrDescriptor, AsrRuntime, AsrSession, AsrTranscribeRequest, NormalizedAsrResult};
+pub use asr::{
+    cancel_grace, AsrCancelToken, AsrDescriptor, AsrRuntime, AsrSession, AsrSessionControl,
+    AsrTranscribeRequest, NormalizedAsrResult, ASR_CANCEL_GRACE_MS,
+};
 pub use cache::{CacheGcResult, CacheRepository};
-pub use events::{EventPublisher, OutboxEvent, OutboxRepository, StoredOutboxEvent};
+pub use events::{
+    ApplicationEvent, EventPublisher, LiveEventSink, OutboxEvent, OutboxRepository, StoredOutboxEvent,
+};
 pub use llm::{
     CapabilityProbeRecord, CapabilityProbeStore, LlmCapabilities, LlmGateway, LlmMessage,
     LlmRequest, LlmRequestMetadata, LlmRequestRecorder, LlmResponse, LlmRole, LlmStage,
