@@ -939,11 +939,11 @@ impl LlmPipeline {
     where
         F: Fn(&Value) -> Result<T, String>,
     {
-        // Semantic/JSON validation retries (budget = retries, default two).
-        let max_semantic_attempts = retries.saturating_add(1);
+        // Semantic/JSON validation retries via application agent repair loop.
+        let max_semantic_attempts = super::agent::max_semantic_attempts(retries);
         // Transport retries: two automatic retries per WorkUnit by default.
-        let max_transport_attempts = 3u32;
-        let mut last_violation = None;
+        let max_transport_attempts = super::agent::MAX_TRANSPORT_ATTEMPTS;
+        let mut last_violation: Option<String> = None;
         let mut semantic_attempt = 0u32;
         let mut transport_attempt = 0u32;
         loop {
@@ -951,12 +951,7 @@ impl LlmPipeline {
                 break;
             }
             if let Some(violation) = last_violation.take() {
-                messages.push(LlmMessage {
-                    role: LlmRole::User,
-                    content: format!(
-                        "The previous response was rejected. Fix this violation and return only the requested JSON: {violation}"
-                    ),
-                });
+                messages.push(super::agent::repair_user_message(&violation));
             }
             let request_id = self.ids.next_id().to_string();
             let request_hash = hash_request(request, &messages);
@@ -979,6 +974,10 @@ impl LlmPipeline {
             match response {
                 Err(error) => {
                     let code = error_code(&error);
+                    let retry_after = match &error {
+                        ApplicationError::Adapter(vc) => vc.retry_after_ms,
+                        _ => None,
+                    };
                     if let Some(ctx) = &request.durable {
                         let _ = super::durable::append_attempt(
                             ctx,
@@ -994,7 +993,7 @@ impl LlmPipeline {
                                 prompt_tokens: None,
                                 completion_tokens: None,
                                 error_code: Some(code.as_str().into()),
-                                retry_after_ms: None,
+                                retry_after_ms: retry_after,
                             },
                         );
                     }
@@ -1022,11 +1021,15 @@ impl LlmPipeline {
                             if transport_attempt >= max_transport_attempts {
                                 return Err(error);
                             }
-                            // Cancellation-aware backoff with jitter.
-                            let base_ms = 200u64.saturating_mul(1u64 << transport_attempt.min(4));
-                            let jitter = started % 50;
-                            tokio::time::sleep(std::time::Duration::from_millis(base_ms + jitter))
-                                .await;
+                            // Honor Retry-After when present; else exponential backoff + jitter.
+                            let wait_ms = retry_after.unwrap_or_else(|| {
+                                let base = 200u64.saturating_mul(1u64 << transport_attempt.min(4));
+                                base + (started % 50)
+                            });
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                wait_ms.min(30_000),
+                            ))
+                            .await;
                             continue;
                         }
                     }

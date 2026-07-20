@@ -3,6 +3,7 @@
 //! This module owns packing, validation, retries, binary isolation and stale
 //! result handling. Providers only transport an already-shaped request.
 
+mod agent;
 mod correct;
 pub mod durable;
 mod execute;

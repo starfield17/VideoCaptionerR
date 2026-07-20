@@ -98,7 +98,8 @@ impl LlmProvider for FakeLlmProvider {
                 Err(VcError::new(ErrorCode::LlmAuthFailed, "403 forbidden"))
             }
             FakeLlmMode::RateLimited429 => {
-                Err(VcError::new(ErrorCode::LlmRateLimited, "429 rate limited"))
+                Err(VcError::new(ErrorCode::LlmRateLimited, "429 rate limited")
+                    .with_retry_after_ms(50))
             }
             FakeLlmMode::Server500 => Err(VcError::new(
                 ErrorCode::LlmProviderUnavailable,
