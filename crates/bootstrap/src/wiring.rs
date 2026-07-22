@@ -43,6 +43,7 @@ pub(crate) fn default_prompt_dir() -> PathBuf {
 
 pub(crate) fn build_llm_pipeline(
     config: &AppConfig,
+    provider_id: Option<&str>,
     prompt_dir: &Path,
     logs_dir: &Path,
     ids: Arc<dyn IdGenerator>,
@@ -51,7 +52,7 @@ pub(crate) fn build_llm_pipeline(
     Option<Arc<LlmPipeline>>,
     Option<LlmProcessDefaults>,
 )> {
-    let Some(provider_id) = config.llm.default_provider.as_deref() else {
+    let Some(provider_id) = provider_id.or(config.llm.default_provider.as_deref()) else {
         return Ok((None, None));
     };
     let provider_config = config.llm.providers.get(provider_id).ok_or_else(|| {

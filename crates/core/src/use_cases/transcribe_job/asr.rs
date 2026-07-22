@@ -2,24 +2,37 @@ use super::commit::{decode_chunk_transcript, normalized_options_hash, work_unit_
 use super::long_audio::append_chunk_words;
 use super::*;
 
+pub(super) struct AsrExecutionContext {
+    pub(super) source_hash: String,
+    pub(super) pcm_hash: String,
+    pub(super) audio_path: PathBuf,
+    pub(super) duration_ms: u64,
+    pub(super) cancel: AsrCancelToken,
+}
+
 impl TranscribeJob {
     pub(super) async fn transcribe_asr(
         &self,
         command: &TranscribeJobCommand,
         session: &mut dyn AsrSession,
-        source_hash: &str,
-        pcm_hash: &str,
-        audio_path: &Path,
-        duration_ms: u64,
+        context: AsrExecutionContext,
     ) -> AppResult<Transcript> {
+        let AsrExecutionContext {
+            source_hash,
+            pcm_hash,
+            audio_path,
+            duration_ms,
+            cancel,
+        } = context;
         let Some(max_audio_secs) = session.descriptor().max_audio_secs else {
             return self
                 .transcribe_full_audio(
                     command,
                     session,
-                    source_hash,
-                    audio_path.to_path_buf(),
+                    &source_hash,
+                    audio_path,
                     duration_ms,
+                    cancel.clone(),
                 )
                 .await;
         };
@@ -29,9 +42,10 @@ impl TranscribeJob {
                 .transcribe_full_audio(
                     command,
                     session,
-                    source_hash,
-                    audio_path.to_path_buf(),
+                    &source_hash,
+                    audio_path,
                     duration_ms,
+                    cancel.clone(),
                 )
                 .await;
         }
@@ -45,10 +59,11 @@ impl TranscribeJob {
         let analysis = self
             .media
             .analyze_audio(AudioAnalysisRequest {
-                audio_path: audio_path.to_path_buf(),
+                audio_path: audio_path.clone(),
                 duration_ms,
             })
             .await?;
+        self.ensure_not_cancelled(command, &cancel).await?;
         let mut options = ChunkPlanOptions::default();
         options.max_chunk_ms = options.max_chunk_ms.min(max_audio_ms);
         let plan = ChunkPlan::build(duration_ms, &analysis.silences, &analysis.energy, options)?;
@@ -70,8 +85,9 @@ impl TranscribeJob {
         let mut engine = EngineFingerprint::unknown();
         let mut chunk_units = Vec::with_capacity(plan.chunks.len());
         for chunk in plan.chunks.iter().copied() {
+            self.ensure_not_cancelled(command, &cancel).await?;
             let key = chunk_cache_key(
-                pcm_hash,
+                &pcm_hash,
                 &plan.plan_hash,
                 chunk.index,
                 &session.descriptor().fingerprint,
@@ -110,6 +126,7 @@ impl TranscribeJob {
         }
 
         for (chunk, key, unit) in chunk_units {
+            self.ensure_not_cancelled(command, &cancel).await?;
             if unit.status() == WorkUnitStatus::Done {
                 let raw = self.load_chunk_transcript(&unit, &key, ports).await?;
                 append_chunk_words(&mut words, &mut language, &mut engine, raw, chunk)?;
@@ -156,22 +173,23 @@ impl TranscribeJob {
                         let extracted = self
                             .media
                             .extract_audio_range(ExtractAudioRangeRequest {
-                                input_wav: audio_path.to_path_buf(),
+                                input_wav: audio_path.clone(),
                                 read_start_ms: chunk.read_start_ms,
                                 read_end_ms: chunk.read_end_ms,
                                 output_path: chunk_path,
                             })
                             .await?;
+                        self.ensure_not_cancelled(command, &cancel).await?;
                         let raw = session
                             .transcribe(
                                 AsrTranscribeRequest {
                                     audio_path: extracted.wav_path,
                                     language: command.language.clone(),
-                                    source_hash: source_hash.to_owned(),
+                                    source_hash: source_hash.clone(),
                                     duration_ms: Some(chunk.read_end_ms - chunk.read_start_ms),
                                 },
                                 self.events.as_ref(),
-                                None,
+                                Some(cancel.clone()),
                             )
                             .await?
                             .transcript;
@@ -180,6 +198,7 @@ impl TranscribeJob {
                     }
                 };
                 raw.validate()?;
+                self.ensure_not_cancelled(command, &cancel).await?;
                 let bytes = serde_json::to_vec_pretty(&raw).map_err(|error| {
                     ApplicationError::Adapter(VcError::new(
                         ErrorCode::ArtifactCommitFailed,
@@ -205,6 +224,7 @@ impl TranscribeJob {
                     artifact: artifact.clone(),
                     source: ArtifactSource::Bytes { bytes },
                 };
+                self.ensure_not_cancelled(command, &cancel).await?;
                 let mut completed = leased.clone();
                 completed.complete(artifact.clone())?;
                 let result = self
@@ -221,6 +241,7 @@ impl TranscribeJob {
                         "atomic ASR WorkUnit commit did not return WorkUnit".into(),
                     )
                 })?;
+                self.ensure_not_cancelled(command, &cancel).await?;
                 Ok(raw)
             }
             .await;
@@ -228,12 +249,22 @@ impl TranscribeJob {
                 Ok(raw) => append_chunk_words(&mut words, &mut language, &mut engine, raw, chunk)?,
                 Err(error) => {
                     let primary = error.into_vc_error();
-                    let state_result = match leased.fail(primary.code.as_str()) {
-                        Ok(()) => {
+                    let state_result = if primary.code == ErrorCode::Cancelled {
+                        if leased.status().is_terminal() {
+                            Ok(())
+                        } else {
+                            leased.cancel()?;
                             let expected = leased.expected_version();
                             ports.work_units.save_work_unit(&mut leased, expected).await
                         }
-                        Err(error) => Err(ApplicationError::Domain(error)),
+                    } else {
+                        match leased.fail(primary.code.as_str()) {
+                            Ok(()) => {
+                                let expected = leased.expected_version();
+                                ports.work_units.save_work_unit(&mut leased, expected).await
+                            }
+                            Err(error) => Err(ApplicationError::Domain(error)),
+                        }
                     };
                     match state_result {
                         Ok(()) => return Err(ApplicationError::Adapter(primary)),
@@ -250,6 +281,7 @@ impl TranscribeJob {
 
         let mut transcript = Transcript::new_asr(source_hash.to_owned(), engine, words);
         transcript.language = language.or_else(|| command.language.clone());
+        self.ensure_not_cancelled(command, &cancel).await?;
         transcript.validate()?;
         Ok(transcript)
     }
@@ -261,7 +293,9 @@ impl TranscribeJob {
         source_hash: &str,
         audio_path: PathBuf,
         duration_ms: u64,
+        cancel: AsrCancelToken,
     ) -> AppResult<Transcript> {
+        self.ensure_not_cancelled(command, &cancel).await?;
         Ok(session
             .transcribe(
                 AsrTranscribeRequest {
@@ -271,7 +305,7 @@ impl TranscribeJob {
                     duration_ms: Some(duration_ms),
                 },
                 self.events.as_ref(),
-                None,
+                Some(cancel),
             )
             .await?
             .transcript)

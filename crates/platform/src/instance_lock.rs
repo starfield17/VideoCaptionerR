@@ -48,7 +48,7 @@ impl InstanceLock {
             .create(true)
             .read(true)
             .write(true)
-            .truncate(true)
+            .truncate(false)
             .open(lock_path)
             .map_err(|e| {
                 VcError::new(
@@ -67,8 +67,17 @@ impl InstanceLock {
             )
         })?;
 
+        // Lock before touching the metadata. A second process must not be
+        // able to truncate the live owner's diagnostic payload while its lock
+        // attempt is being rejected.
         let payload = format!("owner={}\npid={}\n", owner.as_str(), std::process::id());
-        file.set_len(0).ok();
+        file.set_len(0).map_err(|e| {
+            let _ = FileExt::unlock(&file);
+            VcError::new(
+                ErrorCode::InstanceBusy,
+                format!("truncate lock metadata {}: {e}", lock_path.display()),
+            )
+        })?;
         file.write_all(payload.as_bytes())
             .map_err(|e| VcError::new(ErrorCode::InstanceBusy, format!("write lock file: {e}")))?;
         file.sync_all().ok();

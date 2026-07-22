@@ -1,7 +1,7 @@
 //! Atomic ffmpeg audio extraction to 16 kHz mono PCM s16le WAV.
 
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -80,6 +80,18 @@ fn available_bytes(dir: &Path) -> Option<u64> {
     Some(avail_kb.saturating_mul(1024))
 }
 
+fn remove_temp_file(path: &Path) {
+    if let Err(error) = fs::remove_file(path) {
+        if error.kind() != ErrorKind::NotFound {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "temporary media file cleanup failed"
+            );
+        }
+    }
+}
+
 /// Extract audio to `job_dir/audio.wav` via `audio.tmp.wav` then atomic commit.
 ///
 /// On cancellation/failure, only the tmp file is removed; a previous valid
@@ -111,7 +123,7 @@ pub fn extract_audio_wav(
     let final_path = job_dir.join("audio.wav");
 
     // Clean any leftover tmp from a previous crash.
-    let _ = fs::remove_file(&tmp);
+    remove_temp_file(&tmp);
 
     let map = format!("0:{}", opts.stream_index);
     let mut cmd = Command::new(&ffmpeg);
@@ -138,12 +150,12 @@ pub fn extract_audio_wav(
 
     let output = cmd.output().map_err(|e| {
         // Ensure tmp cleaned on spawn failure.
-        let _ = fs::remove_file(&tmp);
+        remove_temp_file(&tmp);
         VcError::new(ErrorCode::FfmpegFailed, format!("spawn ffmpeg: {e}"))
     })?;
 
     if !output.status.success() {
-        let _ = fs::remove_file(&tmp);
+        remove_temp_file(&tmp);
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(VcError::new(
             ErrorCode::FfmpegFailed,
@@ -165,7 +177,7 @@ pub fn extract_audio_wav(
         if let Some(actual) = wav_duration_ms(&tmp) {
             let delta = actual.abs_diff(expected);
             if delta > opts.duration_tolerance_ms {
-                let _ = fs::remove_file(&tmp);
+                remove_temp_file(&tmp);
                 return Err(VcError::new(
                     ErrorCode::FfmpegFailed,
                     format!(
@@ -251,14 +263,14 @@ pub fn extract_audio_range_wav(
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     let output = command.output().map_err(|error| {
-        let _ = fs::remove_file(&tmp);
+        remove_temp_file(&tmp);
         VcError::new(
             ErrorCode::FfmpegFailed,
             format!("spawn ffmpeg for chunk: {error}"),
         )
     })?;
     if !output.status.success() {
-        let _ = fs::remove_file(&tmp);
+        remove_temp_file(&tmp);
         return Err(VcError::new(
             ErrorCode::FfmpegFailed,
             format!(

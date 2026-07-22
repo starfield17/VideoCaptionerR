@@ -339,6 +339,32 @@ fn verify_source_boundaries() -> Result<()> {
         }
     }
 
+    // Bootstrap is a composition root, not a second application service. The
+    // media-processing facade must delegate aggregate creation and output
+    // policy to Core ports/use cases; concrete adapter wiring belongs in the
+    // runtime factory, never in the inbound processing path.
+    for facade_path in [
+        "crates/bootstrap/src/processing.rs",
+        "crates/bootstrap/src/import_subtitle.rs",
+    ] {
+        let facade = fs::read_to_string(facade_path)
+            .with_context(|| format!("read bootstrap facade {facade_path}"))?;
+        for forbidden in [
+            "Batch::",
+            "Job::",
+            "ConflictPolicy::",
+            "OutputPlanner",
+            "videocaptionerr_platform",
+            "videocaptionerr_store",
+        ] {
+            if facade.contains(forbidden) {
+                bail!(
+                    "bootstrap facade {facade_path} contains forbidden application decision {forbidden}"
+                );
+            }
+        }
+    }
+
     let store_root =
         fs::read_to_string("crates/store/src/lib.rs").context("read store crate root")?;
     if store_root

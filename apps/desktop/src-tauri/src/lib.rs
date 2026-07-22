@@ -47,10 +47,6 @@ async fn process_files(
     if request.files.is_empty() {
         return Err("INVALID_ARGUMENT: no input files".into());
     }
-    let _lock = state
-        .runtime
-        .acquire_gui_processing_lock()
-        .map_err(error_text)?;
     let files = request.files.into_iter().map(PathBuf::from).collect();
     state
         .runtime
@@ -118,6 +114,16 @@ async fn retry_job(
     from_stage: Option<String>,
     dry_run: bool,
 ) -> Result<String, String> {
+    let _processing_lease = if dry_run {
+        None
+    } else {
+        Some(
+            state
+                .runtime
+                .acquire_gui_processing_lock()
+                .map_err(error_text)?,
+        )
+    };
     let outcome = state
         .runtime
         .retry_job(&job_id, from_stage.as_deref(), dry_run)
@@ -148,13 +154,30 @@ async fn resume_batch(state: State<'_, DesktopState>, batch_id: String) -> Resul
         .map_err(error_text)
 }
 
+#[tauri::command]
+async fn cancel_batch(state: State<'_, DesktopState>, batch_id: String) -> Result<(), String> {
+    state
+        .runtime
+        .cancel_batch(&batch_id)
+        .await
+        .map_err(error_text)?;
+    Ok(())
+}
+
 pub fn run() {
     let runtime = ApplicationRuntime::open(RuntimeConfig {
         home: None,
-        engine: "fake".into(),
+        engine: if cfg!(debug_assertions) {
+            // Development builds may explicitly opt into the deterministic
+            // fake adapter; release builds resolve the configured real profile.
+            Some("fake".into())
+        } else {
+            None
+        },
         model_path: None,
         helper_path: None,
         prompt_dir: None,
+        profile: None,
     })
     .expect("open VideoCaptionerR application runtime");
 
@@ -170,7 +193,8 @@ pub fn run() {
             cancel_job,
             retry_job,
             pause_batch,
-            resume_batch
+            resume_batch,
+            cancel_batch
         ])
         .run(tauri::generate_context!())
         .expect("run VideoCaptionerR desktop application");

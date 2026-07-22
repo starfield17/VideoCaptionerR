@@ -1,11 +1,12 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use videocaptionerr_contracts::error::{ErrorCode, VcError, VcResult};
 use videocaptionerr_core::application_error::ApplicationError;
 use videocaptionerr_core::use_cases::{RecoveryReport, StartupRecovery};
 
 pub(crate) fn run_startup_recovery_sync(
-    recovery: StartupRecovery,
+    recovery: Arc<StartupRecovery>,
     roots: Vec<PathBuf>,
 ) -> VcResult<RecoveryReport> {
     let join = std::thread::Builder::new()

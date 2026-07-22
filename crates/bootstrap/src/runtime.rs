@@ -1,24 +1,29 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use videocaptionerr_asr::{resolve_helper_binary, FamilyAsrRuntimeResolver};
 use videocaptionerr_contracts::error::{ErrorCode, VcError, VcResult};
 use videocaptionerr_core::ports::{
-    ArtifactRecoveryStore, ArtifactStore, AsrRuntimeResolver, BatchRepository, CacheRepository,
-    CapabilityProbeStore, ChunkPlanStore, Clock, EventPublisher, IdGenerator, JobRepository,
-    OutboxRepository, RetryTransactionRepository, SnapshotRepository, StageCommitRepository,
-    SubtitleGateway, WorkUnitRepository,
+    ActiveRunRegistry, ArtifactRecoveryStore, ArtifactStore, AsrRuntimeResolver, BatchRepository,
+    CacheRepository, CapabilityProbeStore, ChunkPlanStore, Clock, EventPublisher, IdGenerator,
+    JobRepository, JobWorkspace, MediaFileCatalog, OutboxRepository,
+    OutputPlanner as OutputPlannerPort, RetryTransactionRepository, SnapshotRepository,
+    StageCommitRepository, SubtitleGateway, SubtitleImporter, WorkUnitRepository,
 };
 use videocaptionerr_core::use_cases::{
-    CacheGc, PersistChunkPlan, RecoveryReport, RetryJob, RunBatch, StartupRecovery,
+    CacheGc, CreateBatch, CreateBatchDependencies, ImportSubtitle, PersistChunkPlan,
+    ProcessMediaFiles, RecoveryReport, ResumeBatch, RetryJob, RunBatch, StartupRecovery,
     TranscriptEditor, WorkUnitScheduler,
 };
 use videocaptionerr_platform::{
-    AppConfig, AppPaths, FfmpegMediaGateway, FileSubtitleGateway, InstanceLock, LockOwner,
+    AppConfig, AppJobWorkspace, AppPaths, ConflictPolicy, FfmpegMediaGateway, FileSubtitleGateway,
+    InstanceLock, LocalMediaFileCatalog, LocalSubtitleImporter, LockOwner, PlatformOutputPlanner,
+    ResolvedProfile,
 };
 use videocaptionerr_store::{CacheStore, SqliteArtifactStore, StoreHandle};
 
 use crate::config::{LlmProcessDefaults, RuntimeConfig};
+use crate::run_control::InMemoryActiveRunRegistry;
 
 /// Opaque RAII lease shared by CLI and desktop inbound adapters.
 pub struct ProcessingLease {
@@ -29,13 +34,16 @@ pub struct ApplicationRuntime {
     pub(crate) paths: AppPaths,
     pub(crate) engine: String,
     pub(crate) model_path: Option<PathBuf>,
+    pub(crate) model_digest: Option<String>,
     pub(crate) helper_path: PathBuf,
     pub(crate) jobs: Arc<dyn JobRepository>,
     pub(crate) batches: Arc<dyn BatchRepository>,
     pub(crate) work_units: Arc<dyn WorkUnitRepository>,
     pub(crate) snapshots: Arc<dyn SnapshotRepository>,
-    pub(crate) stage_commits: Arc<dyn StageCommitRepository>,
     pub(crate) run_batch: Arc<RunBatch>,
+    pub(crate) process_media_files: Arc<ProcessMediaFiles>,
+    pub(crate) import_subtitle_uc: Arc<ImportSubtitle>,
+    pub(crate) resume_batch_uc: Arc<ResumeBatch>,
     pub(crate) retry_job_uc: Arc<RetryJob>,
     pub(crate) cache_gc: Arc<CacheGc>,
     pub(crate) scheduler: Arc<WorkUnitScheduler>,
@@ -43,7 +51,10 @@ pub struct ApplicationRuntime {
     pub(crate) capability_probes: Arc<dyn CapabilityProbeStore>,
     pub(crate) transcript_editor: Arc<TranscriptEditor>,
     pub(crate) llm_defaults: Option<LlmProcessDefaults>,
-    pub(crate) recovery_report: RecoveryReport,
+    pub(crate) resolved_profile: ResolvedProfile,
+    startup_recovery: Arc<StartupRecovery>,
+    recovery_report: Mutex<RecoveryReport>,
+    pub(crate) active_runs: Arc<dyn ActiveRunRegistry>,
 }
 
 impl ApplicationRuntime {
@@ -54,32 +65,28 @@ impl ApplicationRuntime {
         };
         paths.ensure_layout()?;
         let app_config = AppConfig::load(&paths.config_file)?;
+        let resolved_profile = app_config.resolve_profile(config.profile.as_deref())?;
         let prompt_dir = config
             .prompt_dir
             .clone()
             .unwrap_or_else(crate::wiring::default_prompt_dir);
 
-        if config.engine != "fake" {
-            let model_path = config.model_path.as_ref().ok_or_else(|| {
-                VcError::new(
-                    ErrorCode::ModelNotFound,
-                    "no model selected; pass --model explicitly (no silent default download)",
-                )
-            })?;
-            // whisper-cpp requires a file; python engines accept file or directory.
-            if config.engine == "whisper-cpp" && !model_path.is_file() {
-                return Err(VcError::new(
-                    ErrorCode::ModelNotFound,
-                    format!("model file not found: {}", model_path.display()),
-                ));
-            }
-            if !model_path.exists() {
-                return Err(VcError::new(
-                    ErrorCode::ModelNotFound,
-                    format!("model path not found: {}", model_path.display()),
-                ));
-            }
-        }
+        let engine = config
+            .engine
+            .clone()
+            .unwrap_or_else(|| resolved_profile.preferred_engine.clone());
+        let digest_path = config.model_path.clone().or_else(|| {
+            resolved_profile
+                .model_id
+                .as_ref()
+                .map(PathBuf::from)
+                .filter(|path| path.is_file())
+        });
+        let model_digest = digest_path
+            .as_deref()
+            .filter(|path| path.is_file())
+            .map(videocaptionerr_store::blake3_file)
+            .transpose()?;
 
         let helper_path = config.helper_path.unwrap_or_else(resolve_helper_binary);
         let store = StoreHandle::open(&paths.db_path)?;
@@ -89,7 +96,11 @@ impl ApplicationRuntime {
         let snapshots: Arc<dyn SnapshotRepository> = Arc::new(store.clone());
         let outbox: Arc<dyn OutboxRepository> = Arc::new(store.clone());
         let capability_probes: Arc<dyn CapabilityProbeStore> = Arc::new(store.clone());
-        let cached_capabilities = crate::wiring::load_cached_capabilities(&store, &app_config)?;
+        let cached_capabilities = crate::wiring::load_cached_capabilities(
+            &store,
+            &app_config,
+            resolved_profile.llm_provider.as_deref(),
+        )?;
         let artifact_adapter = Arc::new(SqliteArtifactStore::new(store.clone()));
         let artifacts: Arc<dyn ArtifactStore> = artifact_adapter.clone();
         let artifact_recovery: Arc<dyn ArtifactRecoveryStore> = artifact_adapter.clone();
@@ -111,6 +122,7 @@ impl ApplicationRuntime {
         ));
         let (llm_pipeline, llm_defaults) = crate::wiring::build_llm_pipeline(
             &app_config,
+            resolved_profile.llm_provider.as_deref(),
             &prompt_dir,
             &paths.logs_dir,
             ids.clone(),
@@ -123,8 +135,9 @@ impl ApplicationRuntime {
             artifact_recovery,
             outbox,
         );
-        let recovery_report =
-            crate::recovery::run_startup_recovery_sync(recovery, vec![paths.jobs_dir.clone()])?;
+        let startup_recovery = Arc::new(recovery);
+        let active_runs: Arc<dyn ActiveRunRegistry> =
+            Arc::new(InMemoryActiveRunRegistry::default());
         let runtimes_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../python/runtimes");
         let resolver: Arc<dyn AsrRuntimeResolver> = Arc::new(FamilyAsrRuntimeResolver::new(
             helper_path.clone(),
@@ -137,7 +150,7 @@ impl ApplicationRuntime {
             artifacts,
             subtitles,
             events.clone(),
-            ids,
+            ids.clone(),
             stage_commits.clone(),
         )
         .with_snapshots(snapshots.clone());
@@ -158,13 +171,54 @@ impl ApplicationRuntime {
             work_units.clone(),
             clock.clone(),
         );
+        transcribe_service = transcribe_service.with_batches(batches.clone());
         let transcribe = Arc::new(transcribe_service);
-        let run_batch = Arc::new(RunBatch::new(
+        let run_batch = Arc::new(
+            RunBatch::new(batches.clone(), jobs.clone(), resolver, transcribe, events)
+                .with_active_runs(active_runs.clone()),
+        );
+        let conflict =
+            ConflictPolicy::parse(&resolved_profile.conflict_policy).ok_or_else(|| {
+                VcError::new(
+                    ErrorCode::InvalidConfig,
+                    format!(
+                        "unknown output conflict policy '{}'",
+                        resolved_profile.conflict_policy
+                    ),
+                )
+            })?;
+        let files: Arc<dyn MediaFileCatalog> = Arc::new(LocalMediaFileCatalog);
+        let workspace: Arc<dyn JobWorkspace> =
+            Arc::new(AppJobWorkspace::new(paths.jobs_dir.clone()));
+        let importer: Arc<dyn SubtitleImporter> = Arc::new(LocalSubtitleImporter);
+        let import_subtitle_uc = Arc::new(ImportSubtitle::new(
+            ids.clone(),
+            workspace.clone(),
+            importer,
+            stage_commits.clone(),
+        ));
+        let outputs: Arc<dyn OutputPlannerPort> = Arc::new(PlatformOutputPlanner::new(
+            resolved_profile.output_template.clone(),
+            conflict,
+        ));
+        let process_media_files = Arc::new(ProcessMediaFiles::new(
+            CreateBatch::new(CreateBatchDependencies {
+                jobs: jobs.clone(),
+                batches: batches.clone(),
+                snapshots: snapshots.clone(),
+                ids: ids.clone(),
+                clock: clock.clone(),
+                files,
+                workspace,
+                outputs,
+            }),
+            run_batch.clone(),
+        ));
+        let resume_batch_uc = Arc::new(ResumeBatch::new(
             batches.clone(),
             jobs.clone(),
-            resolver,
-            transcribe,
-            events,
+            snapshots.clone(),
+            run_batch.clone(),
         ));
         let retry_tx: Arc<dyn RetryTransactionRepository> = Arc::new(store.clone());
         let retry_job_uc = Arc::new(RetryJob::new(
@@ -179,15 +233,18 @@ impl ApplicationRuntime {
 
         Ok(Self {
             paths,
-            engine: config.engine,
+            engine,
             model_path: config.model_path,
+            model_digest,
             helper_path,
             jobs,
             batches,
             work_units,
             snapshots,
-            stage_commits,
             run_batch,
+            process_media_files,
+            import_subtitle_uc,
+            resume_batch_uc,
             retry_job_uc,
             cache_gc,
             scheduler,
@@ -195,7 +252,10 @@ impl ApplicationRuntime {
             capability_probes,
             transcript_editor,
             llm_defaults,
-            recovery_report,
+            resolved_profile,
+            startup_recovery,
+            recovery_report: Mutex::new(RecoveryReport::default()),
+            active_runs,
         })
     }
 
@@ -203,13 +263,32 @@ impl ApplicationRuntime {
         &self.paths
     }
 
-    pub fn recovery_report(&self) -> &RecoveryReport {
-        &self.recovery_report
+    pub fn recovery_report(&self) -> RecoveryReport {
+        self.recovery_report
+            .lock()
+            .map(|report| report.clone())
+            .unwrap_or_default()
     }
 
     pub(crate) fn acquire_processing_lock(&self, owner: LockOwner) -> VcResult<ProcessingLease> {
-        InstanceLock::try_acquire(&self.paths.instance_lock_path(), owner)
-            .map(|inner| ProcessingLease { _inner: inner })
+        // Opening a Runtime is read-only. Recovery is deliberately performed
+        // only after the OS-backed owner lock has been acquired, so another
+        // process can list/show/probe while a live owner keeps Running state.
+        let inner = InstanceLock::try_acquire(&self.paths.instance_lock_path(), owner)?;
+        let report = match crate::recovery::run_startup_recovery_sync(
+            self.startup_recovery.clone(),
+            vec![self.paths.jobs_dir.clone()],
+        ) {
+            Ok(report) => report,
+            Err(error) => {
+                drop(inner);
+                return Err(error);
+            }
+        };
+        if let Ok(mut current) = self.recovery_report.lock() {
+            *current = report;
+        }
+        Ok(ProcessingLease { _inner: inner })
     }
 
     pub fn acquire_cli_processing_lock(&self) -> VcResult<ProcessingLease> {

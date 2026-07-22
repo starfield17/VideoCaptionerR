@@ -25,6 +25,9 @@ impl ApplicationRuntime {
         self.batches
             .save_batch(&mut batch, expected)
             .await
+            .map_err(ApplicationError::into_vc_error)?;
+        self.active_runs
+            .signal_batch(&id)
             .map_err(ApplicationError::into_vc_error)
     }
 
@@ -45,6 +48,27 @@ impl ApplicationRuntime {
         self.batches
             .save_batch(&mut batch, expected)
             .await
+            .map_err(ApplicationError::into_vc_error)?;
+        self.active_runs
+            .signal_batch(&id)
+            .map_err(ApplicationError::into_vc_error)?;
+        if batch.status().is_terminal() {
+            return Ok(());
+        }
+
+        // A live owner will observe the durable resume through its polling
+        // loop (and the local signal above). If no owner is alive, this
+        // control command may become the next Processing Owner and rebuild
+        // the execution exclusively from persisted Job snapshots.
+        let _lease = match self.acquire_gui_processing_lock() {
+            Ok(lease) => lease,
+            Err(error) if error.code == ErrorCode::InstanceBusy => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        self.resume_batch_uc
+            .execute(id)
+            .await
+            .map(|_| ())
             .map_err(ApplicationError::into_vc_error)
     }
 }

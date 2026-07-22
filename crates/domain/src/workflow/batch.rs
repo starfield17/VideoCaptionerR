@@ -25,6 +25,9 @@ impl BatchExecutionProfile {
 pub enum BatchStatus {
     Pending,
     Running,
+    /// The Processing Owner is still alive and holding the session, but the
+    /// next Job is deliberately not started until a durable resume request.
+    Paused,
     Done,
     Failed,
     Cancelled,
@@ -125,7 +128,7 @@ impl Batch {
     /// Stop starting new Jobs/WorkUnits. Does not unload the model.
     pub fn request_pause(&mut self) -> DomainResult<()> {
         if self.status.is_terminal() {
-            return Err(DomainError::AlreadyTerminal { aggregate: "Batch" });
+            return Ok(());
         }
         if self.cancel_requested {
             return Err(DomainError::InvalidArgument(
@@ -139,9 +142,31 @@ impl Batch {
     /// Clear pause so RunBatch may start remaining Jobs.
     pub fn resume(&mut self) -> DomainResult<()> {
         if self.status.is_terminal() {
-            return Err(DomainError::AlreadyTerminal { aggregate: "Batch" });
+            return Ok(());
         }
         self.pause_requested = false;
+        if self.status == BatchStatus::Paused {
+            self.status = BatchStatus::Running;
+        }
+        Ok(())
+    }
+
+    /// Persist the safe-point transition reached by the live Processing
+    /// Owner. The ASR session remains open while the Batch is Paused.
+    pub fn mark_paused(&mut self) -> DomainResult<()> {
+        if self.status != BatchStatus::Running {
+            return Err(DomainError::IllegalTransition {
+                aggregate: "Batch",
+                from: format!("{:?}", self.status),
+                to: "Paused".into(),
+            });
+        }
+        if !self.pause_requested {
+            return Err(DomainError::InvalidArgument(
+                "Batch can be marked Paused only after pause was requested".into(),
+            ));
+        }
+        self.status = BatchStatus::Paused;
         Ok(())
     }
 
@@ -224,9 +249,10 @@ impl Batch {
     /// terminalization is intentionally not provided.
     pub fn request_cancel(&mut self) -> DomainResult<()> {
         if self.status.is_terminal() {
-            return Err(DomainError::AlreadyTerminal { aggregate: "Batch" });
+            return Ok(());
         }
         self.cancel_requested = true;
+        self.pause_requested = false;
         Ok(())
     }
 
@@ -254,7 +280,9 @@ impl Batch {
         self.terminal_event_emitted = false;
         self.cancel_requested = false;
         self.pause_requested = false;
-        if self.status.is_terminal() || self.status == BatchStatus::Running {
+        if self.status.is_terminal()
+            || matches!(self.status, BatchStatus::Running | BatchStatus::Paused)
+        {
             self.status = BatchStatus::Pending;
         }
         Ok(())

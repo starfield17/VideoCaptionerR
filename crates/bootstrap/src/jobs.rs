@@ -49,6 +49,7 @@ impl ApplicationRuntime {
             )
         })?;
         CancelJob::new(self.jobs.clone(), self.work_units.clone())
+            .with_active_runs(self.active_runs.clone())
             .execute(CancelJobCommand { job_id })
             .await
             .map_err(ApplicationError::into_vc_error)
@@ -62,6 +63,7 @@ impl ApplicationRuntime {
             )
         })?;
         CancelBatch::new(self.batches.clone(), self.jobs.clone())
+            .with_active_runs(self.active_runs.clone())
             .execute(CancelBatchCommand { batch_id })
             .await
             .map_err(ApplicationError::into_vc_error)

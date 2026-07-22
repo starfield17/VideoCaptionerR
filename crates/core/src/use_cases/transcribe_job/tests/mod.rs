@@ -12,11 +12,12 @@ use videocaptionerr_domain::{BatchId, EngineFingerprint, Word, PROB_UNAVAILABLE,
 use super::*;
 use crate::application_error::AppResult;
 use crate::ports::{
-    ArtifactCommit, ArtifactInput, ArtifactStore, AsrDescriptor, AudioAnalysis, AudioExtraction,
-    AudioRangeExtraction, CacheGcResult, CacheRepository, ChunkPlanCommit, ChunkPlanStore, Clock,
-    ExpectedVersion, ExportedSubtitle, ExtractAudioRangeRequest, ExtractAudioRequest,
-    NormalizedAsrResult, ProbedMedia, StageCommitRepository, StageCommitRequest, StageCommitResult,
-    SubtitleFormat, SubtitleLayout, TranscriptCommit, Versioned, WorkUnitRepository,
+    ArtifactCommit, ArtifactInput, ArtifactStore, AsrCancelToken, AsrDescriptor, AudioAnalysis,
+    AudioExtraction, AudioRangeExtraction, CacheGcResult, CacheRepository, ChunkPlanCommit,
+    ChunkPlanStore, Clock, ExpectedVersion, ExportedSubtitle, ExtractAudioRangeRequest,
+    ExtractAudioRequest, NormalizedAsrResult, ProbedMedia, StageCommitRepository,
+    StageCommitRequest, StageCommitResult, SubtitleFormat, SubtitleLayout, TranscriptCommit,
+    Versioned, WorkUnitRepository,
 };
 
 struct FakeIds;
@@ -690,6 +691,7 @@ struct LongSession {
     calls: Arc<Mutex<Vec<PathBuf>>>,
     fail_chunk: Option<u32>,
     failed: bool,
+    cancel_on_call: Option<usize>,
 }
 
 impl LongSession {
@@ -708,7 +710,13 @@ impl LongSession {
             calls: Arc::new(Mutex::new(Vec::new())),
             fail_chunk,
             failed: false,
+            cancel_on_call: None,
         }
+    }
+
+    fn cancel_on_call(mut self, call: usize) -> Self {
+        self.cancel_on_call = Some(call);
+        self
     }
 
     fn calls(&self) -> Vec<PathBuf> {
@@ -726,10 +734,16 @@ impl AsrSession for LongSession {
         &mut self,
         request: AsrTranscribeRequest,
         _events: &dyn EventPublisher,
-        _cancel: Option<crate::ports::AsrCancelToken>,
+        cancel: Option<crate::ports::AsrCancelToken>,
     ) -> AppResult<NormalizedAsrResult> {
         let path = request.audio_path;
         self.calls.lock().unwrap().push(path.clone());
+        let call_number = self.calls.lock().unwrap().len();
+        if self.cancel_on_call == Some(call_number) {
+            if let Some(cancel) = cancel {
+                cancel.request();
+            }
+        }
         let index = path
             .file_stem()
             .and_then(|value| value.to_str())
@@ -835,6 +849,7 @@ struct FakeSession {
     descriptor: AsrDescriptor,
     transcript: Option<Transcript>,
     fail: bool,
+    cancel_on_transcribe: bool,
 }
 
 #[async_trait]
@@ -847,13 +862,18 @@ impl AsrSession for FakeSession {
         &mut self,
         _request: AsrTranscribeRequest,
         _events: &dyn EventPublisher,
-        _cancel: Option<crate::ports::AsrCancelToken>,
+        cancel: Option<crate::ports::AsrCancelToken>,
     ) -> AppResult<NormalizedAsrResult> {
         if self.fail {
             return Err(ApplicationError::Adapter(VcError::new(
                 ErrorCode::AsrFailed,
                 "fake ASR failure",
             )));
+        }
+        if self.cancel_on_transcribe {
+            if let Some(cancel) = cancel {
+                cancel.request();
+            }
         }
         Ok(NormalizedAsrResult {
             transcript: self.transcript.take().unwrap(),
@@ -943,6 +963,22 @@ fn command(dir: &std::path::Path) -> TranscribeJobCommand {
     }
 }
 
+fn asr_context(
+    command: &TranscribeJobCommand,
+    source_hash: &str,
+    pcm_hash: &str,
+    duration_ms: u64,
+    cancel: AsrCancelToken,
+) -> super::asr::AsrExecutionContext {
+    super::asr::AsrExecutionContext {
+        source_hash: source_hash.into(),
+        pcm_hash: pcm_hash.into(),
+        audio_path: command.job_dir.join("audio.wav"),
+        duration_ms,
+        cancel,
+    }
+}
+
 fn session(transcript: Option<Transcript>, fail: bool) -> FakeSession {
     FakeSession {
         descriptor: AsrDescriptor {
@@ -957,7 +993,14 @@ fn session(transcript: Option<Transcript>, fail: bool) -> FakeSession {
         },
         transcript,
         fail,
+        cancel_on_transcribe: false,
     }
+}
+
+fn cancelling_session() -> FakeSession {
+    let mut session = session(Some(transcript()), false);
+    session.cancel_on_transcribe = true;
+    session
 }
 
 #[tokio::test]
@@ -975,6 +1018,21 @@ async fn fake_vertical_slice_completes_without_unloading_session() {
         jobs.saved.lock().unwrap().last().unwrap().status(),
         videocaptionerr_domain::JobStatus::Done
     );
+}
+
+#[tokio::test]
+async fn cancellation_during_asr_cannot_reach_export_or_completed() {
+    let dir = tempdir().unwrap();
+    let (use_case, jobs) = use_case();
+    let mut session = cancelling_session();
+    let error = use_case
+        .execute(command(dir.path()), &mut session)
+        .await
+        .unwrap_err();
+    assert_eq!(error.into_vc_error().code, ErrorCode::Cancelled);
+    let job = jobs.saved.lock().unwrap().last().unwrap().clone();
+    assert_eq!(job.status(), videocaptionerr_domain::JobStatus::Cancelled);
+    assert_ne!(job.status(), videocaptionerr_domain::JobStatus::Done);
 }
 
 #[tokio::test]
@@ -1110,10 +1168,13 @@ async fn long_audio_uses_core_ownership_and_skips_cached_asr() {
         .transcribe_asr(
             &command,
             &mut session,
-            "media-hash",
-            "pcm-hash",
-            &command.job_dir.join("audio.wav"),
-            250_000,
+            asr_context(
+                &command,
+                "media-hash",
+                "pcm-hash",
+                250_000,
+                AsrCancelToken::new(),
+            ),
         )
         .await
         .unwrap();
@@ -1142,10 +1203,13 @@ async fn long_audio_uses_core_ownership_and_skips_cached_asr() {
         .transcribe_asr(
             &command,
             &mut cached_session,
-            "media-hash",
-            "pcm-hash",
-            &command.job_dir.join("audio.wav"),
-            250_000,
+            asr_context(
+                &command,
+                "media-hash",
+                "pcm-hash",
+                250_000,
+                AsrCancelToken::new(),
+            ),
         )
         .await
         .unwrap();
@@ -1169,10 +1233,13 @@ async fn failed_long_audio_chunk_is_retryable_without_rerunning_completed_chunks
         .transcribe_asr(
             &command,
             &mut session,
-            "media-hash",
-            "pcm-hash",
-            &command.job_dir.join("audio.wav"),
-            250_000,
+            asr_context(
+                &command,
+                "media-hash",
+                "pcm-hash",
+                250_000,
+                AsrCancelToken::new(),
+            ),
         )
         .await
         .unwrap_err();
@@ -1197,10 +1264,13 @@ async fn failed_long_audio_chunk_is_retryable_without_rerunning_completed_chunks
         .transcribe_asr(
             &command,
             &mut session,
-            "media-hash",
-            "pcm-hash",
-            &command.job_dir.join("audio.wav"),
-            250_000,
+            asr_context(
+                &command,
+                "media-hash",
+                "pcm-hash",
+                250_000,
+                AsrCancelToken::new(),
+            ),
         )
         .await
         .unwrap();
@@ -1225,6 +1295,34 @@ async fn failed_long_audio_chunk_is_retryable_without_rerunning_completed_chunks
 }
 
 #[tokio::test]
+async fn cancellation_during_a_chunk_marks_the_job_cancelled() {
+    let dir = tempdir().unwrap();
+    let media = Arc::new(LongMedia::default());
+    let plans = Arc::new(LongPlans::default());
+    let cache = Arc::new(LongCache::default());
+    let units = Arc::new(LongUnits::default());
+    let use_case = long_use_case(media, plans, cache, units);
+    let command = command(dir.path());
+    let mut session = LongSession::new(None).cancel_on_call(2);
+    let error = use_case
+        .transcribe_asr(
+            &command,
+            &mut session,
+            asr_context(
+                &command,
+                "media-hash",
+                "pcm-hash",
+                250_000,
+                AsrCancelToken::new(),
+            ),
+        )
+        .await;
+    let error = error.unwrap_err().into_vc_error();
+    assert_eq!(error.code, ErrorCode::Cancelled);
+    assert_eq!(session.calls().len(), 2);
+}
+
+#[tokio::test]
 async fn corrupt_completed_chunk_cache_fails_explicitly() {
     let dir = tempdir().unwrap();
     let media = Arc::new(LongMedia::default());
@@ -1238,10 +1336,13 @@ async fn corrupt_completed_chunk_cache_fails_explicitly() {
         .transcribe_asr(
             &command,
             &mut initial,
-            "media-hash",
-            "pcm-hash",
-            &command.job_dir.join("audio.wav"),
-            250_000,
+            asr_context(
+                &command,
+                "media-hash",
+                "pcm-hash",
+                250_000,
+                AsrCancelToken::new(),
+            ),
         )
         .await
         .unwrap();
@@ -1252,10 +1353,13 @@ async fn corrupt_completed_chunk_cache_fails_explicitly() {
         .transcribe_asr(
             &command,
             &mut retry,
-            "media-hash",
-            "pcm-hash",
-            &command.job_dir.join("audio.wav"),
-            250_000,
+            asr_context(
+                &command,
+                "media-hash",
+                "pcm-hash",
+                250_000,
+                AsrCancelToken::new(),
+            ),
         )
         .await
         .unwrap_err();
@@ -1417,8 +1521,8 @@ async fn asr_retry_reruns_asr_and_later_stages_only() {
 #[tokio::test]
 async fn source_changed_is_reported_when_size_differs_from_snapshot() {
     use crate::execution_snapshot::{
-        AsrExecutionSnapshot, AudioStreamSelection, JobExecutionSnapshot, OutputPlanSnapshot,
-        SourceStatSnapshot, JOB_EXECUTION_SNAPSHOT_SCHEMA_VERSION,
+        AsrExecutionSnapshot, AudioStreamSelection, CacheExecutionSnapshot, JobExecutionSnapshot,
+        OutputPlanSnapshot, SourceStatSnapshot, JOB_EXECUTION_SNAPSHOT_SCHEMA_VERSION,
     };
     use crate::ports::SnapshotRepository;
 
@@ -1466,6 +1570,7 @@ async fn source_changed_is_reported_when_size_differs_from_snapshot() {
         },
         job_dir: cmd.job_dir.to_string_lossy().into_owned(),
         profile_revision: cmd.profile_revision.clone(),
+        profile_name: None,
         asr: AsrExecutionSnapshot {
             engine: "fake".into(),
             model_locator: crate::ports::ModelLocator::file("fake"),
@@ -1484,6 +1589,7 @@ async fn source_changed_is_reported_when_size_differs_from_snapshot() {
             conflict_policy: "rename".into(),
             fallback_to_source: true,
         },
+        cache: CacheExecutionSnapshot { max_bytes: 0 },
         llm: None,
     };
     let jobs = Arc::new(FakeJobs {
@@ -1586,8 +1692,9 @@ async fn probe_corrupt_manifest_returns_artifact_corrupt() {
 #[tokio::test]
 async fn from_snapshot_rebuilds_command_without_profile_defaults() {
     use crate::execution_snapshot::{
-        AsrExecutionSnapshot, AudioStreamSelection, JobExecutionSnapshot, LlmExecutionSnapshot,
-        OutputPlanSnapshot, SourceStatSnapshot, JOB_EXECUTION_SNAPSHOT_SCHEMA_VERSION,
+        AsrExecutionSnapshot, AudioStreamSelection, CacheExecutionSnapshot, JobExecutionSnapshot,
+        LlmExecutionSnapshot, OutputPlanSnapshot, SourceStatSnapshot,
+        JOB_EXECUTION_SNAPSHOT_SCHEMA_VERSION,
     };
     use crate::ports::{LlmStage, PromptSnapshot, StructuredOutput};
     use std::collections::BTreeMap;
@@ -1613,6 +1720,7 @@ async fn from_snapshot_rebuilds_command_without_profile_defaults() {
         },
         job_dir: "/jobs/1".into(),
         profile_revision: Ulid::new().into(),
+        profile_name: None,
         asr: AsrExecutionSnapshot {
             engine: "whisper-cpp".into(),
             model_locator: crate::ports::ModelLocator::file("/models/x.bin"),
@@ -1631,6 +1739,7 @@ async fn from_snapshot_rebuilds_command_without_profile_defaults() {
             conflict_policy: "rename".into(),
             fallback_to_source: false,
         },
+        cache: CacheExecutionSnapshot { max_bytes: 0 },
         llm: Some(LlmExecutionSnapshot {
             provider_profile_revision: "rev".into(),
             model: "deepseek".into(),

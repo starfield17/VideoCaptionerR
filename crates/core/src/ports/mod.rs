@@ -10,7 +10,9 @@ pub mod events;
 pub mod llm;
 pub mod media;
 pub mod model;
+pub mod processing;
 pub mod repositories;
+pub mod run_control;
 pub mod subtitle;
 pub mod system;
 
@@ -37,12 +39,18 @@ pub use media::{
     ExtractAudioRangeRequest, ExtractAudioRequest, MediaGateway, ProbeMediaRequest, ProbedMedia,
 };
 pub use model::{asr_fingerprint, validate_spec, AsrRuntimeResolver, AsrRuntimeSpec, ModelLocator};
+pub use processing::{
+    JobWorkspace, MediaFileCatalog, OutputPlanRequest, OutputPlanner, PlannedOutput,
+    PreparedMediaFile, ProcessProfile,
+};
 pub use repositories::{
     BatchRepository, ExpectedVersion, JobRepository, RetryTransactionRepository,
     RetryTransactionRequest, RetryTransactionResult, SnapshotRepository, StageCommitRepository,
     StageCommitRequest, StageCommitResult, Versioned, WorkUnitRepository,
 };
+pub use run_control::{ActiveRunRegistry, RunControl};
 pub use subtitle::{
-    ExportedSubtitle, SubtitleExportRequest, SubtitleFormat, SubtitleGateway, SubtitleLayout,
+    ExportedSubtitle, ImportedSubtitle, SubtitleExportRequest, SubtitleFormat, SubtitleGateway,
+    SubtitleImportLayout, SubtitleImporter, SubtitleLayout,
 };
 pub use system::{Clock, IdGenerator};

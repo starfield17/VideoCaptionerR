@@ -417,6 +417,7 @@ mod tests {
             seed: None,
             target_language: None,
             durable: Some(ctx.clone()),
+            cancel: None,
         };
         let man = materialize_prompt_artifact(&ctx, &request).unwrap();
         assert_eq!(man.content_hash, "hash-hello");

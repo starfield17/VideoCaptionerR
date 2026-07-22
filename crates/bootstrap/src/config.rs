@@ -6,10 +6,13 @@ use videocaptionerr_core::use_cases::LlmProcessOptions;
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub home: Option<PathBuf>,
-    pub engine: String,
+    /// Explicit CLI/test override. Normal callers select the named profile
+    /// and inherit its effective engine/model settings.
+    pub engine: Option<String>,
     pub model_path: Option<PathBuf>,
     pub helper_path: Option<PathBuf>,
     pub prompt_dir: Option<PathBuf>,
+    pub profile: Option<String>,
 }
 
 #[derive(Debug, Clone)]

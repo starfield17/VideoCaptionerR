@@ -1,6 +1,6 @@
 use super::*;
 use crate::execution_snapshot::JobExecutionSnapshot;
-use crate::ports::{SubtitleFormat, SubtitleLayout};
+use crate::ports::{AsrCancelToken, SubtitleFormat, SubtitleLayout};
 
 #[derive(Debug, Clone)]
 pub struct LlmProcessOptions {
@@ -18,10 +18,11 @@ pub struct LlmProcessOptions {
 }
 
 impl LlmProcessOptions {
-    pub(super) fn request(
+    pub(super) fn request_with_cancel(
         &self,
         stage: LlmStage,
         durable: Option<crate::use_cases::llm_pipeline::LlmDurableContext>,
+        cancel: Option<AsrCancelToken>,
     ) -> LlmPipelineRequest {
         let prompt = match stage {
             LlmStage::Split => self.split_prompt.clone(),
@@ -40,6 +41,7 @@ impl LlmProcessOptions {
             seed: self.seed,
             target_language: Some(self.target_language.clone()),
             durable,
+            cancel,
         }
     }
 

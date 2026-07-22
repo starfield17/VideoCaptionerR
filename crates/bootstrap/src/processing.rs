@@ -1,32 +1,34 @@
-use std::path::{Path, PathBuf};
+//! Thin inbound facade for media processing.
+//!
+//! Batch creation, source preparation, output reservation, snapshot creation,
+//! and persistence ordering live in Core's `ProcessMediaFiles` use case. This
+//! module only validates the inbound DTO shape and resolves the already-loaded
+//! immutable profile into Core port data.
 
-use ulid::Ulid;
-use videocaptionerr_contracts::error::{ErrorCode, VcError, VcResult};
-use videocaptionerr_core::application_error::ApplicationError;
-use videocaptionerr_core::execution_snapshot::{
-    AsrExecutionSnapshot, AudioStreamSelection, JobExecutionSnapshot, LlmExecutionSnapshot,
-    OutputPlanSnapshot, SourceStatSnapshot, JOB_EXECUTION_SNAPSHOT_SCHEMA_VERSION,
-};
-use videocaptionerr_core::ports::{
-    AsrRuntimeSpec, ExpectedVersion, ModelLocator, SubtitleExportRequest, SubtitleFormat,
-    SubtitleLayout, Versioned,
-};
-use videocaptionerr_core::use_cases::{
-    LlmProcessOptions, RunBatchCommand, RunBatchResponse, TranscribeJobCommand,
-};
-use videocaptionerr_domain::{Batch, BatchExecutionProfile, BatchId, Job, JobId, UlidStr};
-use videocaptionerr_platform::subtitle_io::{ConflictPolicy, ExportFormat, OutputPlanner};
+use std::path::PathBuf;
 
-use crate::dto::{FailureView, ProcessOptions, ProcessView, TranscribeOptions};
+use crate::dto::{ProcessOptions, ProcessView, TranscribeOptions};
 use crate::jobs::job_summary;
 use crate::runtime::ApplicationRuntime;
+use videocaptionerr_contracts::error::{ErrorCode, VcError, VcResult};
+use videocaptionerr_core::application_error::ApplicationError;
+use videocaptionerr_core::ports::{ModelLocator, ProcessProfile, SubtitleFormat, SubtitleLayout};
+use videocaptionerr_core::use_cases::{
+    LlmProcessOptions, ProcessMediaFilesCommand, RunBatchResponse,
+};
 
 impl ApplicationRuntime {
     pub async fn transcribe(&self, options: TranscribeOptions) -> VcResult<RunBatchResponse> {
+        let _lease = self.acquire_cli_processing_lock()?;
         self.execute_transcription(options, None).await
     }
 
     pub async fn process(&self, options: ProcessOptions) -> VcResult<RunBatchResponse> {
+        let _lease = self.acquire_cli_processing_lock()?;
+        self.process_unlocked(options).await
+    }
+
+    async fn process_unlocked(&self, options: ProcessOptions) -> VcResult<RunBatchResponse> {
         if options.target_language.trim().is_empty() {
             return Err(VcError::new(
                 ErrorCode::InvalidArgument,
@@ -58,26 +60,30 @@ impl ApplicationRuntime {
         files: Vec<PathBuf>,
         target_language: Option<String>,
     ) -> VcResult<ProcessView> {
+        let _lease = self.acquire_gui_processing_lock()?;
         let result = match target_language.filter(|value| !value.trim().is_empty()) {
             Some(target_language) => {
-                self.process(ProcessOptions {
+                self.process_unlocked(ProcessOptions {
                     files,
                     language: None,
                     target_language,
                     format: "srt".into(),
-                    profile: None,
+                    profile: self.resolved_profile.name.clone(),
                 })
                 .await?
             }
             None => {
-                self.transcribe(TranscribeOptions {
-                    files,
-                    language: None,
-                    format: "srt".into(),
-                    profile: None,
-                    target_language: None,
-                    layout: SubtitleLayout::SourceOnly,
-                })
+                self.execute_transcription(
+                    TranscribeOptions {
+                        files,
+                        language: None,
+                        format: "srt".into(),
+                        profile: self.resolved_profile.name.clone(),
+                        target_language: None,
+                        layout: SubtitleLayout::SourceOnly,
+                    },
+                    None,
+                )
                 .await?
             }
         };
@@ -92,6 +98,12 @@ impl ApplicationRuntime {
         if options.files.is_empty() {
             return Err(VcError::new(ErrorCode::InvalidArgument, "no input files"));
         }
+        if options.profile != self.resolved_profile.name {
+            return Err(VcError::new(
+                ErrorCode::InvalidArgument,
+                "request profile does not match the Runtime profile",
+            ));
+        }
         let format = SubtitleFormat::parse(&options.format).ok_or_else(|| {
             VcError::new(
                 ErrorCode::InvalidArgument,
@@ -101,141 +113,97 @@ impl ApplicationRuntime {
                 ),
             )
         })?;
-
-        let batch_id: BatchId = Ulid::new().into();
-        let profile_revision: UlidStr = Ulid::new().into();
-        let locator = match self.model_path.as_ref() {
-            Some(path) if path.is_dir() => ModelLocator::directory(path.to_string_lossy()),
-            Some(path) => ModelLocator::file(path.to_string_lossy()),
-            None => ModelLocator::file(format!("{}:default", self.engine)),
-        };
-        let model_id = locator.display();
-        let model_digest = self
-            .model_path
-            .as_deref()
-            .filter(|path| path.is_file())
-            .map(videocaptionerr_store::blake3_file)
-            .transpose()?;
-        let asr_spec = AsrRuntimeSpec {
-            engine_family: self.engine.clone(),
-            model_id: model_id.clone(),
-            verified_digest: model_digest.clone(),
-            locator: locator.clone(),
-            device: "cpu".into(),
-            compute_type: "default".into(),
-        };
-        let profile = BatchExecutionProfile {
-            asr_engine: self.engine.clone(),
-            asr_model: model_id.clone(),
-            device: asr_spec.device.clone(),
-            compute_type: asr_spec.compute_type.clone(),
-        };
-
-        let mut planner = OutputPlanner::new(
-            "{stem}.{target_lang?}.{layout}.{format}",
-            ConflictPolicy::Rename,
-        );
-        let mut job_ids = Vec::with_capacity(options.files.len());
-        let mut commands = Vec::with_capacity(options.files.len());
-        for file in options.files {
-            let input = canonical_input(&file)?;
-            let source_stat = source_stat_snapshot(&input)?;
-            let job_id: JobId = Ulid::new().into();
-            let execution_snapshot_id: UlidStr = Ulid::new().into();
-            let stem = input
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .unwrap_or("media");
-            let job_dir = self.paths.job_dir(
-                job_id.as_str(),
-                &videocaptionerr_platform::sanitize_stem(stem),
-            );
-            let planned = planner.plan(
-                &input,
-                options.target_language.as_deref(),
-                options.layout.into_platform(),
-                format.into_platform(),
-            )?;
-            let snapshot = JobExecutionSnapshot {
-                snapshot_id: execution_snapshot_id.clone(),
-                schema_version: JOB_EXECUTION_SNAPSHOT_SCHEMA_VERSION,
-                created_at: chrono::Utc::now().to_rfc3339(),
-                job_id: job_id.clone(),
-                batch_id: batch_id.clone(),
-                canonical_source_path: input.to_string_lossy().into_owned(),
-                source_stat,
-                job_dir: job_dir.to_string_lossy().into_owned(),
-                profile_revision: profile_revision.clone(),
-                asr: AsrExecutionSnapshot {
-                    engine: self.engine.clone(),
-                    model_locator: locator.clone(),
-                    model_id: Some(model_id.clone()),
-                    model_digest: model_digest.clone(),
-                    device: asr_spec.device.clone(),
-                    compute_type: asr_spec.compute_type.clone(),
-                },
-                audio_stream: AudioStreamSelection::Auto,
-                source_language: options.language.clone(),
-                target_language: options.target_language.clone(),
-                output: OutputPlanSnapshot {
-                    path: planned.path.to_string_lossy().into_owned(),
-                    format: subtitle_format_name(format).into(),
-                    layout: subtitle_layout_name(options.layout).into(),
-                    conflict_policy: ConflictPolicy::Rename.as_str().into(),
-                    fallback_to_source: options.layout == SubtitleLayout::TranslationOnly,
-                },
-                llm: llm.as_ref().map(llm_snapshot),
-            };
-            self.snapshots
-                .save_execution_snapshot(&snapshot)
-                .await
-                .map_err(ApplicationError::into_vc_error)?;
-            job_ids.push(job_id.clone());
-            commands.push(TranscribeJobCommand {
-                job_id,
-                batch_id: Some(batch_id.clone()),
-                execution_snapshot_id,
-                profile_revision: profile_revision.clone(),
-                input,
-                job_dir,
-                language: options.language.clone(),
-                export: SubtitleExportRequest {
-                    output_path: planned.path,
-                    format,
-                    layout: options.layout,
-                    fallback_to_source: options.layout == SubtitleLayout::TranslationOnly,
-                },
-                llm: llm.clone(),
-            });
-        }
-
-        let batch = Batch::new(batch_id, job_ids, profile).map_err(VcError::from)?;
-        for command in &commands {
-            let mut job = Versioned::new(Job::new_with_snapshot(
-                command.job_id.clone(),
-                command.batch_id.clone(),
-                command.execution_snapshot_id.clone(),
-                command.profile_revision.clone(),
-                command.input.to_string_lossy(),
-            ));
-            self.jobs
-                .save_job(&mut job, ExpectedVersion::New)
-                .await
-                .map_err(ApplicationError::into_vc_error)?;
-        }
-        let mut persisted_batch = Versioned::new(batch.clone());
-        self.batches
-            .save_batch(&mut persisted_batch, ExpectedVersion::New)
-            .await
-            .map_err(ApplicationError::into_vc_error)?;
-        self.run_batch
-            .execute(RunBatchCommand {
-                batch: persisted_batch.value,
-                jobs: commands,
-                asr_spec,
+        let profile = self.resolve_process_profile(llm)?;
+        self.process_media_files
+            .execute(ProcessMediaFilesCommand {
+                files: options.files,
+                language: options.language,
+                target_language: options.target_language,
+                format,
+                layout: options.layout,
+                profile,
             })
             .await
             .map_err(ApplicationError::into_vc_error)
+    }
+
+    fn resolve_process_profile(&self, llm: Option<LlmProcessOptions>) -> VcResult<ProcessProfile> {
+        let locator = if let Some(path) = self.model_path.as_ref() {
+            match (path.is_dir(), path.is_file(), self.engine.as_str()) {
+                (true, _, _) => ModelLocator::directory(path.to_string_lossy()),
+                (_, true, _) => ModelLocator::file(path.to_string_lossy()),
+                (_, _, "fake") => ModelLocator::file(path.to_string_lossy()),
+                _ => {
+                    return Err(VcError::new(
+                        ErrorCode::ModelNotFound,
+                        format!("model path not found: {}", path.display()),
+                    ));
+                }
+            }
+        } else if let Some(model_id) = self.resolved_profile.model_id.as_deref() {
+            let path = PathBuf::from(model_id);
+            if path.is_dir() {
+                ModelLocator::directory(path.to_string_lossy())
+            } else if path.is_file() {
+                ModelLocator::file(path.to_string_lossy())
+            } else if matches!(self.engine.as_str(), "faster-whisper" | "mlx-whisper") {
+                // Python engines accept a profile model id as a remote model
+                // reference. The resolver performs the actual availability
+                // check/download policy when the Processing Owner opens it.
+                ModelLocator::hugging_face(model_id, "main", None)
+            } else if self.engine == "fake" {
+                ModelLocator::file("fake:default")
+            } else {
+                return Err(VcError::new(
+                    ErrorCode::ModelNotFound,
+                    format!("model path not found: {model_id}"),
+                ));
+            }
+        } else if self.engine == "fake" {
+            ModelLocator::file("fake:default")
+        } else {
+            return Err(VcError::new(
+                ErrorCode::ModelNotFound,
+                "no model selected; configure profile.model_id or pass --model",
+            ));
+        };
+        if self.engine == "whisper-cpp" && !matches!(locator, ModelLocator::File { .. }) {
+            return Err(VcError::new(
+                ErrorCode::ModelNotFound,
+                "whisper-cpp requires a model file",
+            ));
+        }
+        let asr = videocaptionerr_core::ports::AsrRuntimeSpec {
+            engine_family: self.engine.clone(),
+            // An explicit CLI/Desktop model path is an effective override and
+            // must be reflected in the immutable identity captured by the Job
+            // snapshot. Profile model ids remain the identity when no override
+            // was supplied.
+            model_id: if self.model_path.is_some() {
+                locator.display()
+            } else {
+                self.resolved_profile
+                    .model_id
+                    .clone()
+                    .unwrap_or_else(|| locator.display())
+            },
+            verified_digest: self.model_digest.clone(),
+            locator,
+            device: self.resolved_profile.device.clone(),
+            compute_type: self.resolved_profile.compute_type.clone(),
+        };
+        asr.validate().map_err(|message| {
+            VcError::new(
+                ErrorCode::InvalidConfig,
+                format!("invalid ASR profile: {message}"),
+            )
+        })?;
+        Ok(ProcessProfile {
+            name: self.resolved_profile.name.clone(),
+            asr,
+            llm,
+            cache_max_bytes: self.resolved_profile.cache_max_bytes,
+        })
     }
 }
 
@@ -249,108 +217,11 @@ fn process_view(result: RunBatchResponse) -> ProcessView {
         failures: result
             .failures
             .iter()
-            .map(|failure| FailureView {
+            .map(|failure| crate::dto::FailureView {
                 job_id: failure.job_id.clone(),
                 code: failure.error.code.as_str().into(),
                 message: failure.error.message.clone(),
             })
             .collect(),
-    }
-}
-
-fn canonical_input(path: &Path) -> VcResult<PathBuf> {
-    std::fs::canonicalize(path).map_err(|error| {
-        VcError::new(
-            ErrorCode::InputNotFound,
-            format!("input not found {}: {error}", path.display()),
-        )
-    })
-}
-
-fn source_stat_snapshot(path: &Path) -> VcResult<SourceStatSnapshot> {
-    let metadata = std::fs::metadata(path).map_err(|error| {
-        VcError::new(
-            ErrorCode::InputNotFound,
-            format!("read input metadata {}: {error}", path.display()),
-        )
-    })?;
-    let modified_at_ms = metadata
-        .modified()
-        .ok()
-        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-        .and_then(|value| u64::try_from(value.as_millis()).ok());
-    Ok(SourceStatSnapshot {
-        size: metadata.len(),
-        modified_at_ms,
-    })
-}
-
-fn llm_snapshot(options: &LlmProcessOptions) -> LlmExecutionSnapshot {
-    LlmExecutionSnapshot {
-        provider_profile_revision: options.provider_profile_revision.clone(),
-        model: options.model.clone(),
-        max_context_tokens: options.max_context_tokens,
-        max_output_tokens: options.max_output_tokens,
-        chars_per_token: options.chars_per_token,
-        structured_output: options.structured_output,
-        seed: options.seed,
-        target_language: options.target_language.clone(),
-        split_prompt: options.split_prompt.clone(),
-        correct_prompt: options.correct_prompt.clone(),
-        translate_prompt: options.translate_prompt.clone(),
-    }
-}
-
-fn subtitle_format_name(format: SubtitleFormat) -> &'static str {
-    match format {
-        SubtitleFormat::Srt => "srt",
-        SubtitleFormat::Vtt => "vtt",
-        SubtitleFormat::Ass => "ass",
-    }
-}
-
-fn subtitle_layout_name(layout: SubtitleLayout) -> &'static str {
-    match layout {
-        SubtitleLayout::SourceOnly => "source_only",
-        SubtitleLayout::TranslationOnly => "translation_only",
-        SubtitleLayout::BilingualSourceFirst => "bilingual_source_first",
-        SubtitleLayout::BilingualTranslationFirst => "bilingual_translation_first",
-    }
-}
-
-trait BootstrapSubtitleFormat {
-    fn into_platform(self) -> ExportFormat;
-}
-
-impl BootstrapSubtitleFormat for SubtitleFormat {
-    fn into_platform(self) -> ExportFormat {
-        match self {
-            SubtitleFormat::Srt => ExportFormat::Srt,
-            SubtitleFormat::Vtt => ExportFormat::Vtt,
-            SubtitleFormat::Ass => ExportFormat::Ass,
-        }
-    }
-}
-
-trait BootstrapSubtitleLayout {
-    fn into_platform(self) -> videocaptionerr_platform::subtitle_io::ExportLayout;
-}
-
-impl BootstrapSubtitleLayout for SubtitleLayout {
-    fn into_platform(self) -> videocaptionerr_platform::subtitle_io::ExportLayout {
-        match self {
-            SubtitleLayout::SourceOnly => {
-                videocaptionerr_platform::subtitle_io::ExportLayout::SourceOnly
-            }
-            SubtitleLayout::TranslationOnly => {
-                videocaptionerr_platform::subtitle_io::ExportLayout::TranslationOnly
-            }
-            SubtitleLayout::BilingualSourceFirst => {
-                videocaptionerr_platform::subtitle_io::ExportLayout::BilingualSourceFirst
-            }
-            SubtitleLayout::BilingualTranslationFirst => {
-                videocaptionerr_platform::subtitle_io::ExportLayout::BilingualTranslationFirst
-            }
-        }
     }
 }

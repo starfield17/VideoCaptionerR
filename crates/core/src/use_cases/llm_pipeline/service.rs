@@ -69,6 +69,7 @@ impl LlmPipeline {
         transcript: &Transcript,
         mut request: LlmPipelineRequest,
     ) -> AppResult<LlmPipelineResult> {
+        ensure_not_cancelled(request.cancel.as_ref())?;
         if request.prompt.stage != request.stage {
             return Err(ApplicationError::Invalid(
                 "LLM prompt snapshot stage does not match the requested stage".into(),
@@ -167,6 +168,7 @@ impl LlmPipeline {
         let mut formatted = BTreeMap::new();
         let mut degraded = Vec::new();
         for batch in &batches {
+            ensure_not_cancelled(request.cancel.as_ref())?;
             if let Some(items) = self
                 .load_durable_batch(&request, &plan, batch.index)
                 .await?
@@ -178,6 +180,7 @@ impl LlmPipeline {
                 .await?;
             self.persist_durable_batch(&request, &plan, batch, transcript, &formatted)
                 .await?;
+            ensure_not_cancelled(request.cancel.as_ref())?;
         }
 
         let mut ranges = Vec::new();
@@ -334,6 +337,7 @@ impl LlmPipeline {
         let mut values = BTreeMap::new();
         let mut degraded = Vec::new();
         for batch in &batches {
+            ensure_not_cancelled(request.cancel.as_ref())?;
             if let Some(items) = self
                 .load_durable_batch(&request, &plan, batch.index)
                 .await?
@@ -352,6 +356,7 @@ impl LlmPipeline {
             .await?;
             self.persist_durable_batch(&request, &plan, batch, transcript, &values)
                 .await?;
+            ensure_not_cancelled(request.cancel.as_ref())?;
         }
         let updates = values
             .into_iter()
@@ -539,6 +544,7 @@ impl LlmPipeline {
         let mut working = transcript.clone();
         let mut degraded = Vec::new();
         while !remaining.is_empty() {
+            ensure_not_cancelled(request.cancel.as_ref())?;
             let batch = pack_one_batch(
                 remaining,
                 &previous_context,
@@ -587,6 +593,7 @@ impl LlmPipeline {
                 request_id: self.ids.next_id().to_string(),
             };
             working = working.apply_llm_text(&binding, &updates)?;
+            ensure_not_cancelled(request.cancel.as_ref())?;
 
             // Accepted translations from this batch are the read-only context
             // for the next wavefront batch.
@@ -947,6 +954,7 @@ impl LlmPipeline {
         let mut semantic_attempt = 0u32;
         let mut transport_attempt = 0u32;
         loop {
+            ensure_not_cancelled(request.cancel.as_ref())?;
             if semantic_attempt >= max_semantic_attempts {
                 break;
             }
@@ -1035,6 +1043,7 @@ impl LlmPipeline {
                     }
                 }
                 Ok(response) => {
+                    ensure_not_cancelled(request.cancel.as_ref())?;
                     if let Some(ctx) = &request.durable {
                         let _ = super::durable::append_attempt(
                             ctx,
@@ -1086,5 +1095,13 @@ impl LlmPipeline {
             ErrorCode::LlmValidationFailed,
             "LLM validation retries exhausted",
         )))
+    }
+}
+
+fn ensure_not_cancelled(token: Option<&crate::ports::AsrCancelToken>) -> AppResult<()> {
+    if token.is_some_and(crate::ports::AsrCancelToken::is_requested) {
+        Err(ApplicationError::Cancelled)
+    } else {
+        Ok(())
     }
 }

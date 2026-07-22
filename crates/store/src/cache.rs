@@ -245,7 +245,16 @@ impl CacheStore {
                     format!("delete cache entry: {error}"),
                 )
             })?;
-            let _ = fs::remove_file(self.metadata_path(key));
+            let metadata_path = self.metadata_path(key);
+            if let Err(error) = fs::remove_file(&metadata_path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        path = %metadata_path.display(),
+                        error = %error,
+                        "cache metadata cleanup failed"
+                    );
+                }
+            }
             after_bytes = after_bytes.saturating_sub(size);
             deleted_entries += 1;
         }

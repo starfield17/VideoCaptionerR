@@ -24,6 +24,7 @@ impl ApplicationRuntime {
     ) -> VcResult<ProbeResult> {
         let config = AppConfig::load(&self.paths.config_file)?;
         let provider_id = provider_id
+            .or(self.resolved_profile.llm_provider.as_deref())
             .or(config.llm.default_provider.as_deref())
             .ok_or_else(|| {
                 VcError::new(
@@ -128,8 +129,9 @@ pub(crate) fn probe_config(provider_id: &str, provider: &LlmProviderConfig) -> P
 pub(crate) fn load_cached_capabilities(
     store: &StoreHandle,
     config: &AppConfig,
+    provider_id: Option<&str>,
 ) -> VcResult<Option<ProviderCapabilities>> {
-    let Some(provider_id) = config.llm.default_provider.as_deref() else {
+    let Some(provider_id) = provider_id.or(config.llm.default_provider.as_deref()) else {
         return Ok(None);
     };
     let provider = config.llm.providers.get(provider_id).ok_or_else(|| {

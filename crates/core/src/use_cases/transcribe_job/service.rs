@@ -11,6 +11,17 @@ impl TranscribeJob {
         command: TranscribeJobCommand,
         session: &mut dyn AsrSession,
     ) -> AppResult<TranscribeJobResponse> {
+        self.execute_with_cancel(command, session, AsrCancelToken::new())
+            .await
+    }
+
+    /// Execute with the token registered for this real active Job run.
+    pub async fn execute_with_cancel(
+        &self,
+        command: TranscribeJobCommand,
+        session: &mut dyn AsrSession,
+        cancel: AsrCancelToken,
+    ) -> AppResult<TranscribeJobResponse> {
         let (mut job, new_job) = match self.jobs.load_job(&command.job_id).await? {
             Some(existing) if existing.status() == videocaptionerr_domain::JobStatus::Pending => {
                 if existing.execution_snapshot_id() != Some(&command.execution_snapshot_id) {
@@ -51,17 +62,45 @@ impl TranscribeJob {
                 true,
             ),
         };
-        let expected = if new_job {
-            ExpectedVersion::New
-        } else {
-            job.expected_version()
-        };
-        self.jobs.save_job(&mut job, expected).await?;
-        job.start()?;
-        self.save_job(&mut job).await?;
+        let start_result: AppResult<()> = async {
+            self.ensure_not_cancelled(&command, &cancel).await?;
+            let expected = if new_job {
+                ExpectedVersion::New
+            } else {
+                job.expected_version()
+            };
+            self.jobs.save_job(&mut job, expected).await?;
+            job.start()?;
+            self.save_job(&mut job).await
+        }
+        .await;
+        if let Err(error) = start_result {
+            let primary = error.into_vc_error();
+            let cancelled = primary.code == ErrorCode::Cancelled
+                || cancel.is_requested()
+                || self
+                    .persisted_cancel_requested(&command)
+                    .await
+                    .unwrap_or(false);
+            if cancelled {
+                if let Some(latest) = self.jobs.load_job(&command.job_id).await? {
+                    job = latest;
+                }
+                if !job.status().is_terminal() {
+                    job.cancel()?;
+                    self.save_job(&mut job).await?;
+                }
+                return Err(ApplicationError::Adapter(VcError::new(
+                    ErrorCode::Cancelled,
+                    "operation cancelled",
+                )));
+            }
+            return Err(ApplicationError::Adapter(primary));
+        }
 
         let mut current_stage = None;
         let result: AppResult<TranscribeJobResponse> = async {
+            self.ensure_not_cancelled(&command, &cancel).await?;
             // Source identity is validated against the frozen snapshot before
             // any stage work. A changed path/size/mtime fails closed.
             if let Some(snapshot) = self.snapshot_for(&command).await? {
@@ -69,11 +108,12 @@ impl TranscribeJob {
             }
 
             let probe = self
-                .ensure_probe(&mut job, &command, &mut current_stage)
+                .ensure_probe(&mut job, &command, &mut current_stage, &cancel)
                 .await?;
             let extract = self
-                .ensure_extract(&mut job, &command, &probe, &mut current_stage)
+                .ensure_extract(&mut job, &command, &probe, &mut current_stage, &cancel)
                 .await?;
+            self.ensure_not_cancelled(&command, &cancel).await?;
 
             let asr_pending = stage_is_pending(&job, StageKind::Asr);
             if asr_pending {
@@ -91,13 +131,17 @@ impl TranscribeJob {
                     .transcribe_asr(
                         &command,
                         session,
-                        &probe.source_hash,
-                        &extract.pcm_hash,
-                        &extract.wav_path_buf(),
-                        probe.probe.duration_ms,
+                        super::asr::AsrExecutionContext {
+                            source_hash: probe.source_hash.clone(),
+                            pcm_hash: extract.pcm_hash.clone(),
+                            audio_path: extract.wav_path_buf(),
+                            duration_ms: probe.probe.duration_ms,
+                            cancel: cancel.clone(),
+                        },
                     )
                     .await?;
                 transcript.validate()?;
+                self.ensure_not_cancelled(&command, &cancel).await?;
                 self.commit_transcript_stage(
                     &mut job,
                     StageKind::Asr,
@@ -111,6 +155,7 @@ impl TranscribeJob {
             } else {
                 self.load_stage_transcript(&job, StageKind::Asr).await?
             };
+            self.ensure_not_cancelled(&command, &cancel).await?;
 
             let split_pending = stage_is_pending(&job, StageKind::Split);
             let mut final_transcript = if split_pending {
@@ -138,7 +183,14 @@ impl TranscribeJob {
                         invalidate_plan: false,
                     });
                     let result = pipeline
-                        .execute(&transcript, options.request(LlmStage::Split, durable))
+                        .execute(
+                            &transcript,
+                            options.request_with_cancel(
+                                LlmStage::Split,
+                                durable,
+                                Some(cancel.clone()),
+                            ),
+                        )
                         .await?;
                     degraded = !result.degraded_cue_ids.is_empty();
                     transcript = result.transcript;
@@ -163,6 +215,8 @@ impl TranscribeJob {
                 asr_transcript
             };
 
+            self.ensure_not_cancelled(&command, &cancel).await?;
+
             if let Some(options) = &command.llm {
                 let pipeline = self.llm.as_ref().ok_or_else(|| {
                     ApplicationError::Adapter(VcError::new(
@@ -186,7 +240,11 @@ impl TranscribeJob {
                     let corrected = pipeline
                         .execute(
                             &final_transcript,
-                            options.request(LlmStage::Correct, durable),
+                            options.request_with_cancel(
+                                LlmStage::Correct,
+                                durable,
+                                Some(cancel.clone()),
+                            ),
                         )
                         .await?;
                     let degraded = !corrected.degraded_cue_ids.is_empty();
@@ -200,6 +258,7 @@ impl TranscribeJob {
                         degraded,
                     )
                     .await?;
+                    self.ensure_not_cancelled(&command, &cancel).await?;
                 } else if stage_is_done(&job, StageKind::Correct) {
                     final_transcript = self.load_stage_transcript(&job, StageKind::Correct).await?;
                 }
@@ -220,7 +279,11 @@ impl TranscribeJob {
                     let translated = pipeline
                         .execute(
                             &final_transcript,
-                            options.request(LlmStage::Translate, durable),
+                            options.request_with_cancel(
+                                LlmStage::Translate,
+                                durable,
+                                Some(cancel.clone()),
+                            ),
                         )
                         .await?;
                     let degraded = !translated.degraded_cue_ids.is_empty();
@@ -234,6 +297,7 @@ impl TranscribeJob {
                         degraded,
                     )
                     .await?;
+                    self.ensure_not_cancelled(&command, &cancel).await?;
                 } else if stage_is_done(&job, StageKind::Translate) {
                     final_transcript = self
                         .load_stage_transcript(&job, StageKind::Translate)
@@ -251,13 +315,17 @@ impl TranscribeJob {
                 }
             }
 
+            // Skip-stage commits and LLM waves are both safe boundaries: a
+            // cancel observed here must prevent entering the exporter.
+            self.ensure_not_cancelled(&command, &cancel).await?;
             let export_path = if stage_is_pending(&job, StageKind::Export) {
                 job.start_stage(StageKind::Export)?;
                 current_stage = Some(StageKind::Export);
                 let exported = self
                     .subtitles
-                    .export(&final_transcript, command.export)
+                    .export(&final_transcript, command.export.clone())
                     .await?;
+                self.ensure_not_cancelled(&command, &cancel).await?;
                 let export_ref = ArtifactRef {
                     id: self.ids.next_id(),
                     stage: StageKind::Export,
@@ -276,6 +344,7 @@ impl TranscribeJob {
                 })?;
                 PathBuf::from(artifact.path)
             };
+            self.ensure_not_cancelled(&command, &cancel).await?;
             job.finish()?;
             self.save_job(&mut job).await?;
 
@@ -288,6 +357,26 @@ impl TranscribeJob {
         .await;
 
         if let Err(error) = result {
+            let primary = error.into_vc_error();
+            let cancelled = primary.code == ErrorCode::Cancelled
+                || cancel.is_requested()
+                || self
+                    .persisted_cancel_requested(&command)
+                    .await
+                    .unwrap_or(false);
+            if cancelled {
+                if let Some(latest) = self.jobs.load_job(&command.job_id).await? {
+                    job = latest;
+                }
+                if !job.status().is_terminal() {
+                    job.cancel()?;
+                    self.save_job(&mut job).await?;
+                }
+                return Err(ApplicationError::Adapter(VcError::new(
+                    ErrorCode::Cancelled,
+                    "operation cancelled",
+                )));
+            }
             if let Some(stage) = current_stage {
                 if job.fail_stage(stage).is_err() && !job.status().is_terminal() {
                     let _ = job.cancel();
@@ -295,7 +384,6 @@ impl TranscribeJob {
             } else if !job.status().is_terminal() {
                 let _ = job.cancel();
             }
-            let primary = error.into_vc_error();
             match self.save_job(&mut job).await {
                 Ok(()) => return Err(ApplicationError::Adapter(primary)),
                 Err(state) => {
@@ -307,6 +395,41 @@ impl TranscribeJob {
             }
         }
         result
+    }
+
+    async fn persisted_cancel_requested(&self, command: &TranscribeJobCommand) -> AppResult<bool> {
+        let job_cancelled = self
+            .jobs
+            .load_job(&command.job_id)
+            .await?
+            .is_some_and(|job| {
+                job.status() == videocaptionerr_domain::JobStatus::Cancelled
+                    || job.cancel_requested()
+            });
+        if job_cancelled {
+            return Ok(true);
+        }
+        let Some(batches) = &self.batches else {
+            return Ok(false);
+        };
+        let Some(batch_id) = command.batch_id.as_ref() else {
+            return Ok(false);
+        };
+        Ok(batches.load_batch(batch_id).await?.is_some_and(|batch| {
+            batch.cancel_requested()
+                || batch.status() == videocaptionerr_domain::BatchStatus::Cancelled
+        }))
+    }
+
+    pub(super) async fn ensure_not_cancelled(
+        &self,
+        command: &TranscribeJobCommand,
+        cancel: &AsrCancelToken,
+    ) -> AppResult<()> {
+        if cancel.is_requested() || self.persisted_cancel_requested(command).await? {
+            return Err(ApplicationError::Cancelled);
+        }
+        Ok(())
     }
 
     async fn snapshot_for(
@@ -326,7 +449,9 @@ impl TranscribeJob {
         job: &mut Versioned<Job>,
         command: &TranscribeJobCommand,
         current_stage: &mut Option<StageKind>,
+        cancel: &AsrCancelToken,
     ) -> AppResult<ProbeManifest> {
+        self.ensure_not_cancelled(command, cancel).await?;
         if stage_is_pending(job, StageKind::Probe) {
             job.start_stage(StageKind::Probe)?;
             *current_stage = Some(StageKind::Probe);
@@ -339,6 +464,7 @@ impl TranscribeJob {
                     job_dir: command.job_dir.clone(),
                 })
                 .await?;
+            self.ensure_not_cancelled(command, cancel).await?;
             if !probed.probe.has_audio() {
                 return Err(ApplicationError::Adapter(VcError::new(
                     ErrorCode::AudioStreamNotFound,
@@ -392,6 +518,7 @@ impl TranscribeJob {
                 .await
                 .map_err(|error| map_corrupt(error, "probe artifact is corrupt"))?;
             let current_hash = self.media.media_hash(&command.input).await?;
+            self.ensure_not_cancelled(command, cancel).await?;
             if current_hash != manifest.source_hash {
                 return Err(ApplicationError::Adapter(VcError::new(
                     ErrorCode::SourceChanged,
@@ -416,7 +543,9 @@ impl TranscribeJob {
         command: &TranscribeJobCommand,
         probe: &ProbeManifest,
         current_stage: &mut Option<StageKind>,
+        cancel: &AsrCancelToken,
     ) -> AppResult<ExtractManifest> {
+        self.ensure_not_cancelled(command, cancel).await?;
         if stage_is_pending(job, StageKind::ExtractAudio) {
             job.start_stage(StageKind::ExtractAudio)?;
             *current_stage = Some(StageKind::ExtractAudio);
@@ -429,6 +558,7 @@ impl TranscribeJob {
                     job_dir: command.job_dir.clone(),
                 })
                 .await?;
+            self.ensure_not_cancelled(command, cancel).await?;
             let stream = probe
                 .probe
                 .audio_streams
@@ -492,6 +622,7 @@ impl TranscribeJob {
                 })
                 .await
                 .map_err(|error| map_corrupt(error, "extracted WAV hash mismatch"))?;
+            self.ensure_not_cancelled(command, cancel).await?;
             return Ok(manifest);
         }
 

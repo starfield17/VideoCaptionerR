@@ -29,12 +29,12 @@ pub(crate) use crate::chunking::{
     apply_chunk_offset, chunk_cache_key, retain_core_words, ChunkPlan, ChunkPlanOptions,
 };
 pub(crate) use crate::ports::{
-    ArtifactSource, ArtifactStore, AsrSession, AsrTranscribeRequest, AudioAnalysisRequest,
-    CacheRepository, ChunkPlanCommit, ChunkPlanStore, Clock, EventPublisher, ExpectedVersion,
-    ExtractAudioRangeRequest, IdGenerator, JobRepository, LlmStage, MediaGateway, OutboxEvent,
-    PreparedArtifact, ProbeMediaRequest, PromptSnapshot, SnapshotRepository, StageCommitRepository,
-    StageCommitRequest, StructuredOutput, SubtitleExportRequest, SubtitleGateway, Versioned,
-    WorkUnitRepository,
+    ArtifactSource, ArtifactStore, AsrCancelToken, AsrSession, AsrTranscribeRequest,
+    AudioAnalysisRequest, BatchRepository, CacheRepository, ChunkPlanCommit, ChunkPlanStore, Clock,
+    EventPublisher, ExpectedVersion, ExtractAudioRangeRequest, IdGenerator, JobRepository,
+    LlmStage, MediaGateway, OutboxEvent, PreparedArtifact, ProbeMediaRequest, PromptSnapshot,
+    SnapshotRepository, StageCommitRepository, StageCommitRequest, StructuredOutput,
+    SubtitleExportRequest, SubtitleGateway, Versioned, WorkUnitRepository,
 };
 
 pub struct TranscribeJob {
@@ -45,6 +45,7 @@ pub struct TranscribeJob {
     events: Arc<dyn EventPublisher>,
     ids: Arc<dyn IdGenerator>,
     stage_commits: Arc<dyn StageCommitRepository>,
+    batches: Option<Arc<dyn BatchRepository>>,
     snapshots: Option<Arc<dyn SnapshotRepository>>,
     llm: Option<Arc<super::llm_pipeline::LlmPipeline>>,
     chunking: Option<ChunkingPorts>,
@@ -75,6 +76,7 @@ impl TranscribeJob {
             events,
             ids,
             stage_commits,
+            batches: None,
             snapshots: None,
             llm: None,
             chunking: None,
@@ -83,6 +85,11 @@ impl TranscribeJob {
 
     pub fn with_snapshots(mut self, snapshots: Arc<dyn SnapshotRepository>) -> Self {
         self.snapshots = Some(snapshots);
+        self
+    }
+
+    pub fn with_batches(mut self, batches: Arc<dyn BatchRepository>) -> Self {
+        self.batches = Some(batches);
         self
     }
 

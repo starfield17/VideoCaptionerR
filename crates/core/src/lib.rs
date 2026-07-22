@@ -23,7 +23,7 @@ pub use chunking::{
 };
 pub use constants::*;
 pub use execution_snapshot::{
-    AsrExecutionSnapshot, AudioStreamSelection, JobExecutionSnapshot,
+    AsrExecutionSnapshot, AudioStreamSelection, CacheExecutionSnapshot, JobExecutionSnapshot,
     JobExecutionSnapshot as ExecutionSnapshot, LlmExecutionSnapshot, OutputPlanSnapshot,
     SourceStatSnapshot, JOB_EXECUTION_SNAPSHOT_SCHEMA_V1, JOB_EXECUTION_SNAPSHOT_SCHEMA_VERSION,
 };

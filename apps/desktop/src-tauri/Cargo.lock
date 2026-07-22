@@ -4225,6 +4225,7 @@ name = "videocaptionerr-bootstrap"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "chrono",
  "serde",
  "serde_json",
@@ -4264,6 +4265,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
+ "tracing",
  "videocaptionerr-contracts",
  "videocaptionerr-domain",
 ]
@@ -4320,6 +4322,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml 0.8.2",
+ "tracing",
  "videocaptionerr-contracts",
  "videocaptionerr-core",
  "videocaptionerr-domain",

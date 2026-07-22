@@ -232,7 +232,7 @@ pub async fn download_model(entry: &ModelEntry, dest_dir: &Path) -> VcResult<Pat
             if actual.eq_ignore_ascii_case(expected) {
                 return Ok(final_path);
             }
-            let _ = fs::remove_file(&final_path);
+            remove_model_file(&final_path);
         } else if let Some(expected) = &entry.expected_blake3 {
             let actual = blake3_file(&final_path)?;
             if actual.eq_ignore_ascii_case(expected)
@@ -242,7 +242,7 @@ pub async fn download_model(entry: &ModelEntry, dest_dir: &Path) -> VcResult<Pat
             {
                 return Ok(final_path);
             }
-            let _ = fs::remove_file(&final_path);
+            remove_model_file(&final_path);
         } else {
             return Ok(final_path);
         }
@@ -309,7 +309,7 @@ pub async fn download_model(entry: &ModelEntry, dest_dir: &Path) -> VcResult<Pat
     if let Some(expected) = &entry.expected_sha256 {
         let actual = sha256_file(&partial)?;
         if !actual.eq_ignore_ascii_case(expected) {
-            let _ = fs::remove_file(&partial);
+            remove_model_file(&partial);
             return Err(VcError::new(
                 ErrorCode::ModelDigestMismatch,
                 format!("expected {expected}, got {actual}"),
@@ -321,7 +321,7 @@ pub async fn download_model(entry: &ModelEntry, dest_dir: &Path) -> VcResult<Pat
         let exp = expected.trim_start_matches("blake3:");
         let act = actual.trim_start_matches("blake3:");
         if !act.eq_ignore_ascii_case(exp) {
-            let _ = fs::remove_file(&partial);
+            remove_model_file(&partial);
             return Err(VcError::new(
                 ErrorCode::ModelDigestMismatch,
                 format!("expected blake3:{exp}, got {actual}"),
@@ -333,6 +333,18 @@ pub async fn download_model(entry: &ModelEntry, dest_dir: &Path) -> VcResult<Pat
     fs::rename(&partial, &final_path)
         .map_err(|e| VcError::new(ErrorCode::ModelNotFound, format!("rename model: {e}")))?;
     Ok(final_path)
+}
+
+fn remove_model_file(path: &Path) {
+    if let Err(error) = fs::remove_file(path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "model temporary file cleanup failed"
+            );
+        }
+    }
 }
 
 fn preflight_disk_space(dest_dir: &Path, needed: u64) -> VcResult<()> {

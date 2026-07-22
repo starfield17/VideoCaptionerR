@@ -8,7 +8,7 @@ Batch subtitle generation: media → ASR → split → LLM correct/translate →
 ## Status
 
 Implementation follows the frozen baseline in
-[`docs/implementation-decisions-all.md`](docs/implementation-decisions-all.md)
+[`docs/implementation-decisions-all_DDD_FINAL.md`](docs/implementation-decisions-all_DDD_FINAL.md)
 (milestones M0–M7).
 
 ## Workspace
@@ -16,12 +16,17 @@ Implementation follows the frozen baseline in
 ```text
 crates/
   contracts/   # IR, protocols, error codes
+  domain/      # pure aggregates and state machines
   core/        # application / business services
+  platform/    # filesystem, ffmpeg, subtitle, and config adapters
+  bootstrap/   # shared CLI/Desktop composition root
   asr/         # ASR traits and adapters
   llm/         # LLM provider client
   store/       # SQLite store actor, artifacts, locks
   cli/         # clap CLI
   test-support/
+apps/
+  desktop/     # Tauri shell and frontend
 tools/xtask/
 ```
 

@@ -75,6 +75,11 @@ pub struct OutputPlanSnapshot {
     pub fallback_to_source: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheExecutionSnapshot {
+    pub max_bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LlmExecutionSnapshot {
     pub provider_profile_revision: String,
@@ -111,12 +116,20 @@ pub struct JobExecutionSnapshot {
     pub source_stat: SourceStatSnapshot,
     pub job_dir: String,
     pub profile_revision: UlidStr,
+    #[serde(default)]
+    pub profile_name: Option<String>,
     pub asr: AsrExecutionSnapshot,
     pub audio_stream: AudioStreamSelection,
     pub source_language: Option<String>,
     pub target_language: Option<String>,
     pub output: OutputPlanSnapshot,
+    #[serde(default = "default_cache_snapshot")]
+    pub cache: CacheExecutionSnapshot,
     pub llm: Option<LlmExecutionSnapshot>,
+}
+
+fn default_cache_snapshot() -> CacheExecutionSnapshot {
+    CacheExecutionSnapshot { max_bytes: 0 }
 }
 
 impl JobExecutionSnapshot {
@@ -193,6 +206,7 @@ mod tests {
             },
             job_dir: "/jobs/01JOB".into(),
             profile_revision: Ulid::new().into(),
+            profile_name: Some("test".into()),
             asr: AsrExecutionSnapshot {
                 engine: "whisper-cpp".into(),
                 model_locator: ModelLocator::file("/models/ggml-tiny.bin"),
@@ -210,6 +224,9 @@ mod tests {
                 layout: "source".into(),
                 conflict_policy: "rename".into(),
                 fallback_to_source: true,
+            },
+            cache: CacheExecutionSnapshot {
+                max_bytes: 20 * 1024,
             },
             llm: Some(LlmExecutionSnapshot {
                 provider_profile_revision: "provider-rev-1".into(),

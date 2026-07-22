@@ -20,6 +20,7 @@ impl StatusString for videocaptionerr_domain::BatchStatus {
         match self {
             Self::Pending => "pending",
             Self::Running => "running",
+            Self::Paused => "paused",
             Self::Done => "done",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",

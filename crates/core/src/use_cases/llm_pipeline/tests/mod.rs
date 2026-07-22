@@ -161,6 +161,7 @@ fn request(stage: LlmStage) -> LlmPipelineRequest {
         seed: Some(1),
         target_language: Some("zh-CN".into()),
         durable: None,
+        cancel: None,
     }
 }
 

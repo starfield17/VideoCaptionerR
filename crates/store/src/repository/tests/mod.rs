@@ -3,8 +3,8 @@ use rusqlite::Connection;
 use ulid::Ulid;
 use videocaptionerr_contracts::error::ErrorCode;
 use videocaptionerr_core::execution_snapshot::{
-    AsrExecutionSnapshot, AudioStreamSelection, JobExecutionSnapshot, OutputPlanSnapshot,
-    SourceStatSnapshot, JOB_EXECUTION_SNAPSHOT_SCHEMA_VERSION,
+    AsrExecutionSnapshot, AudioStreamSelection, CacheExecutionSnapshot, JobExecutionSnapshot,
+    OutputPlanSnapshot, SourceStatSnapshot, JOB_EXECUTION_SNAPSHOT_SCHEMA_VERSION,
 };
 use videocaptionerr_core::ports::{
     ArtifactStore, BatchRepository, ExpectedVersion, JobRepository, SnapshotRepository,
@@ -86,6 +86,7 @@ fn snapshot(job_id: JobId, batch_id: videocaptionerr_domain::BatchId) -> JobExec
         },
         job_dir: "/jobs/job-1".into(),
         profile_revision: Ulid::new().into(),
+        profile_name: None,
         asr: AsrExecutionSnapshot {
             engine: "fake".into(),
             model_locator: videocaptionerr_core::ModelLocator::file("fake:default"),
@@ -103,6 +104,9 @@ fn snapshot(job_id: JobId, batch_id: videocaptionerr_domain::BatchId) -> JobExec
             layout: "source".into(),
             conflict_policy: "rename".into(),
             fallback_to_source: true,
+        },
+        cache: CacheExecutionSnapshot {
+            max_bytes: 20 * 1024,
         },
         llm: None,
     }

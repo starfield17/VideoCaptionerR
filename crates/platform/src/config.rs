@@ -19,6 +19,10 @@ pub struct AppConfig {
     pub export: ExportSection,
     #[serde(default)]
     pub cache: CacheSection,
+    /// Named profiles override the global sections without changing their
+    /// schema. Runtime creation resolves one profile into a frozen snapshot.
+    #[serde(default)]
+    pub profiles: BTreeMap<String, ProfileConfig>,
 }
 
 impl Default for AppConfig {
@@ -29,8 +33,42 @@ impl Default for AppConfig {
             asr: AsrSection::default(),
             export: ExportSection::default(),
             cache: CacheSection::default(),
+            profiles: BTreeMap::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProfileConfig {
+    #[serde(default)]
+    pub preferred_engine: Option<String>,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub device: Option<String>,
+    #[serde(default)]
+    pub compute_type: Option<String>,
+    #[serde(default)]
+    pub output_template: Option<String>,
+    #[serde(default)]
+    pub conflict_policy: Option<String>,
+    #[serde(default)]
+    pub cache_max_bytes: Option<u64>,
+    #[serde(default)]
+    pub llm_provider: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedProfile {
+    pub name: Option<String>,
+    pub preferred_engine: String,
+    pub model_id: Option<String>,
+    pub device: String,
+    pub compute_type: String,
+    pub output_template: String,
+    pub conflict_policy: String,
+    pub cache_max_bytes: u64,
+    pub llm_provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -131,6 +169,42 @@ fn default_cache_bytes() -> u64 {
 }
 
 impl AppConfig {
+    pub fn resolve_profile(&self, name: Option<&str>) -> VcResult<ResolvedProfile> {
+        let selected = match name {
+            Some(name) => Some(self.profiles.get(name).ok_or_else(|| {
+                VcError::new(
+                    ErrorCode::InvalidConfig,
+                    format!("profile '{name}' is not configured"),
+                )
+            })?),
+            None => None,
+        };
+        let profile = selected.cloned().unwrap_or_default();
+        Ok(ResolvedProfile {
+            name: name.map(str::to_owned),
+            preferred_engine: profile
+                .preferred_engine
+                .or_else(|| self.asr.preferred_engine.clone())
+                .unwrap_or_else(|| "whisper-cpp".into()),
+            model_id: profile.model_id.or_else(|| self.asr.model_id.clone()),
+            device: profile
+                .device
+                .or_else(|| self.asr.device.clone())
+                .unwrap_or_else(|| "cpu".into()),
+            compute_type: profile.compute_type.unwrap_or_else(|| "default".into()),
+            output_template: profile
+                .output_template
+                .unwrap_or_else(|| self.export.template.clone()),
+            conflict_policy: profile
+                .conflict_policy
+                .unwrap_or_else(|| self.export.conflict_policy.clone()),
+            cache_max_bytes: profile.cache_max_bytes.unwrap_or(self.cache.max_bytes),
+            llm_provider: profile
+                .llm_provider
+                .or_else(|| self.llm.default_provider.clone()),
+        })
+    }
+
     pub fn load(path: &Path) -> VcResult<Self> {
         if !path.exists() {
             return Ok(Self::default());
@@ -208,5 +282,32 @@ mod tests {
         cfg.save(&path).unwrap();
         let loaded = AppConfig::load(&path).unwrap();
         assert_eq!(loaded.llm.providers["primary"].api_key, "sk-test");
+    }
+
+    #[test]
+    fn named_profile_freezes_effective_runtime_settings() {
+        let mut config = AppConfig::default();
+        config.asr.preferred_engine = Some("whisper-cpp".into());
+        config.export.conflict_policy = "rename".into();
+        config.profiles.insert(
+            "fast".into(),
+            ProfileConfig {
+                preferred_engine: Some("fake".into()),
+                model_id: Some("model-a".into()),
+                device: Some("cpu".into()),
+                compute_type: Some("int8".into()),
+                output_template: Some("{stem}.{format}".into()),
+                conflict_policy: Some("fail".into()),
+                cache_max_bytes: Some(123),
+                llm_provider: None,
+            },
+        );
+        let resolved = config.resolve_profile(Some("fast")).unwrap();
+        assert_eq!(resolved.preferred_engine, "fake");
+        assert_eq!(resolved.model_id.as_deref(), Some("model-a"));
+        assert_eq!(resolved.compute_type, "int8");
+        assert_eq!(resolved.output_template, "{stem}.{format}");
+        assert_eq!(resolved.conflict_policy, "fail");
+        assert_eq!(resolved.cache_max_bytes, 123);
     }
 }

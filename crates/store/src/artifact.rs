@@ -100,7 +100,7 @@ pub fn atomic_write_bytes(path: &Path, data: &[u8]) -> VcResult<String> {
         })?;
     }
     if reread.as_slice() != data {
-        let _ = fs::remove_file(&tmp);
+        remove_artifact_file(&tmp);
         return Err(VcError::new(
             ErrorCode::ArtifactCommitFailed,
             format!("reread mismatch for {}", tmp.display()),
@@ -109,7 +109,7 @@ pub fn atomic_write_bytes(path: &Path, data: &[u8]) -> VcResult<String> {
 
     let hash = blake3_bytes(data);
     fs::rename(&tmp, path).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
+        remove_artifact_file(&tmp);
         VcError::new(
             ErrorCode::ArtifactCommitFailed,
             format!("rename {} -> {}: {e}", tmp.display(), path.display()),
@@ -193,15 +193,7 @@ pub fn publish_prepared_artifact_with_fault(
             if final_path.exists() {
                 let final_hash = blake3_file(final_path)?;
                 if final_hash == prepared.artifact.content_hash {
-                    fs::remove_file(path).map_err(|error| {
-                        VcError::new(
-                            ErrorCode::ArtifactCommitFailed,
-                            format!(
-                                "remove duplicate prepared artifact {}: {error}",
-                                path.display()
-                            ),
-                        )
-                    })?;
+                    remove_artifact_file(path);
                     return Ok(false);
                 }
                 return Err(VcError::new(
@@ -281,7 +273,7 @@ pub fn publish_prepared_artifact_with_fault(
             }
             fault_at(fault, StageCommitFaultPoint::AfterTempWrite)?;
             if blake3_file(&partial)? != prepared.artifact.content_hash {
-                let _ = fs::remove_file(&partial);
+                remove_artifact_file(&partial);
                 return Err(VcError::new(
                     ErrorCode::ArtifactCommitFailed,
                     format!("reread hash mismatch: {}", partial.display()),
@@ -289,7 +281,7 @@ pub fn publish_prepared_artifact_with_fault(
             }
             if final_path.exists() {
                 let final_hash = blake3_file(final_path)?;
-                let _ = fs::remove_file(&partial);
+                remove_artifact_file(&partial);
                 if final_hash == prepared.artifact.content_hash {
                     return Ok(false);
                 }
@@ -302,7 +294,7 @@ pub fn publish_prepared_artifact_with_fault(
                 ));
             }
             fs::rename(&partial, final_path).map_err(|error| {
-                let _ = fs::remove_file(&partial);
+                remove_artifact_file(&partial);
                 VcError::new(
                     ErrorCode::ArtifactCommitFailed,
                     format!(
@@ -371,11 +363,23 @@ pub fn quarantine_tmp_files(dir: &Path) -> VcResult<Vec<PathBuf>> {
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.ends_with(".tmp"))
         {
-            let _ = fs::remove_file(&path);
+            remove_artifact_file(&path);
             removed.push(path);
         }
     }
     Ok(removed)
+}
+
+fn remove_artifact_file(path: &Path) {
+    if let Err(error) = fs::remove_file(path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "temporary artifact cleanup failed"
+            );
+        }
+    }
 }
 
 fn tmp_path(path: &Path) -> PathBuf {

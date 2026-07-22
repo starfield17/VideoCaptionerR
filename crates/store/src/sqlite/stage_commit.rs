@@ -15,7 +15,15 @@ impl SqliteStore {
         if result.is_err() && published == Some(true) && fault.is_none() {
             if let Some(artifact) = &request.artifact {
                 let path = Path::new(&artifact.artifact.path);
-                let _ = fs::remove_file(path);
+                if let Err(error) = fs::remove_file(path) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %error,
+                            "published artifact cleanup failed after transaction rollback"
+                        );
+                    }
+                }
                 sync_parent(path);
             }
         }
@@ -491,6 +499,7 @@ fn update_batch_tx(
                 match batch.value.status() {
                     videocaptionerr_domain::BatchStatus::Pending => "pending",
                     videocaptionerr_domain::BatchStatus::Running => "running",
+                    videocaptionerr_domain::BatchStatus::Paused => "paused",
                     videocaptionerr_domain::BatchStatus::Done => "done",
                     videocaptionerr_domain::BatchStatus::Failed => "failed",
                     videocaptionerr_domain::BatchStatus::Cancelled => "cancelled",

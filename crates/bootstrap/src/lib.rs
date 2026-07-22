@@ -13,6 +13,7 @@ mod jobs;
 mod models;
 mod processing;
 mod recovery;
+mod run_control;
 mod runtime;
 mod transcript;
 mod wiring;

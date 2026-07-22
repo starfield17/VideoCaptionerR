@@ -44,9 +44,9 @@ enum Commands {
         files: Vec<PathBuf>,
         #[arg(long)]
         profile: Option<String>,
-        /// ASR helper engine: fake (default for smoke) or whisper-cpp.
-        #[arg(long, default_value = "fake")]
-        engine: String,
+        /// ASR helper engine override: fake is for explicit development/test runs.
+        #[arg(long)]
+        engine: Option<String>,
         /// Explicit model path (required for non-fake engines; never auto-selected).
         #[arg(long)]
         model: Option<PathBuf>,
@@ -66,8 +66,8 @@ enum Commands {
         profile: Option<String>,
         #[arg(long)]
         target_lang: Option<String>,
-        #[arg(long, default_value = "fake")]
-        engine: String,
+        #[arg(long)]
+        engine: Option<String>,
         #[arg(long)]
         model: Option<PathBuf>,
         #[arg(long, env = "VIDEOCAPTIONERR_HELPER")]
@@ -114,6 +114,10 @@ enum Commands {
 #[derive(Debug, Subcommand)]
 enum JobsCmd {
     List,
+    /// Request cancellation of a Job owned by the active Processing Owner.
+    Cancel {
+        id: String,
+    },
     Retry {
         id: String,
         /// Retry this stage and all later stages. Defaults to the first failed stage.
@@ -152,6 +156,8 @@ enum BatchCmd {
     Pause { id: String },
     /// Resume a paused Batch.
     Resume { id: String },
+    /// Cancel the active Batch and all remaining Jobs.
+    Cancel { id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -201,10 +207,11 @@ fn run(cli: Cli) -> Result<ExitCode, VcError> {
         Commands::Doctor => {
             let runtime = ApplicationRuntime::open(RuntimeConfig {
                 home: cli.home,
-                engine: "fake".into(),
+                engine: None,
                 model_path: None,
                 helper_path: None,
                 prompt_dir: None,
+                profile: None,
             })?;
             let report = runtime.doctor();
             println!("videocaptionerr {}", report.version);
@@ -265,8 +272,8 @@ fn run(cli: Cli) -> Result<ExitCode, VcError> {
                 model_path: model,
                 helper_path: helper,
                 prompt_dir: None,
+                profile: profile.clone(),
             })?;
-            let _lock = runtime.acquire_cli_processing_lock()?;
             let options = TranscribeOptions {
                 files,
                 language,
@@ -300,8 +307,8 @@ fn run(cli: Cli) -> Result<ExitCode, VcError> {
                 model_path: model,
                 helper_path: helper,
                 prompt_dir: None,
+                profile: profile.clone(),
             })?;
-            let _lock = runtime.acquire_cli_processing_lock()?;
             let target_language = target_lang.ok_or_else(|| {
                 VcError::new(ErrorCode::InvalidArgument, "process requires --target-lang")
             })?;
@@ -323,10 +330,11 @@ fn run(cli: Cli) -> Result<ExitCode, VcError> {
         Commands::Jobs { action } => {
             let runtime = ApplicationRuntime::open(RuntimeConfig {
                 home: cli.home,
-                engine: "fake".into(),
+                engine: None,
                 model_path: None,
                 helper_path: None,
                 prompt_dir: None,
+                profile: None,
             })?;
             match action {
                 JobsCmd::List => {
@@ -352,12 +360,35 @@ fn run(cli: Cli) -> Result<ExitCode, VcError> {
                     }
                     Ok(ExitCode::Success)
                 }
+                JobsCmd::Cancel { id } => {
+                    let async_runtime = tokio::runtime::Runtime::new().map_err(|error| {
+                        VcError::new(
+                            ErrorCode::Internal,
+                            format!("create Tokio runtime: {error}"),
+                        )
+                    })?;
+                    async_runtime.block_on(runtime.cancel_job(&id))?;
+                    if cli.json {
+                        emit_event(
+                            CliEvent::JobListed,
+                            Some(id.clone()),
+                            serde_json::json!({"job_id": id, "action": "cancel"}),
+                        )?;
+                    } else {
+                        println!("job {id} cancellation requested");
+                    }
+                    Ok(ExitCode::Success)
+                }
                 JobsCmd::Retry {
                     id,
                     from_stage,
                     dry_run,
                 } => {
-                    let _lock = runtime.acquire_cli_processing_lock()?;
+                    let _lock = if dry_run {
+                        None
+                    } else {
+                        Some(runtime.acquire_cli_processing_lock()?)
+                    };
                     let async_runtime = tokio::runtime::Runtime::new().map_err(|error| {
                         VcError::new(
                             ErrorCode::Internal,
@@ -426,10 +457,11 @@ fn run(cli: Cli) -> Result<ExitCode, VcError> {
         } => {
             let runtime = ApplicationRuntime::open(RuntimeConfig {
                 home: cli.home,
-                engine: "fake".into(),
+                engine: None,
                 model_path: None,
                 helper_path: None,
                 prompt_dir: None,
+                profile: None,
             })?;
             let _lock = runtime.acquire_cli_processing_lock()?;
             let max_bytes = parse_size(&max_size)?;
@@ -466,10 +498,11 @@ fn run(cli: Cli) -> Result<ExitCode, VcError> {
         } => {
             let runtime = ApplicationRuntime::open(RuntimeConfig {
                 home: cli.home,
-                engine: "fake".into(),
+                engine: None,
                 model_path: None,
                 helper_path: None,
                 prompt_dir: None,
+                profile: None,
             })?;
             let async_runtime = tokio::runtime::Runtime::new().map_err(|error| {
                 VcError::new(
@@ -504,10 +537,11 @@ fn run(cli: Cli) -> Result<ExitCode, VcError> {
         Commands::Batch { action } => {
             let runtime = ApplicationRuntime::open(RuntimeConfig {
                 home: cli.home,
-                engine: "fake".into(),
+                engine: None,
                 model_path: None,
                 helper_path: None,
                 prompt_dir: None,
+                profile: None,
             })?;
             let async_runtime = tokio::runtime::Runtime::new().map_err(|error| {
                 VcError::new(
@@ -542,16 +576,31 @@ fn run(cli: Cli) -> Result<ExitCode, VcError> {
                     }
                     Ok(ExitCode::Success)
                 }
+                BatchCmd::Cancel { id } => {
+                    async_runtime.block_on(runtime.cancel_batch(&id))?;
+                    if cli.json {
+                        emit_event(
+                            CliEvent::JobListed,
+                            None,
+                            serde_json::json!({"batch_id": id, "action": "cancel"}),
+                        )?;
+                    } else {
+                        println!("batch {id} cancellation requested");
+                    }
+                    Ok(ExitCode::Success)
+                }
             }
         }
         Commands::ImportSubtitle { file, layout } => {
             let runtime = ApplicationRuntime::open(RuntimeConfig {
                 home: cli.home,
-                engine: "fake".into(),
+                engine: None,
                 model_path: None,
                 helper_path: None,
                 prompt_dir: None,
+                profile: None,
             })?;
+            let _lock = runtime.acquire_cli_processing_lock()?;
             let async_runtime = tokio::runtime::Runtime::new().map_err(|error| {
                 VcError::new(
                     ErrorCode::Internal,
@@ -582,10 +631,11 @@ fn run(cli: Cli) -> Result<ExitCode, VcError> {
         Commands::Models { action } => {
             let runtime = ApplicationRuntime::open(RuntimeConfig {
                 home: cli.home,
-                engine: "fake".into(),
+                engine: None,
                 model_path: None,
                 helper_path: None,
                 prompt_dir: None,
+                profile: None,
             })?;
             match action {
                 ModelsCmd::Install { model_id, dest } => {

@@ -3,11 +3,14 @@
 use std::sync::Arc;
 
 use videocaptionerr_contracts::error::VcError;
-use videocaptionerr_domain::{Batch, BatchStatus, JobStatus, JobTerminalStatus};
+use videocaptionerr_domain::{
+    Batch, BatchExecutionProfile, BatchStatus, JobStatus, JobTerminalStatus,
+};
 
 use crate::application_error::{AppResult, ApplicationError};
 use crate::ports::{
-    AsrRuntimeResolver, AsrRuntimeSpec, BatchRepository, EventPublisher, JobRepository, Versioned,
+    ActiveRunRegistry, AsrRuntimeResolver, AsrRuntimeSpec, BatchRepository, EventPublisher,
+    JobRepository, RunControl, Versioned,
 };
 use crate::use_cases::{TranscribeJob, TranscribeJobCommand, TranscribeJobResponse};
 
@@ -36,6 +39,7 @@ pub struct RunBatch {
     resolver: Arc<dyn AsrRuntimeResolver>,
     transcribe: Arc<TranscribeJob>,
     events: Arc<dyn EventPublisher>,
+    active_runs: Option<Arc<dyn ActiveRunRegistry>>,
 }
 
 impl RunBatch {
@@ -52,7 +56,13 @@ impl RunBatch {
             resolver,
             transcribe,
             events,
+            active_runs: None,
         }
+    }
+
+    pub fn with_active_runs(mut self, active_runs: Arc<dyn ActiveRunRegistry>) -> Self {
+        self.active_runs = Some(active_runs);
+        self
     }
 
     pub async fn execute(&self, command: RunBatchCommand) -> AppResult<RunBatchResponse> {
@@ -62,6 +72,12 @@ impl RunBatch {
             .asr_spec
             .validate()
             .map_err(ApplicationError::Invalid)?;
+        let requested_profile = BatchExecutionProfile {
+            asr_engine: command.asr_spec.engine_family.clone(),
+            asr_model: command.asr_spec.model_id.clone(),
+            device: command.asr_spec.device.clone(),
+            compute_type: command.asr_spec.compute_type.clone(),
+        };
         let mut batch = self
             .batches
             .load_batch(requested_batch.id())
@@ -78,6 +94,7 @@ impl RunBatch {
                 requested_batch.id()
             )));
         }
+        batch.value.require_profile(&requested_profile)?;
         for command in &command.jobs {
             self.jobs.load_job(&command.job_id).await?.ok_or_else(|| {
                 ApplicationError::Invalid(format!(
@@ -87,26 +104,44 @@ impl RunBatch {
             })?;
         }
 
-        if let Err(error) = batch.start() {
-            return Err(ApplicationError::Domain(error));
+        if batch.status() == BatchStatus::Pending {
+            batch.start()?;
+            self.save_batch(&mut batch).await?;
+        } else if batch.status().is_terminal() {
+            return Err(ApplicationError::Invalid(format!(
+                "Batch {} is already {:?}",
+                batch.id(),
+                batch.status()
+            )));
         }
-        let expected = batch.expected_version();
-        self.batches.save_batch(&mut batch, expected).await?;
 
         // Resolve + open once outside the per-Job loop. The worker/model stays
         // alive until the Batch reaches a terminal state.
-        let runtime = self.resolver.resolve(&command.asr_spec).await?;
-        let mut session = runtime.open_session(batch.execution_profile()).await?;
+        let runtime = match self.resolver.resolve(&command.asr_spec).await {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                self.fail_before_session(batch, &command.jobs).await?;
+                return Err(error);
+            }
+        };
+        let mut session = match runtime.open_session(batch.execution_profile()).await {
+            Ok(session) => session,
+            Err(error) => {
+                self.fail_before_session(batch, &command.jobs).await?;
+                return Err(error);
+            }
+        };
 
         let result = self
             .execute_with_session(batch, command.jobs, session.as_mut())
             .await;
-        let close_result = session.close().await;
-        match (result, close_result) {
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
-            (Ok(response), Ok(())) => Ok(response),
+        if let Err(error) = session.close().await {
+            // The Batch/Job result is already the durable business outcome.
+            // Cleanup diagnostics must never turn a successful Batch into a
+            // business failure (nor hide the original execution error).
+            tracing::warn!(error = %error, "ASR session close failed after Batch execution");
         }
+        result
     }
 
     async fn execute_with_session(
@@ -119,55 +154,133 @@ impl RunBatch {
         let mut failed_job_ids = Vec::new();
         let mut failures = Vec::new();
 
-        for job_command in commands {
-            // Reload batch so external pause/cancel is observed between Jobs.
+        let mut next_index = 0usize;
+        let mut wait_control: Option<(videocaptionerr_domain::JobId, RunControl)> = None;
+        while next_index < commands.len() {
+            // Persistent state is reloaded at every safe boundary. The
+            // in-process signal is only a latency optimization.
             if let Some(latest) = self.batches.load_batch(batch.id()).await? {
                 batch = latest;
             }
+
+            if batch.status().is_terminal() {
+                // Another control path may have completed the aggregate while
+                // this owner was inside an adapter. The durable terminal
+                // result is authoritative; do not replay member transitions.
+                break;
+            }
+
             if batch.cancel_requested() {
+                if let Some((job_id, _)) = wait_control.take() {
+                    self.unregister_run(&job_id);
+                }
+                // A control process may have already terminalized every Job
+                // and the Batch while this owner was waiting. That durable
+                // terminal state is authoritative and must not be replayed.
+                if !batch.status().is_terminal() {
+                    self.cancel_remaining_jobs(&mut batch, &commands, next_index)
+                        .await?;
+                }
                 break;
             }
-            if batch.pause_requested() {
-                // Keep model loaded; stop starting new Jobs until resume.
-                break;
+
+            if batch.pause_requested() || batch.status() == BatchStatus::Paused {
+                if batch.status() == BatchStatus::Running {
+                    batch.mark_paused()?;
+                    self.save_batch(&mut batch).await?;
+                }
+                let (job_id, control) = match wait_control.take() {
+                    Some(existing) => existing,
+                    None => {
+                        let job_id = commands[next_index].job_id.clone();
+                        let control = RunControl::new();
+                        self.register_run(
+                            job_id.clone(),
+                            Some(batch.id().clone()),
+                            control.clone(),
+                        )?;
+                        (job_id, control)
+                    }
+                };
+                tokio::select! {
+                    _ = control.wait() => {},
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {},
+                }
+                wait_control = Some((job_id, control));
+                continue;
             }
+
+            if let Some((job_id, _)) = wait_control.take() {
+                self.unregister_run(&job_id);
+            }
+
+            let job_command = commands[next_index].clone();
             let job_id = job_command.job_id.clone();
-            match self.transcribe.execute(job_command, session).await {
+            // A resumed owner receives the original full command list. Already
+            // terminal Jobs are acknowledged and never executed a second time.
+            if let Some(existing) = self.jobs.load_job(&job_id).await? {
+                if existing.status().is_terminal() {
+                    if !batch.has_terminal_record(&job_id) {
+                        batch.record_job_terminal(&job_id, terminal_status(existing.status()))?;
+                        self.save_batch(&mut batch).await?;
+                    }
+                    next_index += 1;
+                    continue;
+                }
+            }
+
+            let control = RunControl::new();
+            self.register_run(job_id.clone(), Some(batch.id().clone()), control.clone())?;
+            let result = self
+                .transcribe
+                .execute_with_cancel(job_command, session, control.cancellation_token())
+                .await;
+            self.unregister_run(&job_id);
+
+            // A control command may have changed Batch state while the Job was
+            // inside an adapter. Refresh before recording the terminal member.
+            if let Some(latest) = self.batches.load_batch(batch.id()).await? {
+                batch = latest;
+            }
+            match result {
                 Ok(response) => {
                     let terminal = terminal_status(response.job.status());
-                    batch.record_job_terminal(&job_id, terminal)?;
-                    self.save_batch(&mut batch).await?;
+                    if !batch.status().is_terminal() {
+                        batch.record_job_terminal(&job_id, terminal)?;
+                        self.save_batch(&mut batch).await?;
+                    }
                     responses.push(response);
                 }
                 Err(error) => {
                     let vc_error = error.into_vc_error();
-                    let job_id_string = job_id.to_string();
-                    failed_job_ids.push(job_id_string.clone());
-                    failures.push(RunBatchFailure {
-                        job_id: job_id_string,
-                        error: vc_error,
-                    });
                     let terminal = self
                         .jobs
                         .load_job(&job_id)
                         .await?
                         .map(|job| terminal_status(job.status()))
                         .unwrap_or(JobTerminalStatus::Failed);
-                    batch.record_job_terminal(&job_id, terminal)?;
-                    self.save_batch(&mut batch).await?;
+                    if vc_error.code != videocaptionerr_contracts::error::ErrorCode::Cancelled {
+                        let job_id_string = job_id.to_string();
+                        failed_job_ids.push(job_id_string.clone());
+                        failures.push(RunBatchFailure {
+                            job_id: job_id_string,
+                            error: vc_error,
+                        });
+                    }
+                    if !batch.status().is_terminal() {
+                        batch.record_job_terminal(&job_id, terminal)?;
+                        self.save_batch(&mut batch).await?;
+                    }
                 }
             }
+            next_index += 1;
         }
 
-        // Paused batches stay Running with model still open only until the
-        // caller closes the session after this return; business status stays
-        // non-terminal when not all jobs finished.
         let all_terminal = batch
             .job_ids()
             .iter()
             .all(|id| batch.has_terminal_record(id));
         if !all_terminal {
-            self.save_batch(&mut batch).await?;
             return Ok(RunBatchResponse {
                 batch: batch.value.clone(),
                 jobs: responses,
@@ -175,9 +288,30 @@ impl RunBatch {
                 failures,
             });
         }
+        // CancelBatch may have completed the aggregate while this owner was
+        // inside a safe-point wait. Do not call finish twice; cleanup still
+        // happens in the caller and the persisted terminal result wins.
+        if batch.status().is_terminal() {
+            return Ok(RunBatchResponse {
+                batch: batch.value.clone(),
+                jobs: responses,
+                failed_job_ids,
+                failures,
+            });
+        }
+        if batch.status() == BatchStatus::Paused {
+            batch.resume()?;
+        }
+        let any_job_failed = self
+            .jobs
+            .list_jobs()
+            .await?
+            .into_iter()
+            .filter(|job| batch.job_ids().iter().any(|id| id == job.id()))
+            .any(|job| job.status() == JobStatus::Failed);
         let final_status = if batch.cancel_requested() {
             BatchStatus::Cancelled
-        } else if failed_job_ids.is_empty() {
+        } else if !any_job_failed {
             BatchStatus::Done
         } else {
             BatchStatus::Failed
@@ -200,6 +334,79 @@ impl RunBatch {
     async fn save_batch(&self, batch: &mut Versioned<Batch>) -> AppResult<()> {
         let expected = batch.expected_version();
         self.batches.save_batch(batch, expected).await
+    }
+
+    fn register_run(
+        &self,
+        job_id: videocaptionerr_domain::JobId,
+        batch_id: Option<videocaptionerr_domain::BatchId>,
+        control: RunControl,
+    ) -> AppResult<()> {
+        if let Some(registry) = &self.active_runs {
+            registry.register(job_id, batch_id, control)?;
+        }
+        Ok(())
+    }
+
+    fn unregister_run(&self, job_id: &videocaptionerr_domain::JobId) {
+        if let Some(registry) = &self.active_runs {
+            registry.unregister(job_id);
+        }
+    }
+
+    async fn cancel_remaining_jobs(
+        &self,
+        batch: &mut Versioned<Batch>,
+        commands: &[TranscribeJobCommand],
+        start: usize,
+    ) -> AppResult<()> {
+        for command in commands.iter().skip(start) {
+            let Some(mut job) = self.jobs.load_job(&command.job_id).await? else {
+                continue;
+            };
+            if !job.status().is_terminal() {
+                job.cancel()?;
+                self.save_job(&mut job).await?;
+            }
+            if !batch.has_terminal_record(&command.job_id) {
+                batch.record_job_terminal(&command.job_id, terminal_status(job.status()))?;
+            }
+        }
+        self.save_batch(batch).await
+    }
+
+    async fn save_job(&self, job: &mut Versioned<videocaptionerr_domain::Job>) -> AppResult<()> {
+        let expected = job.expected_version();
+        self.jobs.save_job(job, expected).await
+    }
+
+    async fn fail_before_session(
+        &self,
+        mut batch: Versioned<Batch>,
+        commands: &[TranscribeJobCommand],
+    ) -> AppResult<()> {
+        if batch.status() == BatchStatus::Pending {
+            batch.start()?;
+        } else if batch.status() == BatchStatus::Paused {
+            batch.resume()?;
+        }
+        for command in commands {
+            if let Some(mut job) = self.jobs.load_job(&command.job_id).await? {
+                if !job.status().is_terminal() {
+                    job.fail()?;
+                    self.save_job(&mut job).await?;
+                    batch.record_job_terminal(&command.job_id, JobTerminalStatus::Failed)?;
+                }
+            }
+        }
+        if batch
+            .job_ids()
+            .iter()
+            .all(|id| batch.has_terminal_record(id))
+        {
+            batch.finish(BatchStatus::Failed)?;
+        }
+        self.save_batch(&mut batch).await
     }
 }
 
@@ -279,6 +486,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
+    use tokio::sync::Notify;
     use ulid::Ulid;
     use videocaptionerr_contracts::error::{ErrorCode, VcError};
     use videocaptionerr_contracts::media::{AudioStream, MediaProbe};
@@ -557,6 +765,7 @@ mod tests {
         descriptor: AsrDescriptor,
         close_count: Arc<AtomicUsize>,
         fail_first: bool,
+        fail_close: bool,
         calls: usize,
     }
 
@@ -603,7 +812,14 @@ mod tests {
 
         async fn close(self: Box<Self>) -> AppResult<()> {
             self.close_count.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            if self.fail_close {
+                Err(ApplicationError::Adapter(VcError::new(
+                    ErrorCode::Internal,
+                    "injected session cleanup failure",
+                )))
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -611,6 +827,104 @@ mod tests {
         opens: Arc<AtomicUsize>,
         closes: Arc<AtomicUsize>,
         fail_first: bool,
+    }
+
+    struct GateState {
+        started: Notify,
+        release: Notify,
+        calls: AtomicUsize,
+        closes: AtomicUsize,
+    }
+
+    struct GateSession {
+        descriptor: AsrDescriptor,
+        state: Arc<GateState>,
+    }
+
+    #[async_trait]
+    impl AsrSession for GateSession {
+        fn descriptor(&self) -> &AsrDescriptor {
+            &self.descriptor
+        }
+
+        async fn transcribe(
+            &mut self,
+            _request: AsrTranscribeRequest,
+            _events: &dyn EventPublisher,
+            _cancel: Option<crate::ports::AsrCancelToken>,
+        ) -> AppResult<NormalizedAsrResult> {
+            self.state.calls.fetch_add(1, Ordering::SeqCst);
+            self.state.started.notify_one();
+            self.state.release.notified().await;
+            Ok(NormalizedAsrResult {
+                transcript: Transcript::new_asr(
+                    "source",
+                    EngineFingerprint::unknown(),
+                    vec![
+                        Word {
+                            text: "hello".into(),
+                            start_ms: 0,
+                            end_ms: 200,
+                            prob: 0.9,
+                        },
+                        Word {
+                            text: "world".into(),
+                            start_ms: 220,
+                            end_ms: 500,
+                            prob: PROB_UNAVAILABLE,
+                        },
+                    ],
+                ),
+            })
+        }
+
+        async fn close(self: Box<Self>) -> AppResult<()> {
+            self.state.closes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct GateRuntime {
+        opens: Arc<AtomicUsize>,
+        state: Arc<GateState>,
+    }
+
+    #[async_trait]
+    impl AsrRuntime for GateRuntime {
+        async fn open_session(
+            &self,
+            _profile: &BatchExecutionProfile,
+        ) -> AppResult<Box<dyn AsrSession>> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(GateSession {
+                descriptor: AsrDescriptor {
+                    engine_id: "fake-gated".into(),
+                    adapter_version: "test".into(),
+                    runtime_version: "test".into(),
+                    fingerprint: "fake-gated|test|test|fake|cpu".into(),
+                    supports_word_timestamps: true,
+                    supports_confidence: true,
+                    cooperative_cancel: true,
+                    max_audio_secs: Some(3600),
+                },
+                state: self.state.clone(),
+            }))
+        }
+    }
+
+    struct GateResolver {
+        opens: Arc<AtomicUsize>,
+        state: Arc<GateState>,
+    }
+
+    #[async_trait]
+    impl AsrRuntimeResolver for GateResolver {
+        async fn resolve(&self, _spec: &AsrRuntimeSpec) -> AppResult<Box<dyn AsrRuntime>> {
+            Ok(Box::new(GateRuntime {
+                opens: self.opens.clone(),
+                state: self.state.clone(),
+            }))
+        }
     }
 
     #[async_trait]
@@ -633,6 +947,7 @@ mod tests {
                 },
                 close_count: self.closes.clone(),
                 fail_first: self.fail_first,
+                fail_close: false,
                 calls: 0,
             }))
         }
@@ -647,6 +962,48 @@ mod tests {
                 opens: self.0.opens.clone(),
                 closes: self.0.closes.clone(),
                 fail_first: self.0.fail_first,
+            }))
+        }
+    }
+
+    struct CleanupFailResolver {
+        closes: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl AsrRuntimeResolver for CleanupFailResolver {
+        async fn resolve(&self, _spec: &AsrRuntimeSpec) -> AppResult<Box<dyn AsrRuntime>> {
+            Ok(Box::new(CleanupFailRuntime {
+                closes: self.closes.clone(),
+            }))
+        }
+    }
+
+    struct CleanupFailRuntime {
+        closes: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl AsrRuntime for CleanupFailRuntime {
+        async fn open_session(
+            &self,
+            _profile: &BatchExecutionProfile,
+        ) -> AppResult<Box<dyn AsrSession>> {
+            Ok(Box::new(Session {
+                descriptor: AsrDescriptor {
+                    engine_id: "fake-cleanup".into(),
+                    adapter_version: "test".into(),
+                    runtime_version: "test".into(),
+                    fingerprint: "fake-cleanup|test|test|fake|cpu".into(),
+                    supports_word_timestamps: true,
+                    supports_confidence: true,
+                    cooperative_cancel: true,
+                    max_audio_secs: Some(3600),
+                },
+                close_count: self.closes.clone(),
+                fail_first: false,
+                fail_close: true,
+                calls: 0,
             }))
         }
     }
@@ -1007,5 +1364,340 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.batch.status(), BatchStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn pause_keeps_session_open_and_resume_continues_remaining_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = Arc::new(Jobs {
+            values: Mutex::new(HashMap::new()),
+        });
+        let (batch, commands) = make_batch(dir.path(), 2);
+        let batch_id = batch.id().clone();
+        let batches = Arc::new(Batches {
+            values: Mutex::new(Vec::new()),
+        });
+        seed_persisted_state(&jobs, &batches, &batch, &commands);
+        let state = Arc::new(GateState {
+            started: Notify::new(),
+            release: Notify::new(),
+            calls: AtomicUsize::new(0),
+            closes: AtomicUsize::new(0),
+        });
+        let opens = Arc::new(AtomicUsize::new(0));
+        let runner = Arc::new(RunBatch::new(
+            batches.clone(),
+            jobs.clone(),
+            Arc::new(GateResolver {
+                opens: opens.clone(),
+                state: state.clone(),
+            }),
+            use_case(jobs),
+            Arc::new(Events),
+        ));
+        let task = tokio::spawn({
+            let runner = runner.clone();
+            async move {
+                runner
+                    .execute(RunBatchCommand {
+                        batch,
+                        jobs: commands,
+                        asr_spec: asr_spec(),
+                    })
+                    .await
+            }
+        });
+
+        state.started.notified().await;
+        // The first Job is still inside ASR. Persisting pause now must be
+        // observed only after that Job reaches its safe boundary.
+        let mut paused = batches.load_batch(&batch_id).await.unwrap().unwrap();
+        paused.request_pause().unwrap();
+        let paused_expected = paused.expected_version();
+        batches
+            .save_batch(&mut paused, paused_expected)
+            .await
+            .unwrap();
+        state.release.notify_one();
+
+        for _ in 0..100 {
+            if batches
+                .load_batch(&batch_id)
+                .await
+                .unwrap()
+                .is_some_and(|batch| batch.status() == BatchStatus::Paused)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(state.closes.load(Ordering::SeqCst), 0);
+        let current = batches.load_batch(&batch_id).await.unwrap().unwrap();
+        assert_eq!(current.status(), BatchStatus::Paused);
+        assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+
+        let mut resumed = current;
+        resumed.resume().unwrap();
+        let resumed_expected = resumed.expected_version();
+        batches
+            .save_batch(&mut resumed, resumed_expected)
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if state.calls.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        state.release.notify_one();
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result.batch.status(), BatchStatus::Done);
+        assert_eq!(result.jobs.len(), 2);
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        assert_eq!(state.closes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pause_then_cancel_finishes_remaining_jobs_without_closing_early() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = Arc::new(Jobs {
+            values: Mutex::new(HashMap::new()),
+        });
+        let (batch, commands) = make_batch(dir.path(), 2);
+        let batch_id = batch.id().clone();
+        let batches = Arc::new(Batches {
+            values: Mutex::new(Vec::new()),
+        });
+        seed_persisted_state(&jobs, &batches, &batch, &commands);
+        let state = Arc::new(GateState {
+            started: Notify::new(),
+            release: Notify::new(),
+            calls: AtomicUsize::new(0),
+            closes: AtomicUsize::new(0),
+        });
+        let runner = Arc::new(RunBatch::new(
+            batches.clone(),
+            jobs.clone(),
+            Arc::new(GateResolver {
+                opens: Arc::new(AtomicUsize::new(0)),
+                state: state.clone(),
+            }),
+            use_case(jobs.clone()),
+            Arc::new(Events),
+        ));
+        let task = tokio::spawn({
+            let runner = runner.clone();
+            async move {
+                runner
+                    .execute(RunBatchCommand {
+                        batch,
+                        jobs: commands,
+                        asr_spec: asr_spec(),
+                    })
+                    .await
+            }
+        });
+
+        state.started.notified().await;
+        let mut paused = batches.load_batch(&batch_id).await.unwrap().unwrap();
+        paused.request_pause().unwrap();
+        let expected = paused.expected_version();
+        batches.save_batch(&mut paused, expected).await.unwrap();
+        state.release.notify_one();
+
+        for _ in 0..100 {
+            if batches
+                .load_batch(&batch_id)
+                .await
+                .unwrap()
+                .is_some_and(|batch| batch.status() == BatchStatus::Paused)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            batches
+                .load_batch(&batch_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status(),
+            BatchStatus::Paused
+        );
+        assert_eq!(state.closes.load(Ordering::SeqCst), 0);
+
+        let request = crate::use_cases::CancelBatch::new(batches.clone(), jobs.clone())
+            .execute(crate::use_cases::CancelBatchCommand {
+                batch_id: batch_id.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(request.cancel_requested);
+
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result.batch.status(), BatchStatus::Cancelled);
+        assert_eq!(state.closes.load(Ordering::SeqCst), 1);
+        let statuses: Vec<_> = jobs
+            .list_jobs()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|job| job.status())
+            .collect();
+        assert!(statuses.contains(&JobStatus::Done));
+        assert!(statuses.contains(&JobStatus::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn active_batch_cancel_converges_after_the_current_job_reaches_a_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = Arc::new(Jobs {
+            values: Mutex::new(HashMap::new()),
+        });
+        let (batch, commands) = make_batch(dir.path(), 2);
+        let batch_id = batch.id().clone();
+        let batches = Arc::new(Batches {
+            values: Mutex::new(Vec::new()),
+        });
+        seed_persisted_state(&jobs, &batches, &batch, &commands);
+        let state = Arc::new(GateState {
+            started: Notify::new(),
+            release: Notify::new(),
+            calls: AtomicUsize::new(0),
+            closes: AtomicUsize::new(0),
+        });
+        let runner = Arc::new(RunBatch::new(
+            batches.clone(),
+            jobs.clone(),
+            Arc::new(GateResolver {
+                opens: Arc::new(AtomicUsize::new(0)),
+                state: state.clone(),
+            }),
+            use_case(jobs.clone()),
+            Arc::new(Events),
+        ));
+        let task = tokio::spawn({
+            let runner = runner.clone();
+            async move {
+                runner
+                    .execute(RunBatchCommand {
+                        batch,
+                        jobs: commands,
+                        asr_spec: asr_spec(),
+                    })
+                    .await
+            }
+        });
+
+        state.started.notified().await;
+        let request = crate::use_cases::CancelBatch::new(batches.clone(), jobs.clone())
+            .execute(crate::use_cases::CancelBatchCommand {
+                batch_id: batch_id.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(request.cancel_requested);
+        state.release.notify_one();
+
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(result.batch.status(), BatchStatus::Cancelled);
+        assert_eq!(state.closes.load(Ordering::SeqCst), 1);
+        assert!(jobs
+            .list_jobs()
+            .await
+            .unwrap()
+            .into_iter()
+            .all(|job| job.status() == JobStatus::Cancelled));
+        let repeated = crate::use_cases::CancelBatch::new(batches, jobs)
+            .execute(crate::use_cases::CancelBatchCommand { batch_id })
+            .await
+            .unwrap();
+        assert!(!repeated.cancel_requested);
+    }
+
+    #[tokio::test]
+    async fn cleanup_failure_does_not_replace_a_committed_batch_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = Arc::new(Jobs {
+            values: Mutex::new(HashMap::new()),
+        });
+        let (batch, commands) = make_batch(dir.path(), 1);
+        let batches = Arc::new(Batches {
+            values: Mutex::new(Vec::new()),
+        });
+        seed_persisted_state(&jobs, &batches, &batch, &commands);
+        let closes = Arc::new(AtomicUsize::new(0));
+        let runner = RunBatch::new(
+            batches,
+            jobs.clone(),
+            Arc::new(CleanupFailResolver {
+                closes: closes.clone(),
+            }),
+            use_case(jobs),
+            Arc::new(Events),
+        );
+        let result = runner
+            .execute(RunBatchCommand {
+                batch,
+                jobs: commands,
+                asr_spec: asr_spec(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.batch.status(), BatchStatus::Done);
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn batch_cancel_is_durable_and_repeated_cancel_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = Arc::new(Jobs {
+            values: Mutex::new(HashMap::new()),
+        });
+        let (batch, commands) = make_batch(dir.path(), 2);
+        let batch_id = batch.id().clone();
+        let batches = Arc::new(Batches {
+            values: Mutex::new(Vec::new()),
+        });
+        seed_persisted_state(&jobs, &batches, &batch, &commands);
+
+        let first = crate::use_cases::CancelBatch::new(batches.clone(), jobs.clone())
+            .execute(crate::use_cases::CancelBatchCommand {
+                batch_id: batch_id.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(first.cancel_requested);
+        assert_eq!(
+            batches
+                .load_batch(&batch_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status(),
+            BatchStatus::Cancelled
+        );
+        assert!(jobs
+            .list_jobs()
+            .await
+            .unwrap()
+            .into_iter()
+            .all(|job| job.status() == JobStatus::Cancelled));
+
+        let second = crate::use_cases::CancelBatch::new(batches.clone(), jobs.clone())
+            .execute(crate::use_cases::CancelBatchCommand { batch_id })
+            .await
+            .unwrap();
+        assert!(!second.cancel_requested);
+        assert_eq!(
+            batches
+                .load_batch(batch.id())
+                .await
+                .unwrap()
+                .unwrap()
+                .status(),
+            BatchStatus::Cancelled
+        );
     }
 }

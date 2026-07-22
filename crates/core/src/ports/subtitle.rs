@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use videocaptionerr_domain::Transcript;
@@ -29,6 +29,38 @@ pub enum SubtitleLayout {
     TranslationOnly,
     BilingualSourceFirst,
     BilingualTranslationFirst,
+}
+
+/// How a subtitle importer maps cue lines into source and translation fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SubtitleImportLayout {
+    #[default]
+    Mono,
+    SourceAboveTranslation,
+    TranslationAboveSource,
+}
+
+impl SubtitleImportLayout {
+    pub fn parse(value: Option<&str>) -> Option<Self> {
+        match value.unwrap_or("mono").to_ascii_lowercase().as_str() {
+            "mono" | "source" => Some(Self::Mono),
+            "source-above" | "source_above" | "bilingual" => Some(Self::SourceAboveTranslation),
+            "translation-above" | "translation_above" => Some(Self::TranslationAboveSource),
+            _ => None,
+        }
+    }
+}
+
+/// Parsed subtitle input returned by the host adapter to the import use case.
+pub struct ImportedSubtitle {
+    pub source_path: PathBuf,
+    pub transcript: Transcript,
+    pub warnings: Vec<String>,
+}
+
+/// Host-specific subtitle parsing and file access required by `ImportSubtitle`.
+pub trait SubtitleImporter: Send + Sync {
+    fn import(&self, path: &Path, layout: SubtitleImportLayout) -> AppResult<ImportedSubtitle>;
 }
 
 impl SubtitleLayout {

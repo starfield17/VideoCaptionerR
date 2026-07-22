@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use videocaptionerr_domain::Transcript;
 
 use crate::ports::{
-    IdGenerator, LlmGateway, LlmRequestRecorder, LlmStage, PromptSnapshot, StructuredOutput,
+    AsrCancelToken, IdGenerator, LlmGateway, LlmRequestRecorder, LlmStage, PromptSnapshot,
+    StructuredOutput,
 };
 
 pub(crate) const DEFAULT_CONTEXT_TOKENS: u32 = 8_192;
@@ -24,6 +25,9 @@ pub struct LlmPipelineRequest {
     pub target_language: Option<String>,
     /// When set, plans/prompts/batch results are durable under the Job directory.
     pub durable: Option<super::durable::LlmDurableContext>,
+    /// The same Job cancellation token used by ASR. LLM checks it before each
+    /// wave and retry so cancellation cannot advance to a later stage.
+    pub cancel: Option<AsrCancelToken>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

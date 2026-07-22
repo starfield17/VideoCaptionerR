@@ -13,6 +13,10 @@ pub struct Job {
     source_path: String,
     stages: Vec<StageState>,
     status: JobStatus,
+    /// Durable cancellation intent. A running Job remains Running until its
+    /// owner reaches a safe boundary and commits Cancelled.
+    #[serde(default)]
+    cancel_requested: bool,
     /// Number of explicit user/application retries applied to this Job.
     #[serde(default)]
     retry_attempt: u32,
@@ -53,6 +57,7 @@ impl Job {
                 })
                 .collect(),
             status: JobStatus::Pending,
+            cancel_requested: false,
             retry_attempt: 0,
             retry_generation: 0,
         }
@@ -92,6 +97,10 @@ impl Job {
 
     pub fn status(&self) -> JobStatus {
         self.status
+    }
+
+    pub fn cancel_requested(&self) -> bool {
+        self.cancel_requested
     }
 
     pub fn stages(&self) -> &[StageState] {
@@ -137,6 +146,11 @@ impl Job {
                 from: format!("{:?}", self.status),
                 to: "Running".into(),
             });
+        }
+        if self.cancel_requested {
+            return Err(DomainError::InvalidArgument(
+                "Job has a pending cancellation request".into(),
+            ));
         }
         self.status = JobStatus::Running;
         Ok(())
@@ -302,13 +316,43 @@ impl Job {
     }
 
     pub fn cancel(&mut self) -> DomainResult<()> {
+        if self.status == JobStatus::Cancelled {
+            return Ok(());
+        }
         if self.status.is_terminal() {
             return Err(DomainError::AlreadyTerminal { aggregate: "Job" });
         }
+        self.cancel_requested = true;
         self.status = JobStatus::Cancelled;
         for stage in &mut self.stages {
             if !stage.status.is_terminal() {
                 stage.status = StageStatus::Cancelled;
+            }
+        }
+        Ok(())
+    }
+
+    /// Persist cancellation intent without pretending that an active stage
+    /// has already stopped. The Processing Owner turns this into Cancelled at
+    /// its next safe boundary.
+    pub fn request_cancel(&mut self) -> DomainResult<()> {
+        if self.status.is_terminal() {
+            return Ok(());
+        }
+        self.cancel_requested = true;
+        Ok(())
+    }
+
+    /// Mark a Job failed before a stage can start, for example when the
+    /// Batch's shared ASR session cannot be initialized.
+    pub fn fail(&mut self) -> DomainResult<()> {
+        if self.status.is_terminal() {
+            return Ok(());
+        }
+        self.status = JobStatus::Failed;
+        for stage in &mut self.stages {
+            if !stage.status.is_terminal() {
+                stage.status = StageStatus::Failed;
             }
         }
         Ok(())
@@ -357,6 +401,7 @@ impl Job {
         self.retry_attempt = self.retry_attempt.saturating_add(1);
         self.retry_generation = self.retry_generation.saturating_add(1);
         self.status = JobStatus::Pending;
+        self.cancel_requested = false;
         Ok(start_kind)
     }
 
