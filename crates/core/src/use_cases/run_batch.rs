@@ -12,7 +12,42 @@ use crate::ports::{
     ActiveRunRegistry, AsrRuntimeResolver, AsrRuntimeSpec, BatchRepository, EventPublisher,
     JobRepository, RunControl, Versioned,
 };
-use crate::use_cases::{TranscribeJob, TranscribeJobCommand, TranscribeJobResponse};
+use crate::use_cases::{
+    ActiveCancellationWatcher, TranscribeJob, TranscribeJobCommand, TranscribeJobResponse,
+};
+
+/// A single owner-local registration for one active Job.
+///
+/// The watcher is deliberately owned by this lease instead of by the
+/// registry. That keeps its lifetime exactly aligned with the ASR/LLM run and
+/// prevents a control command from leaving a detached task behind.
+struct ActiveRunLease {
+    job_id: videocaptionerr_domain::JobId,
+    control: RunControl,
+    watcher: Option<ActiveCancellationWatcher>,
+    registry: Option<Arc<dyn ActiveRunRegistry>>,
+}
+
+impl ActiveRunLease {
+    async fn stop(mut self) {
+        if let Some(watcher) = self.watcher.take() {
+            watcher.stop().await;
+        }
+        if let Some(registry) = &self.registry {
+            registry.unregister(&self.job_id);
+        }
+    }
+}
+
+impl Drop for ActiveRunLease {
+    fn drop(&mut self) {
+        // This is the panic/error-path safety net. Normal completion calls
+        // `stop`, which also awaits the task before releasing the registry.
+        if let Some(registry) = &self.registry {
+            registry.unregister(&self.job_id);
+        }
+    }
+}
 
 pub struct RunBatchCommand {
     pub batch: Batch,
@@ -155,7 +190,7 @@ impl RunBatch {
         let mut failures = Vec::new();
 
         let mut next_index = 0usize;
-        let mut wait_control: Option<(videocaptionerr_domain::JobId, RunControl)> = None;
+        let mut wait_control: Option<ActiveRunLease> = None;
         while next_index < commands.len() {
             // Persistent state is reloaded at every safe boundary. The
             // in-process signal is only a latency optimization.
@@ -171,8 +206,8 @@ impl RunBatch {
             }
 
             if batch.cancel_requested() {
-                if let Some((job_id, _)) = wait_control.take() {
-                    self.unregister_run(&job_id);
+                if let Some(run) = wait_control.take() {
+                    run.stop().await;
                 }
                 // A control process may have already terminalized every Job
                 // and the Batch while this owner was waiting. That durable
@@ -189,7 +224,7 @@ impl RunBatch {
                     batch.mark_paused()?;
                     self.save_batch(&mut batch).await?;
                 }
-                let (job_id, control) = match wait_control.take() {
+                let run = match wait_control.take() {
                     Some(existing) => existing,
                     None => {
                         let job_id = commands[next_index].job_id.clone();
@@ -198,20 +233,19 @@ impl RunBatch {
                             job_id.clone(),
                             Some(batch.id().clone()),
                             control.clone(),
-                        )?;
-                        (job_id, control)
+                        )?
                     }
                 };
                 tokio::select! {
-                    _ = control.wait() => {},
+                    _ = run.control.wait() => {},
                     _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {},
                 }
-                wait_control = Some((job_id, control));
+                wait_control = Some(run);
                 continue;
             }
 
-            if let Some((job_id, _)) = wait_control.take() {
-                self.unregister_run(&job_id);
+            if let Some(run) = wait_control.take() {
+                run.stop().await;
             }
 
             let job_command = commands[next_index].clone();
@@ -230,12 +264,12 @@ impl RunBatch {
             }
 
             let control = RunControl::new();
-            self.register_run(job_id.clone(), Some(batch.id().clone()), control.clone())?;
+            let run = self.register_run(job_id.clone(), Some(batch.id().clone()), control)?;
             let result = self
                 .transcribe
-                .execute_with_cancel(job_command, session, control.cancellation_token())
+                .execute_with_cancel(job_command, session, run.control.cancellation_token())
                 .await;
-            self.unregister_run(&job_id);
+            run.stop().await;
 
             // A control command may have changed Batch state while the Job was
             // inside an adapter. Refresh before recording the terminal member.
@@ -341,17 +375,22 @@ impl RunBatch {
         job_id: videocaptionerr_domain::JobId,
         batch_id: Option<videocaptionerr_domain::BatchId>,
         control: RunControl,
-    ) -> AppResult<()> {
+    ) -> AppResult<ActiveRunLease> {
         if let Some(registry) = &self.active_runs {
-            registry.register(job_id, batch_id, control)?;
+            registry.register(job_id.clone(), batch_id.clone(), control.clone())?;
         }
-        Ok(())
-    }
-
-    fn unregister_run(&self, job_id: &videocaptionerr_domain::JobId) {
-        if let Some(registry) = &self.active_runs {
-            registry.unregister(job_id);
-        }
+        Ok(ActiveRunLease {
+            watcher: Some(ActiveCancellationWatcher::spawn(
+                self.jobs.clone(),
+                self.batches.clone(),
+                job_id.clone(),
+                batch_id,
+                control.clone(),
+            )),
+            job_id,
+            control,
+            registry: self.active_runs.clone(),
+        })
     }
 
     async fn cancel_remaining_jobs(

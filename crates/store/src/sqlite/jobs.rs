@@ -13,35 +13,61 @@ impl SqliteStore {
         aggregate_json: &str,
         expected: ExpectedVersion,
     ) -> VcResult<u64> {
+        Self::save_job_aggregate_on(
+            &self.conn,
+            id,
+            batch_id,
+            status,
+            source_path,
+            profile_revision,
+            execution_snapshot_id,
+            aggregate_json,
+            expected,
+        )
+    }
+
+    /// Write a Job row on the caller-provided connection. The connection may
+    /// be a SQLite transaction used by first-time Batch graph creation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn save_job_aggregate_on(
+        conn: &Connection,
+        id: &str,
+        batch_id: Option<&str>,
+        status: &str,
+        source_path: &str,
+        profile_revision: &str,
+        execution_snapshot_id: Option<&str>,
+        aggregate_json: &str,
+        expected: ExpectedVersion,
+    ) -> VcResult<u64> {
         let now = chrono::Utc::now().to_rfc3339();
         let projection = execution_snapshot_id
             .map(|snapshot_id| {
-                self.conn
-                    .query_row(
-                        "SELECT canonical_source_path, job_dir, profile_revision
+                conn.query_row(
+                    "SELECT canonical_source_path, job_dir, profile_revision
                          FROM execution_snapshots WHERE snapshot_id = ?1",
-                        [snapshot_id],
-                        |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, String>(2)?,
-                            ))
-                        },
+                    [snapshot_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|error| {
+                    VcError::new(
+                        ErrorCode::Internal,
+                        format!("load execution snapshot projection: {error}"),
                     )
-                    .optional()
-                    .map_err(|error| {
-                        VcError::new(
-                            ErrorCode::Internal,
-                            format!("load execution snapshot projection: {error}"),
-                        )
-                    })?
-                    .ok_or_else(|| {
-                        VcError::new(
-                            ErrorCode::InvalidArgument,
-                            format!("execution snapshot {snapshot_id} not found"),
-                        )
-                    })
+                })?
+                .ok_or_else(|| {
+                    VcError::new(
+                        ErrorCode::InvalidArgument,
+                        format!("execution snapshot {snapshot_id} not found"),
+                    )
+                })
             })
             .transpose()?;
         let source_path = projection
@@ -59,40 +85,38 @@ impl SqliteStore {
 
         match expected {
             ExpectedVersion::New => {
-                self.conn
-                    .execute(
-                        "INSERT INTO jobs (
+                conn.execute(
+                    "INSERT INTO jobs (
                             id, batch_id, status, source_path, job_dir, profile_revision,
                             execution_snapshot_id, aggregate_json, aggregate_version,
                             created_at, updated_at
                          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?9)",
-                        params![
-                            id,
-                            batch_id,
-                            status,
-                            source_path,
-                            job_dir,
-                            profile_revision,
-                            execution_snapshot_id,
-                            aggregate_json,
-                            now
-                        ],
-                    )
-                    .map_err(|error| {
-                        if is_constraint(&error) {
-                            stale_result("Job", id, expected)
-                        } else {
-                            VcError::new(
-                                ErrorCode::Internal,
-                                format!("insert job aggregate: {error}"),
-                            )
-                        }
-                    })?;
+                    params![
+                        id,
+                        batch_id,
+                        status,
+                        source_path,
+                        job_dir,
+                        profile_revision,
+                        execution_snapshot_id,
+                        aggregate_json,
+                        now
+                    ],
+                )
+                .map_err(|error| {
+                    if is_constraint(&error) {
+                        stale_result("Job", id, expected)
+                    } else {
+                        VcError::new(
+                            ErrorCode::Internal,
+                            format!("insert job aggregate: {error}"),
+                        )
+                    }
+                })?;
                 Ok(1)
             }
             ExpectedVersion::Exact(version) => {
-                let changed = self
-                    .conn
+                let changed = conn
                     .execute(
                         "UPDATE jobs SET
                             batch_id = ?1, status = ?2, source_path = ?3, job_dir = ?4,

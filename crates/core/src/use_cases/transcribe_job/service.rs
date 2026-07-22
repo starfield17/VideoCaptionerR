@@ -345,7 +345,17 @@ impl TranscribeJob {
                 PathBuf::from(artifact.path)
             };
             self.ensure_not_cancelled(&command, &cancel).await?;
-            job.finish()?;
+            // Build the terminal candidate only after the final durable
+            // cancellation check. If a cross-process cancel arrived while
+            // export/validation was completing, keep the owner on the
+            // cancellation path instead of writing Completed from a stale
+            // in-memory Job.
+            let mut completed = job.value.clone();
+            completed.finish()?;
+            if cancel.is_requested() || self.persisted_cancel_requested(&command).await? {
+                return Err(ApplicationError::Cancelled);
+            }
+            job.value = completed;
             self.save_job(&mut job).await?;
 
             Ok(TranscribeJobResponse {

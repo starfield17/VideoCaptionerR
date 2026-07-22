@@ -1,6 +1,7 @@
 //! SQLite-backed control-plane persistence.
 
 mod artifacts;
+mod batch_creation;
 mod batches;
 mod capability_probes;
 mod jobs;
@@ -45,6 +46,7 @@ pub(crate) use stage_commit::{insert_outbox_tx, sync_stage_projection};
 pub(crate) struct SqliteStore {
     pub(super) conn: Connection,
     pub(super) fault: Option<StageCommitFaultPoint>,
+    pub(super) batch_creation_fault: Option<batch_creation::BatchCreationFaultPoint>,
 }
 
 impl SqliteStore {
@@ -61,11 +63,23 @@ impl SqliteStore {
             )
         })?;
         migrate(&conn)?;
-        Ok(Self { conn, fault: None })
+        Ok(Self {
+            conn,
+            fault: None,
+            batch_creation_fault: None,
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn inject_stage_commit_fault(&mut self, point: StageCommitFaultPoint) {
         self.fault = Some(point);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_batch_creation_fault(
+        &mut self,
+        point: batch_creation::BatchCreationFaultPoint,
+    ) {
+        self.batch_creation_fault = Some(point);
     }
 }

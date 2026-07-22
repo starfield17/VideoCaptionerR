@@ -58,6 +58,33 @@ pub trait BatchRepository: Send + Sync {
     ) -> AppResult<()>;
 }
 
+/// Complete first-write graph for a newly created Batch.
+///
+/// Creation is intentionally a separate narrow port: snapshots, the Batch
+/// aggregate, and member Jobs must become visible together. Implementations
+/// must use one database transaction and must not expose a partially-created
+/// graph to callers.
+#[derive(Debug, Clone)]
+pub struct BatchCreationRequest {
+    pub batch: Batch,
+    pub jobs: Vec<Job>,
+    pub snapshots: Vec<JobExecutionSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreatedBatchGraph {
+    pub batch: Versioned<Batch>,
+    pub jobs: Vec<Versioned<Job>>,
+}
+
+#[async_trait]
+pub trait BatchCreationRepository: Send + Sync {
+    async fn create_batch_graph(
+        &self,
+        request: BatchCreationRequest,
+    ) -> AppResult<CreatedBatchGraph>;
+}
+
 #[derive(Debug, Clone)]
 pub struct StageCommitRequest {
     pub job: Option<(Versioned<Job>, ExpectedVersion)>,

@@ -8,8 +8,9 @@ use videocaptionerr_contracts::artifact::ArtifactMeta;
 use videocaptionerr_contracts::error::{ErrorCode, VcError, VcResult};
 use videocaptionerr_core::execution_snapshot::JobExecutionSnapshot;
 use videocaptionerr_core::ports::{
-    ArtifactRecoveryReport, CapabilityProbeRecord, ExpectedVersion, RetryTransactionRequest,
-    RetryTransactionResult, StageCommitRequest, StageCommitResult, StoredOutboxEvent,
+    ArtifactRecoveryReport, BatchCreationRequest, CapabilityProbeRecord, CreatedBatchGraph,
+    ExpectedVersion, RetryTransactionRequest, RetryTransactionResult, StageCommitRequest,
+    StageCommitResult, StoredOutboxEvent,
 };
 
 use super::handle::{LeaseRequest, StoreResponse, WorkUnitRecord};
@@ -126,6 +127,10 @@ pub(super) enum StoreCommand {
     SaveExecutionSnapshot {
         snapshot: JobExecutionSnapshot,
         reply: StoreResponse<()>,
+    },
+    CreateBatchGraph {
+        request: Box<BatchCreationRequest>,
+        reply: StoreResponse<CreatedBatchGraph>,
     },
     LoadExecutionSnapshot {
         id: String,
@@ -319,6 +324,9 @@ impl StoreCommand {
             }
             Self::SaveExecutionSnapshot { snapshot, reply } => {
                 let _ = reply.send(store.save_execution_snapshot(&snapshot));
+            }
+            Self::CreateBatchGraph { request, reply } => {
+                let _ = reply.send(store.create_batch_graph(*request));
             }
             Self::LoadExecutionSnapshot { id, reply } => {
                 let _ = reply.send(store.load_execution_snapshot(&id));

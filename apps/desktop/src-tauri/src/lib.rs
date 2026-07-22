@@ -165,15 +165,14 @@ async fn cancel_batch(state: State<'_, DesktopState>, batch_id: String) -> Resul
 }
 
 pub fn run() {
+    // Business runtime selection is profile-driven in both debug and release.
+    // Tests/developers may opt into the deterministic adapter explicitly.
+    let engine = std::env::var("VIDEOCAPTIONERR_ASR_ENGINE")
+        .ok()
+        .filter(|value| value == "fake");
     let runtime = ApplicationRuntime::open(RuntimeConfig {
         home: None,
-        engine: if cfg!(debug_assertions) {
-            // Development builds may explicitly opt into the deterministic
-            // fake adapter; release builds resolve the configured real profile.
-            Some("fake".into())
-        } else {
-            None
-        },
+        engine,
         model_path: None,
         helper_path: None,
         prompt_dir: None,

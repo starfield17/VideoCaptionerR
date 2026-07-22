@@ -44,9 +44,10 @@ pub use processing::{
     PreparedMediaFile, ProcessProfile,
 };
 pub use repositories::{
-    BatchRepository, ExpectedVersion, JobRepository, RetryTransactionRepository,
-    RetryTransactionRequest, RetryTransactionResult, SnapshotRepository, StageCommitRepository,
-    StageCommitRequest, StageCommitResult, Versioned, WorkUnitRepository,
+    BatchCreationRepository, BatchCreationRequest, BatchRepository, CreatedBatchGraph,
+    ExpectedVersion, JobRepository, RetryTransactionRepository, RetryTransactionRequest,
+    RetryTransactionResult, SnapshotRepository, StageCommitRepository, StageCommitRequest,
+    StageCommitResult, Versioned, WorkUnitRepository,
 };
 pub use run_control::{ActiveRunRegistry, RunControl};
 pub use subtitle::{

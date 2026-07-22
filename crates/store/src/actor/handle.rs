@@ -9,8 +9,9 @@ use videocaptionerr_contracts::artifact::ArtifactMeta;
 use videocaptionerr_contracts::error::{ErrorCode, VcError, VcResult};
 use videocaptionerr_core::execution_snapshot::JobExecutionSnapshot;
 use videocaptionerr_core::ports::{
-    ArtifactRecoveryReport, CapabilityProbeRecord, ExpectedVersion, RetryTransactionRequest,
-    RetryTransactionResult, StageCommitRequest, StageCommitResult, StoredOutboxEvent,
+    ArtifactRecoveryReport, BatchCreationRequest, CapabilityProbeRecord, CreatedBatchGraph,
+    ExpectedVersion, RetryTransactionRequest, RetryTransactionResult, StageCommitRequest,
+    StageCommitResult, StoredOutboxEvent,
 };
 
 use super::command::store_actor;
@@ -326,6 +327,18 @@ impl StoreHandle {
     ) -> VcResult<()> {
         let (reply, result) = response_channel();
         self.send(StoreCommand::SaveExecutionSnapshot { snapshot, reply })?;
+        await_response(result).await
+    }
+
+    pub(crate) async fn create_batch_graph(
+        &self,
+        request: BatchCreationRequest,
+    ) -> VcResult<CreatedBatchGraph> {
+        let (reply, result) = response_channel();
+        self.send(StoreCommand::CreateBatchGraph {
+            request: Box::new(request),
+            reply,
+        })?;
         await_response(result).await
     }
 

@@ -10,32 +10,52 @@ impl SqliteStore {
         aggregate_json: &str,
         expected: ExpectedVersion,
     ) -> VcResult<u64> {
+        Self::save_batch_aggregate_on(
+            &self.conn,
+            id,
+            status,
+            asr_model,
+            device,
+            aggregate_json,
+            expected,
+        )
+    }
+
+    /// Write a Batch row on the caller-provided connection, including a
+    /// transaction connection used by atomic first creation.
+    pub(crate) fn save_batch_aggregate_on(
+        conn: &Connection,
+        id: &str,
+        status: &str,
+        asr_model: &str,
+        device: &str,
+        aggregate_json: &str,
+        expected: ExpectedVersion,
+    ) -> VcResult<u64> {
         let now = chrono::Utc::now().to_rfc3339();
         match expected {
             ExpectedVersion::New => {
-                self.conn
-                    .execute(
-                        "INSERT INTO batches (
+                conn.execute(
+                    "INSERT INTO batches (
                             id, status, asr_model_id, asr_device, aggregate_json,
                             aggregate_version, created_at, updated_at
                          ) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?6)",
-                        params![id, status, asr_model, device, aggregate_json, now],
-                    )
-                    .map_err(|error| {
-                        if is_constraint(&error) {
-                            stale_result("Batch", id, expected)
-                        } else {
-                            VcError::new(
-                                ErrorCode::Internal,
-                                format!("insert batch aggregate: {error}"),
-                            )
-                        }
-                    })?;
+                    params![id, status, asr_model, device, aggregate_json, now],
+                )
+                .map_err(|error| {
+                    if is_constraint(&error) {
+                        stale_result("Batch", id, expected)
+                    } else {
+                        VcError::new(
+                            ErrorCode::Internal,
+                            format!("insert batch aggregate: {error}"),
+                        )
+                    }
+                })?;
                 Ok(1)
             }
             ExpectedVersion::Exact(version) => {
-                let changed = self
-                    .conn
+                let changed = conn
                     .execute(
                         "UPDATE batches SET
                             status = ?1, asr_model_id = ?2, asr_device = ?3,

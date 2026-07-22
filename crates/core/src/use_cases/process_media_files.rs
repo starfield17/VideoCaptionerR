@@ -16,9 +16,9 @@ use crate::execution_snapshot::{
     LlmExecutionSnapshot, OutputPlanSnapshot, JOB_EXECUTION_SNAPSHOT_SCHEMA_VERSION,
 };
 use crate::ports::{
-    BatchRepository, Clock, ExpectedVersion, IdGenerator, JobRepository, JobWorkspace,
-    MediaFileCatalog, OutputPlanRequest, OutputPlanner, ProcessProfile, SnapshotRepository,
-    SubtitleExportRequest, SubtitleFormat, SubtitleLayout, Versioned,
+    BatchCreationRepository, BatchCreationRequest, Clock, IdGenerator, JobWorkspace,
+    MediaFileCatalog, OutputPlanRequest, OutputPlanner, ProcessProfile, SubtitleExportRequest,
+    SubtitleFormat, SubtitleLayout,
 };
 
 use super::{LlmProcessOptions, RunBatch, RunBatchCommand, RunBatchResponse, TranscribeJobCommand};
@@ -43,9 +43,7 @@ pub struct CreatedBatch {
 /// composition root supplies the repository and host-adapter implementations;
 /// this type keeps the use-case constructor small and explicit.
 pub struct CreateBatchDependencies {
-    pub jobs: Arc<dyn JobRepository>,
-    pub batches: Arc<dyn BatchRepository>,
-    pub snapshots: Arc<dyn SnapshotRepository>,
+    pub creation: Arc<dyn BatchCreationRepository>,
     pub ids: Arc<dyn IdGenerator>,
     pub clock: Arc<dyn Clock>,
     pub files: Arc<dyn MediaFileCatalog>,
@@ -54,9 +52,7 @@ pub struct CreateBatchDependencies {
 }
 
 pub struct CreateBatch {
-    jobs: Arc<dyn JobRepository>,
-    batches: Arc<dyn BatchRepository>,
-    snapshots: Arc<dyn SnapshotRepository>,
+    creation: Arc<dyn BatchCreationRepository>,
     ids: Arc<dyn IdGenerator>,
     clock: Arc<dyn Clock>,
     files: Arc<dyn MediaFileCatalog>,
@@ -67,9 +63,7 @@ pub struct CreateBatch {
 impl CreateBatch {
     pub fn new(dependencies: CreateBatchDependencies) -> Self {
         Self {
-            jobs: dependencies.jobs,
-            batches: dependencies.batches,
-            snapshots: dependencies.snapshots,
+            creation: dependencies.creation,
             ids: dependencies.ids,
             clock: dependencies.clock,
             files: dependencies.files,
@@ -173,31 +167,29 @@ impl CreateBatch {
 
         let batch = Batch::new(batch_id, job_ids, batch_profile)?;
 
-        // Persist immutable snapshots before aggregate rows. A Job can never
-        // become runnable without the exact settings used to construct it.
-        for snapshot in &snapshots {
-            self.snapshots.save_execution_snapshot(snapshot).await?;
-        }
-        // SQLite enforces the Job -> Batch foreign key. Persist the Batch
-        // identity before member Job rows, while keeping snapshots first so
-        // Job projections can resolve their immutable source/output facts.
-        let mut persisted_batch = Versioned::new(batch.clone());
-        self.batches
-            .save_batch(&mut persisted_batch, ExpectedVersion::New)
+        let job_entities = jobs
+            .iter()
+            .map(|command| {
+                Job::new_with_snapshot(
+                    command.job_id.clone(),
+                    command.batch_id.clone(),
+                    command.execution_snapshot_id.clone(),
+                    command.profile_revision.clone(),
+                    command.input.to_string_lossy(),
+                )
+            })
+            .collect();
+        let persisted = self
+            .creation
+            .create_batch_graph(BatchCreationRequest {
+                batch,
+                jobs: job_entities,
+                snapshots,
+            })
             .await?;
-        for command in &jobs {
-            let mut job = Versioned::new(Job::new_with_snapshot(
-                command.job_id.clone(),
-                command.batch_id.clone(),
-                command.execution_snapshot_id.clone(),
-                command.profile_revision.clone(),
-                command.input.to_string_lossy(),
-            ));
-            self.jobs.save_job(&mut job, ExpectedVersion::New).await?;
-        }
 
         Ok(CreatedBatch {
-            batch: persisted_batch.value,
+            batch: persisted.batch.value,
             jobs,
             asr_spec: command.profile.asr,
         })

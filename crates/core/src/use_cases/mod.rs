@@ -1,6 +1,7 @@
 //! Application use cases.
 
 pub mod cancel_job;
+pub mod cancellation_watcher;
 pub mod chunk_plan;
 pub mod import_subtitle;
 pub mod job_ops;
@@ -17,6 +18,7 @@ pub mod transcript_editor;
 pub use cancel_job::{
     CancelBatch, CancelBatchCommand, CancelJob, CancelJobCommand, CancelResponse,
 };
+pub use cancellation_watcher::{ActiveCancellationWatcher, CANCELLATION_WATCH_INTERVAL};
 pub use chunk_plan::PersistChunkPlan;
 pub use import_subtitle::{ImportSubtitle, ImportSubtitleCommand, ImportSubtitleResponse};
 pub use job_ops::{DeleteJob, ExportJob, ExportJobCommand, ExportJobResponse, ListJobs};

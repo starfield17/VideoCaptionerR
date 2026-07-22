@@ -2,6 +2,7 @@
 
 mod artifact;
 mod batch;
+mod batch_creation;
 mod capability_probe;
 mod job;
 mod outbox;
@@ -27,8 +28,9 @@ pub(crate) use videocaptionerr_contracts::error::{ErrorCode, VcError};
 pub(crate) use videocaptionerr_core::application_error::{AppResult, ApplicationError};
 pub(crate) use videocaptionerr_core::execution_snapshot::JobExecutionSnapshot;
 pub(crate) use videocaptionerr_core::ports::{
-    ArtifactCommit, ArtifactRecoveryStore, ArtifactStore, BatchRepository, CapabilityProbeRecord,
-    CapabilityProbeStore, ChunkPlanCommit, ChunkPlanStore, EventPublisher, ExpectedVersion,
+    ArtifactCommit, ArtifactRecoveryStore, ArtifactStore, BatchCreationRepository,
+    BatchCreationRequest, BatchRepository, CapabilityProbeRecord, CapabilityProbeStore,
+    ChunkPlanCommit, ChunkPlanStore, CreatedBatchGraph, EventPublisher, ExpectedVersion,
     JobRepository, OutboxEvent, OutboxRepository, SnapshotRepository, StageCommitRepository,
     StageCommitRequest, StageCommitResult, TranscriptCommit, Versioned, WorkUnitRepository,
 };

@@ -4,11 +4,12 @@ use std::sync::{Arc, Mutex};
 use videocaptionerr_asr::{resolve_helper_binary, FamilyAsrRuntimeResolver};
 use videocaptionerr_contracts::error::{ErrorCode, VcError, VcResult};
 use videocaptionerr_core::ports::{
-    ActiveRunRegistry, ArtifactRecoveryStore, ArtifactStore, AsrRuntimeResolver, BatchRepository,
-    CacheRepository, CapabilityProbeStore, ChunkPlanStore, Clock, EventPublisher, IdGenerator,
-    JobRepository, JobWorkspace, MediaFileCatalog, OutboxRepository,
-    OutputPlanner as OutputPlannerPort, RetryTransactionRepository, SnapshotRepository,
-    StageCommitRepository, SubtitleGateway, SubtitleImporter, WorkUnitRepository,
+    ActiveRunRegistry, ArtifactRecoveryStore, ArtifactStore, AsrRuntimeResolver,
+    BatchCreationRepository, BatchRepository, CacheRepository, CapabilityProbeStore,
+    ChunkPlanStore, Clock, EventPublisher, IdGenerator, JobRepository, JobWorkspace,
+    MediaFileCatalog, OutboxRepository, OutputPlanner as OutputPlannerPort,
+    RetryTransactionRepository, SnapshotRepository, StageCommitRepository, SubtitleGateway,
+    SubtitleImporter, WorkUnitRepository,
 };
 use videocaptionerr_core::use_cases::{
     CacheGc, CreateBatch, CreateBatchDependencies, ImportSubtitle, PersistChunkPlan,
@@ -92,6 +93,7 @@ impl ApplicationRuntime {
         let store = StoreHandle::open(&paths.db_path)?;
         let jobs: Arc<dyn JobRepository> = Arc::new(store.clone());
         let batches: Arc<dyn BatchRepository> = Arc::new(store.clone());
+        let creation: Arc<dyn BatchCreationRepository> = Arc::new(store.clone());
         let work_units: Arc<dyn WorkUnitRepository> = Arc::new(store.clone());
         let snapshots: Arc<dyn SnapshotRepository> = Arc::new(store.clone());
         let outbox: Arc<dyn OutboxRepository> = Arc::new(store.clone());
@@ -203,9 +205,7 @@ impl ApplicationRuntime {
         ));
         let process_media_files = Arc::new(ProcessMediaFiles::new(
             CreateBatch::new(CreateBatchDependencies {
-                jobs: jobs.clone(),
-                batches: batches.clone(),
-                snapshots: snapshots.clone(),
+                creation,
                 ids: ids.clone(),
                 clock: clock.clone(),
                 files,

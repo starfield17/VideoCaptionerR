@@ -17,12 +17,12 @@ Implementation follows the frozen baseline in
 crates/
   contracts/   # IR, protocols, error codes
   domain/      # pure aggregates and state machines
-  core/        # application / business services
+  core/        # application ports, use cases, and lifecycle orchestration
   platform/    # filesystem, ffmpeg, subtitle, and config adapters
-  bootstrap/   # shared CLI/Desktop composition root
+  bootstrap/   # shared CLI/Desktop composition root and Runtime factory
   asr/         # ASR traits and adapters
   llm/         # LLM provider client
-  store/       # SQLite store actor, artifacts, locks
+  store/       # SQLite Store Actor, transactions, artifacts, and locks
   cli/         # clap CLI
   test-support/
 apps/
